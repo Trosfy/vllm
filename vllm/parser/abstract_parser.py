@@ -341,6 +341,43 @@ class Parser:
         """
 
 
+def _merge_tool_delta_messages(
+    acc: DeltaMessage | None, step: DeltaMessage | None
+) -> DeltaMessage | None:
+    """Merge drained tool parser steps produced from one streamed delta."""
+    if step is None:
+        return acc
+    if acc is None:
+        return step
+    if step.content:
+        acc.content = (acc.content or "") + step.content
+    if step.tool_calls:
+        if acc.tool_calls is None:
+            acc.tool_calls = []
+        by_index = {tc.index: tc for tc in acc.tool_calls}
+        for tc in step.tool_calls:
+            existing = by_index.get(tc.index)
+            if existing is None:
+                acc.tool_calls.append(tc)
+                by_index[tc.index] = tc
+                continue
+            if tc.id is not None:
+                existing.id = tc.id
+            if tc.type is not None:
+                existing.type = tc.type
+            if tc.function is not None:
+                if existing.function is None:
+                    existing.function = tc.function
+                    continue
+                if tc.function.name is not None:
+                    existing.function.name = tc.function.name
+                if tc.function.arguments:
+                    existing.function.arguments = (
+                        existing.function.arguments or ""
+                    ) + tc.function.arguments
+    return acc
+
+
 class DelegatingParser(Parser):
     """
     A Parser implementation that delegates to separate ReasoningParser and
@@ -841,37 +878,67 @@ class DelegatingParser(Parser):
                 delta_text = current_text
                 delta_token_ids = current_token_ids
 
-            reasoning_from_this_batch = (
-                delta_message.reasoning if delta_message else None
-            )
+            # A boundary delta may carry both reasoning and tool-call text.
+            # Keep the reasoning part before the tool parser overwrites it.
+            reasoning_from_this_batch = delta_message.reasoning if delta_message else None
 
-            delta_message, state.function_name_returned = (
-                self._extract_tool_calls_streaming(
-                    previous_text=state.previous_text,
-                    current_text=current_text,
-                    delta_text=delta_text,
-                    previous_token_ids=state.previous_token_ids,
-                    current_token_ids=current_token_ids,
-                    delta_token_ids=delta_token_ids,
-                    request=request,  # type: ignore[arg-type]
-                    tool_call_idx=state.history_tool_call_cnt,
-                    tool_call_id_type=state.tool_call_id_type,
-                    function_name_returned=state.function_name_returned,
+            merged_tool_msg: DeltaMessage | None = None
+            prev_text_for_call = state.previous_text
+            last_content: str | None = None
+
+            # Spec decode can deliver a whole tool call in one large delta.
+            # Incremental tool parsers advance one FSM step per call, so drain
+            # until the parser stops emitting new content/tool fragments.
+            for _ in range(64):
+                step_msg, state.function_name_returned = (
+                    self._extract_tool_calls_streaming(
+                        previous_text=prev_text_for_call,
+                        current_text=current_text,
+                        delta_text=delta_text,
+                        previous_token_ids=state.previous_token_ids,
+                        current_token_ids=current_token_ids,
+                        delta_token_ids=delta_token_ids,
+                        request=request,  # type: ignore[arg-type]
+                        tool_call_idx=state.history_tool_call_cnt,
+                        tool_call_id_type=state.tool_call_id_type,
+                        function_name_returned=state.function_name_returned,
+                    )
                 )
-            )
+                prev_text_for_call = current_text
+                if step_msg is None:
+                    break
+
+                step_tool_calls = list(step_msg.tool_calls or [])
+                new_content = (
+                    step_msg.content
+                    if step_msg.content and step_msg.content != last_content
+                    else None
+                )
+                if step_msg.content:
+                    last_content = step_msg.content
+                if (
+                    step_tool_calls
+                    and step_tool_calls[0].id is not None
+                ):
+                    state.history_tool_call_cnt += 1
+
+                if step_tool_calls or new_content is not None:
+                    piece = DeltaMessage(content=new_content)
+                    if step_tool_calls:
+                        piece.tool_calls = step_tool_calls
+                    merged_tool_msg = _merge_tool_delta_messages(
+                        merged_tool_msg, piece
+                    )
+                    continue
+                break
+
+            delta_message = merged_tool_msg
 
             if reasoning_from_this_batch:
                 if delta_message is None:
                     delta_message = DeltaMessage(reasoning=reasoning_from_this_batch)
                 elif not delta_message.reasoning:
                     delta_message.reasoning = reasoning_from_this_batch
-
-            if (
-                delta_message
-                and delta_message.tool_calls
-                and delta_message.tool_calls[0].id is not None
-            ):
-                state.history_tool_call_cnt += 1
 
         # No phase active: pass through as content.
         # Skip when reasoning just ended in this delta — the engine already
