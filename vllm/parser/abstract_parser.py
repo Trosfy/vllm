@@ -694,6 +694,10 @@ class DelegatingParser(Parser):
             return False
         return state.reasoning_ended
 
+    @staticmethod
+    def _request_has_tools(request: ChatCompletionRequest | ResponsesRequest) -> bool:
+        return bool(getattr(request, "tools", None))
+
     def _append_unstreamed_tool_args(
         self,
         delta_message: DeltaMessage | None,
@@ -814,7 +818,21 @@ class DelegatingParser(Parser):
                     delta_text = current_text
 
         # Tool call extraction
-        if self._in_tool_call_phase(state):
+        #
+        # ``--enable-auto-tool-choice`` installs a tool parser globally, but a
+        # request without a tools list cannot produce valid tool calls.  Do not
+        # route plain post-reasoning content through an engine-based tool
+        # parser in that case; it may carry buffered content and re-emit text
+        # that the output processor already streamed as a clean delta.
+        if self._in_tool_call_phase(state) and not self._request_has_tools(request):
+            if current_text:
+                if delta_message is None:
+                    delta_message = DeltaMessage(content=current_text)
+                elif delta_message.content:
+                    delta_message.content += current_text
+                else:
+                    delta_message.content = current_text
+        elif self._in_tool_call_phase(state):
             if not state.tool_call_text_started:
                 state.tool_call_text_started = True
                 state.previous_text = ""
@@ -881,6 +899,11 @@ class DelegatingParser(Parser):
         reasoning_ended = self._stream_state.reasoning_ended
         for parser in (self._reasoning_parser, self._tool_parser):
             if not getattr(parser, "engine_based_streaming", False):
+                continue
+            if (
+                parser is self._tool_parser
+                and not self._stream_state.tool_call_text_started
+            ):
                 continue
             # When reasoning has ended and we transitioned to the tool
             # phase, the reasoning parser's engine may still have buffered
