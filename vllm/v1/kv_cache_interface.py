@@ -566,6 +566,7 @@ class SlidingWindowSpec(AttentionSpec):
         return all(
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
             for spec in kv_cache_specs.values()
         )
 
