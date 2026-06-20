@@ -326,6 +326,15 @@ class SpecDecodeBaseProposer:
 
             self.allowed_attn_types = tuple(rocm_types)
 
+    @staticmethod
+    def _invalidate_decode_only_metadata(common_attn_metadata) -> None:
+        # The proposer mutates target-batch metadata into a decode-only draft
+        # loop shape. The computed-token cache depends on query_start_loc and
+        # must be rebuilt after each draft-step metadata update. Keep topology
+        # and prefill state: sparse MLA backends use them to preserve the
+        # captured token-to-request layout in the draft loop.
+        common_attn_metadata._num_computed_tokens_cache = None
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -717,6 +726,7 @@ class SpecDecodeBaseProposer:
         common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
             self.token_arange_np[: batch_size + 1]
         ).clone()
+        self._invalidate_decode_only_metadata(common_attn_metadata)
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -860,6 +870,7 @@ class SpecDecodeBaseProposer:
             common_attn_metadata._num_computed_tokens_cpu += 1
         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
             common_attn_metadata.seq_lens_cpu_upper_bound += 1
+        self._invalidate_decode_only_metadata(common_attn_metadata)
 
         return positions
 
