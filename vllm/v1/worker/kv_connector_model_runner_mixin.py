@@ -155,7 +155,33 @@ class KVConnectorModelRunnerMixin:
         kv_cache_spec = attn_group.kv_cache_spec
         if not isinstance(kv_cache_spec, AttentionSpec):
             return False
-        return kv_cache_spec.indexes_kv_by_block_stride
+        if kv_cache_spec.indexes_kv_by_block_stride:
+            return True
+
+        attn_backend = attn_group.backend
+        cache_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
+        kv_cache_shape = attn_backend.get_kv_cache_shape(
+            1234,
+            kv_cache_spec.block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+
+        try:
+            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
+                include_num_layers_dimension=True
+            )
+        except (AttributeError, NotImplementedError):
+            return False
+
+        # check that attention backend includes a layers dimension
+        if len(kv_cache_stride_order) != len(kv_cache_shape) + 1:
+            return False
+
+        # stride_order[0] == 0 means num_layers stays first in physical
+        # layout (identity permutation), so cross-layer is unsupported.
+        return kv_cache_stride_order[0] != 0
 
     @staticmethod
     def allocate_uniform_kv_caches(
@@ -206,12 +232,13 @@ class KVConnectorModelRunnerMixin:
         kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
         attn_backend = attn_group.backend
+        cache_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
         kv_cache_shape = attn_backend.get_kv_cache_shape(
             kernel_num_blocks,
             kernel_block_size,
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=cache_dtype_str,
         )
 
         # prepend a num_layers dimension into the shape
