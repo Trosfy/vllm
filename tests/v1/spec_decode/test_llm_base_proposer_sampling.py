@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm.platforms import current_platform
@@ -8,6 +10,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
+    SpecDecodeBaseProposer,
     compute_probs_and_sample_next_token,
 )
 
@@ -68,3 +71,18 @@ def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():
 
     assert torch.equal(actual_ids, expected_ids)
     assert torch.allclose(actual_probs, probs)
+
+
+def test_decode_only_metadata_invalidation_preserves_topology():
+    stale_topology = object()
+    metadata = SimpleNamespace(
+        batch_topology=stale_topology,
+        is_prefilling=True,
+        _num_computed_tokens_cache=object(),
+    )
+
+    SpecDecodeBaseProposer._invalidate_decode_only_metadata(metadata)
+
+    assert metadata.batch_topology is stale_topology
+    assert metadata.is_prefilling is True
+    assert metadata._num_computed_tokens_cache is None
