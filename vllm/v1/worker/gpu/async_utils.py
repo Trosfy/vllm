@@ -35,6 +35,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self.logprobs_tensors = (
                     sampler_output.logprobs_tensors.to_cpu_nonblocking()
                 )
+            self.sample_logits = None
+            if sampler_output.sample_logits is not None:
+                self.sample_logits = sampler_output.sample_logits.to(
+                    "cpu", non_blocking=True
+                )
             self.num_nans: np.ndarray | None = None
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
@@ -43,6 +48,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
+            self.prompt_logits_dict = self.model_runner_output.prompt_logits_dict
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
@@ -65,7 +71,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+        if self.sample_logits is not None:
+            self.model_runner_output.sample_logits = self.sample_logits
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+        self.model_runner_output.prompt_logits_dict = self.prompt_logits_dict
         return self.model_runner_output
 
 

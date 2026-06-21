@@ -90,6 +90,9 @@ class Sampler:
             idx_mapping_np
         )
         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
+        return_sample_logits = self.sampling_states.any_return_sample_logits(
+            idx_mapping_np
+        )
 
         sampled, processed_logits = self.sample(
             logits,
@@ -137,6 +140,7 @@ class Sampler:
             # token per request.
             sampled_token_ids=sampled.view(-1, 1),
             logprobs_tensors=logprobs_tensors,
+            sample_logits=logits.detach() if return_sample_logits else None,
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,

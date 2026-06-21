@@ -37,6 +37,7 @@ class SamplingStates:
         self.num_logprobs = np.empty(self.max_num_reqs, dtype=np.int32)
         # -1 means no logprobs are requested.
         self.num_logprobs.fill(NO_LOGPROBS)
+        self.return_sample_logits = np.zeros(self.max_num_reqs, dtype=bool)
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         self.temperature.np[req_idx] = sampling_params.temperature
@@ -59,6 +60,7 @@ class SamplingStates:
         elif num_logprobs == -1:
             num_logprobs = self.vocab_size
         self.num_logprobs[req_idx] = num_logprobs
+        self.return_sample_logits[req_idx] = sampling_params.return_sample_logits
 
     def apply_staged_writes(self) -> None:
         self.temperature.copy_to_uva()
@@ -119,3 +121,6 @@ class SamplingStates:
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
         return int(np.max(self.num_logprobs[idx_mapping_np]))
+
+    def any_return_sample_logits(self, idx_mapping_np: np.ndarray) -> bool:
+        return bool(np.any(self.return_sample_logits[idx_mapping_np]))

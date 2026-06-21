@@ -352,6 +352,16 @@ class SamplingParams(
     '\\emoji \\emoji \\emoji ...'). This feature can detect such behavior
     and terminate early, saving time and tokens."""
 
+    return_prompt_logits: bool = False
+    """When True, return raw prompt logits instead of building prompt logprobs.
+    This is intended for offline numeric comparison where the full vocabulary
+    logits are needed without the memory overhead of top-k prompt logprobs."""
+
+    return_sample_logits: bool = False
+    """When True, return raw decode/sample logits for generated positions.
+    This is intended for offline numeric comparison where full-vocabulary
+    logits are needed without the memory overhead of top-k sample logprobs."""
+
     @staticmethod
     def from_optional(
         n: int | None = 1,
@@ -461,6 +471,11 @@ class SamplingParams(
         if self.prompt_logprobs is True:
             self.prompt_logprobs = 1
 
+        if self.return_prompt_logits and self.prompt_logprobs is None:
+            # Reuse the prompt-logprobs scheduling path, but bypass the
+            # logprob/top-k computation before returning the output.
+            self.prompt_logprobs = 1
+
         # Number of characters to hold back for stop string evaluation
         # until sequence is finished.
         if self.stop and not self.include_stop_str_in_output:
@@ -482,7 +497,9 @@ class SamplingParams(
             # If prefix caching is enabled,
             # the output of prompt logprobs may less than n_prompt_tokens,
             # we need to skip reading cache at this request.
-            self.skip_reading_prefix_cache = self.prompt_logprobs is not None
+            self.skip_reading_prefix_cache = (
+                self.prompt_logprobs is not None or self.return_prompt_logits
+            )
 
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):

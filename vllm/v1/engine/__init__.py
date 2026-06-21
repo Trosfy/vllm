@@ -183,6 +183,8 @@ class EngineCoreOutput(
 
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
+    new_prompt_logits: torch.Tensor | None = None
+    new_sample_logits: torch.Tensor | None = None
 
     pooling_output: torch.Tensor | None = None
 

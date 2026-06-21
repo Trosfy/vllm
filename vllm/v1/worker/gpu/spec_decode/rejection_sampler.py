@@ -165,6 +165,7 @@ class RejectionSampler:
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=logprobs_tensors,
+            sample_logits=None,
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,

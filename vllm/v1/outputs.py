@@ -256,6 +256,14 @@ class ModelRunnerOutput:
         default_factory=dict
     )
 
+    # req_id -> logits tensor [num_positions, vocab_size] when
+    # SamplingParams.return_prompt_logits is enabled.
+    prompt_logits_dict: dict[str, torch.Tensor | None] = field(default_factory=dict)
+
+    # [num_reqs, vocab_size] raw sample logits when
+    # SamplingParams.return_sample_logits is enabled for at least one request.
+    sample_logits: torch.Tensor | None = None
+
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 

@@ -11,6 +11,7 @@ from vllm.v1.outputs import LogprobsTensors
 class SamplerOutput:
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    sample_logits: torch.Tensor | None
     num_nans: torch.Tensor | None
     num_sampled: torch.Tensor | None
     num_rejected: torch.Tensor | None = None

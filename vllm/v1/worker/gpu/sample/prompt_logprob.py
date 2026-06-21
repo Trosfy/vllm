@@ -17,19 +17,27 @@ class PromptLogprobsWorker:
         self.max_num_reqs = max_num_reqs
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
+        self.returns_prompt_logits = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
         # req_idx -> list of in-progress LogprobsTensors
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
+        # req_id -> list of raw prompt-logit chunks on CPU.
+        self.in_progress_prompt_logits: dict[str, list[torch.Tensor]] = {}
 
     def add_request(self, req_id: str, req_idx: int, sampling_params: SamplingParams):
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
+        returns_prompt_logits = sampling_params.return_prompt_logits
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
+        self.returns_prompt_logits[req_idx] = returns_prompt_logits
         self.num_prompt_logprobs[req_idx] = sampling_params.prompt_logprobs or 0
         if uses_prompt_logprobs:
             self.in_progress_prompt_logprobs[req_id] = []
+        if returns_prompt_logits:
+            self.in_progress_prompt_logits[req_id] = []
 
     def remove_request(self, req_id: str) -> None:
         self.in_progress_prompt_logprobs.pop(req_id, None)
+        self.in_progress_prompt_logits.pop(req_id, None)
 
     def compute_prompt_logprobs(
         self,
@@ -42,12 +50,13 @@ class PromptLogprobsWorker:
         num_computed_tokens: torch.Tensor,
         # [max_num_reqs]
         prompt_lens: np.ndarray,
-    ) -> dict[str, LogprobsTensors]:
+    ) -> tuple[dict[str, LogprobsTensors], dict[str, torch.Tensor]]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
+        returns_prompt_logits = self.returns_prompt_logits[idx_mapping_np]
         if not np.any(needs_prompt_logprobs):
             # Common case: No request asks for prompt logprobs.
-            return {}
+            return {}, {}
 
         num_prompt_logprobs = self.num_prompt_logprobs[idx_mapping_np]
         prompt_lens = prompt_lens[idx_mapping_np]
@@ -57,8 +66,9 @@ class PromptLogprobsWorker:
         # logprobs must have been computed before preemption. Skip.
         resumed_after_prompt = prompt_lens < input_batch.prefill_len_np
         needs_prompt_logprobs &= includes_prompt & ~resumed_after_prompt
+        returns_prompt_logits &= needs_prompt_logprobs
         if not np.any(needs_prompt_logprobs):
-            return {}
+            return {}, {}
 
         # get the maximum number in this batch
         requested_num_prompt_logprobs = num_prompt_logprobs[needs_prompt_logprobs]
@@ -76,12 +86,13 @@ class PromptLogprobsWorker:
             num_computed_tokens,
             all_token_ids,
         )
-        prompt_token_ids, prompt_logprobs, prompt_ranks = (
+        prompt_token_ids, prompt_logprobs, prompt_ranks, prompt_logits = (
             compute_prompt_logprobs_with_chunking(
                 prompt_logprobs_token_ids,
                 hidden_states[: input_batch.num_tokens],
                 logits_fn,
                 max_num_prompt_logprobs,
+                return_prompt_logits=np.any(returns_prompt_logits),
             )
         )
 
@@ -90,6 +101,7 @@ class PromptLogprobsWorker:
 
         query_start_loc_np = input_batch.query_start_loc_np
         prompt_logprobs_dict: dict[str, LogprobsTensors] = {}
+        prompt_logits_dict: dict[str, torch.Tensor] = {}
         for i, req_id in enumerate(input_batch.req_ids):
             if not needs_prompt_logprobs[i]:
                 continue
@@ -123,6 +135,16 @@ class PromptLogprobsWorker:
             prompt_logprobs_list = self.in_progress_prompt_logprobs[req_id]
             if logprobs is not None and (req_is_prompt_chunked or prompt_logprobs_list):
                 prompt_logprobs_list.append(logprobs)
+
+            logits_chunk: torch.Tensor | None = None
+            prompt_logits_list: list[torch.Tensor] | None = None
+            if returns_prompt_logits[i]:
+                assert prompt_logits is not None
+                logits_chunk = prompt_logits[start_idx:end_idx]
+                prompt_logits_list = self.in_progress_prompt_logits[req_id]
+                if logits_chunk.numel() and (req_is_prompt_chunked or prompt_logits_list):
+                    prompt_logits_list.append(logits_chunk)
+
             if req_is_prompt_chunked:
                 # Prompt is chunked. Do not return the logprobs yet.
                 continue
@@ -144,7 +166,16 @@ class PromptLogprobsWorker:
                 continue
 
             prompt_logprobs_dict[req_id] = logprobs
-        return prompt_logprobs_dict
+
+            if returns_prompt_logits[i]:
+                assert logits_chunk is not None
+                assert prompt_logits_list is not None
+                if prompt_logits_list:
+                    logits_chunk = torch.cat(prompt_logits_list)
+                    prompt_logits_list.clear()
+                prompt_logits_dict[req_id] = logits_chunk
+
+        return prompt_logprobs_dict, prompt_logits_dict
 
 
 @triton.jit
@@ -206,18 +237,22 @@ def compute_prompt_logprobs_with_chunking(
     prompt_hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_prompt_logits: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
     CHUNK_SIZE = 1024
     token_ids = []
     logprobs = []
     ranks = []
+    logits = []
     prompt_token_ids = prompt_token_ids.to(torch.int64)
     for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
         end_idx = start_idx + CHUNK_SIZE
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+        if return_prompt_logits:
+            logits.append(prompt_logits.float().cpu())
         requested_num_prompt_logprobs = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1
@@ -235,4 +270,7 @@ def compute_prompt_logprobs_with_chunking(
     token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
     logprobs = torch.cat(logprobs, dim=0) if len(logprobs) > 1 else logprobs[0]
     ranks = torch.cat(ranks, dim=0) if len(ranks) > 1 else ranks[0]
-    return token_ids, logprobs, ranks
+    prompt_logits = torch.cat(logits, dim=0) if len(logits) > 1 else (
+        logits[0] if logits else None
+    )
+    return token_ids, logprobs, ranks, prompt_logits

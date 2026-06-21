@@ -30,6 +30,8 @@ class CompletionOutput:
             output text.
         logprobs: The log probabilities of the top probability words at each
             position if the logprobs are requested.
+        sample_logits: Raw logits for generated positions when requested through
+            ``SamplingParams.return_sample_logits``.
         finish_reason: The reason why the sequence is finished.
         stop_reason: The stop string or token id that caused the completion
             to stop, None if the completion finished for some other reason
@@ -42,6 +44,7 @@ class CompletionOutput:
     token_ids: GenericSequence[int]
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
+    sample_logits: torch.Tensor | None = None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
     finish_reason: str | None = None
     stop_reason: int | str | None = None
@@ -94,6 +97,8 @@ class RequestOutput:
                           For encoder/decoder models, this is the
                           decoder input prompt token ids.
         prompt_logprobs: The log probabilities to return per prompt token.
+        prompt_logits: Raw logits for prompt positions when requested through
+            ``SamplingParams.return_prompt_logits``.
         outputs: The output sequences of the request.
         finished: Whether the whole request is finished.
         metrics: Metrics associated with the request.
@@ -114,6 +119,7 @@ class RequestOutput:
         prompt_logprobs: PromptLogprobs | None,
         outputs: list[CompletionOutput],
         finished: bool,
+        prompt_logits: torch.Tensor | None = None,
         metrics: RequestStateStats | None = None,
         lora_request: LoRARequest | None = None,
         encoder_prompt: str | None = None,
@@ -133,6 +139,7 @@ class RequestOutput:
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
         self.prompt_logprobs = prompt_logprobs
+        self.prompt_logits = prompt_logits
         self.outputs = outputs
         self.finished = finished
         self.metrics = metrics
@@ -160,6 +167,17 @@ class RequestOutput:
                         if next_completion.logprobs:
                             assert completion.logprobs is not None
                             completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]
+                        if next_completion.sample_logits is not None:
+                            if completion.sample_logits is None:
+                                completion.sample_logits = next_completion.sample_logits
+                            else:
+                                completion.sample_logits = torch.cat(
+                                    [
+                                        completion.sample_logits,
+                                        next_completion.sample_logits,
+                                    ],
+                                    dim=0,
+                                )
                         completion.cumulative_logprob = (
                             next_completion.cumulative_logprob
                         )

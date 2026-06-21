@@ -1474,6 +1474,8 @@ class Scheduler(SchedulerInterface):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        prompt_logits_dict = model_runner_output.prompt_logits_dict
+        sample_logits = model_runner_output.sample_logits
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -1685,6 +1687,12 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            prompt_logits = prompt_logits_dict.get(req_id)
+            req_sample_logits = (
+                sample_logits[req_index : req_index + len(new_token_ids)]
+                if sample_logits is not None and new_token_ids
+                else None
+            )
             if (
                 new_token_ids
                 or pooler_output is not None
@@ -1699,6 +1707,8 @@ class Scheduler(SchedulerInterface):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        new_prompt_logits=prompt_logits,
+                        new_sample_logits=req_sample_logits,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),

@@ -5,6 +5,8 @@ import itertools
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.logprobs import (
     FlatLogprobs,
@@ -38,6 +40,8 @@ class LogprobsProcessor:
     cumulative_logprob: float | None
     num_logprobs: int | None
     num_prompt_logprobs: int | None
+    prompt_logits: torch.Tensor | None = None
+    sample_logits: torch.Tensor | None = None
 
     @classmethod
     def from_new_request(
@@ -350,3 +354,12 @@ class LogprobsProcessor:
             self._update_sample_logprobs(output.new_logprobs)
         if output.new_prompt_logprobs_tensors is not None:
             self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)
+        if output.new_prompt_logits is not None:
+            self.prompt_logits = output.new_prompt_logits
+        if output.new_sample_logits is not None:
+            if self.sample_logits is None:
+                self.sample_logits = output.new_sample_logits
+            else:
+                self.sample_logits = torch.cat(
+                    [self.sample_logits, output.new_sample_logits], dim=0
+                )
