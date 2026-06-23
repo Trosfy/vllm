@@ -328,6 +328,19 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
+                        # The capture forward_fn may use distinct metadata from
+                        # the warmup pass above. Run it once eagerly before
+                        # capture so Inductor/Triton first-call autotuning does
+                        # not happen inside torch.cuda.graph().
+                        if b12x_cuda_graph_prewarm_enabled():
+                            with guard_b12x_kernel_resolution(
+                                "vLLM full CUDA graph prewarm with capture state"
+                            ):
+                                forward_fn(CUDAGraphMode.NONE)
+                        else:
+                            forward_fn(CUDAGraphMode.NONE)
+                        get_offloader().join_after_forward()
+                        get_offloader().sync_prev_onload()
                         with guard_b12x_kernel_resolution(
                             "vLLM full CUDA graph capture after B12X warmup"
                         ), torch.cuda.graph(graph, self.pool):
