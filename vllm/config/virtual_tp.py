@@ -99,9 +99,11 @@ def _build_b12x_virtual_tp_plan(
 
     original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
     # DeepSeek V4 carries output-group constraints tied to padded head count.
-    # GLM/DSA sparse MLA only needs divisibility by TP; backend kernels handle
-    # their own local tiling, so avoid inflating KV/cache shapes there.
-    attention_head_alignment = _ATTENTION_HEAD_LOCAL_ALIGNMENT if is_deepseek_v4 else 1
+    # GLM/DSA sparse MLA also needs full local HPB shards for B12X MG prefill:
+    # TP6 with only divisibility-by-TP padding produces 11 local heads, then the
+    # B12X wrapper pads that partial HPB to 16. The current MG prefill kernel does
+    # not carry a valid_hpb mask for that path and corrupts long-context output.
+    attention_head_alignment = _ATTENTION_HEAD_LOCAL_ALIGNMENT
     attention_axis = _make_virtual_axis(
         original_attention_heads,
         attention_tp_size,
