@@ -1,8 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
+
+try:
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    _MHC_USE_DEEP_GEMM = (
+        os.environ.get("VLLM_MHC_USE_DEEP_GEMM", "0") == "1"
+        and is_deep_gemm_supported()
+    )
+except Exception:
+    # Keep import-time probes from breaking non-worker flows. The MHC helper
+    # falls back to the non-DeepGEMM split choice if the platform is not ready.
+    _MHC_USE_DEEP_GEMM = False
 
 
 def _torch_hc_prenorm_gemm(
@@ -162,9 +176,7 @@ def mhc_pre_tilelang(
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
 
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = _MHC_USE_DEEP_GEMM
     if use_deep_gemm:
         # these numbers are from deepgemm kernel impl
         block_k = 64
@@ -405,9 +417,7 @@ def mhc_fused_post_pre_tilelang(
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = _MHC_USE_DEEP_GEMM
     use_small_fma = num_tokens <= 16
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
@@ -674,25 +684,49 @@ def _hc_head_fused_kernel_tilelang_fake(
     )
 
 
+_mhc_pre_tilelang_impl = mhc_pre_tilelang
+_mhc_post_tilelang_impl = mhc_post_tilelang
+_mhc_fused_post_pre_tilelang_impl = mhc_fused_post_pre_tilelang
+
 direct_register_custom_op(
     op_name="mhc_pre_tilelang",
-    op_func=mhc_pre_tilelang,
+    op_func=_mhc_pre_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_pre_tilelang_fake,
 )
 direct_register_custom_op(
     op_name="mhc_post_tilelang",
-    op_func=mhc_post_tilelang,
+    op_func=_mhc_post_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_post_tilelang_fake,
 )
 
 direct_register_custom_op(
     op_name="mhc_fused_post_pre_tilelang",
-    op_func=mhc_fused_post_pre_tilelang,
+    op_func=_mhc_fused_post_pre_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_fused_post_pre_tilelang_fake,
 )
+
+
+def mhc_pre_tilelang(*args, **kwargs):
+    """Call MHC pre through the registered custom op.
+
+    Model code imports this symbol directly. Keeping the public symbol as a
+    thin custom-op wrapper prevents torch.compile from tracing into TileLang
+    Python/JIT internals during memory profiling and CUDA graph capture.
+    """
+    return torch.ops.vllm.mhc_pre_tilelang(*args, **kwargs)
+
+
+def mhc_post_tilelang(*args, **kwargs):
+    """Call MHC post through the registered custom op."""
+    return torch.ops.vllm.mhc_post_tilelang(*args, **kwargs)
+
+
+def mhc_fused_post_pre_tilelang(*args, **kwargs):
+    """Call fused MHC post/pre through the registered custom op."""
+    return torch.ops.vllm.mhc_fused_post_pre_tilelang(*args, **kwargs)
 
 direct_register_custom_op(
     op_name="hc_head_fused_kernel_tilelang",
