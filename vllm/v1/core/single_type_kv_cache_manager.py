@@ -66,7 +66,15 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
+        # Under (D)CP a request's cache is sharded across ranks, so one local
+        # block of `block_size` slots covers `block_size * cp` tokens of the
+        # global sequence -- scale the scheduler-visible block size to match.
+        # dcp_replicated groups (e.g. the DFlash draft) instead keep the full
+        # cache on every rank, so one block covers exactly `block_size` global
+        # tokens and must not be scaled.
+        if dcp_world_size * pcp_world_size > 1 and not getattr(
+            kv_cache_spec, "dcp_replicated", False
+        ):
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -1405,12 +1413,27 @@ def get_manager_for_kv_cache_spec(
     # chunks; the runtime admission cap must match the recycling-aware bound
     # the startup pool sizer uses (single source of truth: the spec method).
     if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
-        kwargs["max_admission_blocks_per_request"] = (
-            kv_cache_spec.max_admission_blocks_per_request(
-                max_num_batched_tokens=max_num_batched_tokens,
-                max_model_len=max_model_len,
+        if (
+            isinstance(kv_cache_spec, SlidingWindowMLASpec)
+            and kv_cache_spec.dcp_sharded
+        ):
+            dcp_world_size = kwargs.get("dcp_world_size", 1)
+            pcp_world_size = kwargs.get("pcp_world_size", 1)
+            block_size = kv_cache_spec.block_size * dcp_world_size * pcp_world_size
+            num_tokens = min(
+                kv_cache_spec.sliding_window - 1 + max_num_batched_tokens,
+                max_model_len,
             )
-        )
+            kwargs["max_admission_blocks_per_request"] = cdiv(
+                num_tokens, block_size
+            ) + 1
+        else:
+            kwargs["max_admission_blocks_per_request"] = (
+                kv_cache_spec.max_admission_blocks_per_request(
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    max_model_len=max_model_len,
+                )
+            )
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
 
