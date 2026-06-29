@@ -36,7 +36,11 @@ def _build_dspark_sparse_attn_kernel(num_heads: int, head_dim: int, scale: float
         topk = T.symbolic("topk")
 
         num_stages = 2
-        threads = 256
+        # TP4 has 16 DSpark heads per rank. With 8 warps, TileLang's FullRow
+        # repartition leaves too few warp-column tiles for this MMA layout.
+        # Use 4 warps for that native-head path; TP2 keeps the measured faster
+        # 8-warps path.
+        threads = 128 if num_heads <= 16 else 256
         # The upstream DSpark reference uses 64, which asks for ~104 KiB
         # dynamic shared memory on DeepSeek V4 head dims and is rejected on
         # this sm120 stack. 32 keeps the same online-softmax algorithm while
