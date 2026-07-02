@@ -63,6 +63,7 @@ class RejectionSampler:
         self.sampler = sampler
         self.num_speculative_steps = spec_config.num_speculative_tokens
         self.rejection_sample_method = spec_config.rejection_sample_method
+        self.use_block_verification = self.rejection_sample_method == "block"
         self.synthetic_conditional_rates: torch.Tensor | None = None
         if self.rejection_sample_method == "synthetic":
             assert spec_config.synthetic_acceptance_rates is not None
@@ -130,6 +131,16 @@ class RejectionSampler:
             draft_sampled,
             input_batch.expanded_local_pos,
         )
+        use_block_verification = self.use_block_verification
+        if use_block_verification:
+            # Block verification only affects temp>0 requests; its prep
+            # kernels cost ~5-7% of the step, so skip them for all-greedy
+            # batches (host-side check, no sync).
+            temps = self.sampler.sampling_states.temperature.np[
+                input_batch.idx_mapping_np
+            ]
+            if not (temps > 0).any():
+                use_block_verification = False
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -144,6 +155,7 @@ class RejectionSampler:
             self.num_speculative_steps,
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
+            use_block_verification=use_block_verification,
         )
         logprobs_tensors = self._get_logprobs_tensors(
             input_batch,

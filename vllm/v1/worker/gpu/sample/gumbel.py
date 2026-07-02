@@ -69,6 +69,14 @@ def apply_temperature(
 
 
 @triton.jit
+def tl_rand32(seed, offset, includes_zero: tl.constexpr):
+    u = tl.rand(seed, offset)
+    if not includes_zero:
+        u = tl.maximum(u, _TL_RAND_MIN)
+    return u
+
+
+@triton.jit
 def tl_rand64(seed, offset, includes_zero: tl.constexpr):
     lo, hi, _, _ = tl.randint4x(seed, offset)
     lo = lo.to(tl.uint32, bitcast=True).to(tl.uint64)
