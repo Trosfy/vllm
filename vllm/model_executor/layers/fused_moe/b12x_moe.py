@@ -552,6 +552,18 @@ def _run_b12x_moe_fp4(
     """Call b12x MoE with caller-owned live scratch."""
     from b12x.integration.tp_moe import b12x_moe_fp4
 
+    from .b12x_tiny_decode import maybe_run_tiny_w4a8mx_moe
+
+    if maybe_run_tiny_w4a8mx_moe(
+        a=a,
+        experts=experts,
+        output=output,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        plan=plan,
+    ):
+        return
+
     if _moe_zero_scratch_enabled():
         if _is_current_stream_capturing():
             raise RuntimeError("B12X_MOE_ZERO_SCRATCH is a diagnostic eager-only mode")
