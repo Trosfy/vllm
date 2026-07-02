@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
+    VLLM_B12X_INDEXER_PREFILL_MQA_LOGITS: bool = False
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
@@ -1012,6 +1013,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
+    # With the b12x sparse indexer enabled, route prefill-chunk scoring through
+    # the DeepGEMM fp8 MQA-logits + top-k-per-row path (the same kernels the
+    # FlashInfer sparse backends use) while decode keeps the b12x paged
+    # indexer. Only applies to layers with the logical top-k contract
+    # (output_physical_slots=False); the GLM native physical-slot contract
+    # always keeps the b12x producer.
+    "VLLM_B12X_INDEXER_PREFILL_MQA_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_B12X_INDEXER_PREFILL_MQA_LOGITS", "0"))
     ),
     # Use b12x for DeepSeek V4 mHC pre/post residual mixing.
     # This is opt-in while the b12x subsystems are brought over one at a time.

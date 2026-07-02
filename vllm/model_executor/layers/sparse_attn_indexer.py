@@ -666,6 +666,18 @@ def use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
     return _use_b12x_sparse_indexer(enabled)
 
 
+def _b12x_prefill_uses_mqa_logits(output_physical_slots: bool) -> bool:
+    """Whether b12x-indexer prefill chunks reroute to DeepGEMM MQA logits.
+
+    Decode always keeps the b12x paged indexer. The native physical-slot
+    contract (GLM non-compressed indexer) has no DeepGEMM producer, so it
+    always keeps the b12x prefill path regardless of the env toggle.
+    """
+    return (
+        envs.VLLM_B12X_INDEXER_PREFILL_MQA_LOGITS and not output_physical_slots
+    )
+
+
 @triton.jit
 def _fused_indexer_q_rope_quant_kernel(
     positions,
@@ -1329,7 +1341,11 @@ def sparse_attn_indexer(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
+        b12x_indexer_requested = _b12x_sparse_indexer_requested(use_b12x_sparse_indexer)
+        b12x_prefill_mqa = b12x_indexer_requested and _b12x_prefill_uses_mqa_logits(
+            output_physical_slots
+        )
+        if b12x_indexer_requested:
             _ensure_b12x_sparse_indexer_supported()
             profile_q_rows = _get_b12x_paged_indexer_profile_q_rows(
                 int(q_quant.shape[0])
@@ -1349,50 +1365,52 @@ def sparse_attn_indexer(
                 device=q_quant.device,
                 shared_page_table=False,
             )
-            _reserve_b12x_paged_indexer_scratch(
-                q_rows=profile_q_rows,
-                num_q_heads=int(q_quant.shape[1]),
-                topk_tokens=int(topk_tokens),
-                total_k_rows=profile_k_rows,
-                device=q_quant.device,
-                shared_page_table=True,
-            )
+            if not b12x_prefill_mqa:
+                _reserve_b12x_paged_indexer_scratch(
+                    q_rows=profile_q_rows,
+                    num_q_heads=int(q_quant.shape[1]),
+                    topk_tokens=int(topk_tokens),
+                    total_k_rows=profile_k_rows,
+                    device=q_quant.device,
+                    shared_page_table=True,
+                )
             (
                 dcp_world_size,
                 dcp_rank,
                 cp_kv_cache_interleave_size,
             ) = _get_dcp_warmup_params()
-            _prewarm_b12x_paged_indexer_prefill(
-                q_quant=q_quant,
-                weights=weights,
-                kv_cache=kv_cache,
-                topk_tokens=int(topk_tokens),
-                profile_q_rows=profile_q_rows,
-                profile_k_rows=warmup_k_rows,
-                page_table_k_rows=profile_k_rows,
-                output_physical_slots=output_physical_slots,
-            )
-            if dcp_world_size > 1:
-                dcp_profile_k_rows = _get_dcp_local_k_rows(
-                    profile_k_rows,
-                    dcp_world_size,
-                    dcp_rank,
-                    cp_kv_cache_interleave_size,
+            if not b12x_prefill_mqa:
+                _prewarm_b12x_paged_indexer_prefill(
+                    q_quant=q_quant,
+                    weights=weights,
+                    kv_cache=kv_cache,
+                    topk_tokens=int(topk_tokens),
+                    profile_q_rows=profile_q_rows,
+                    profile_k_rows=warmup_k_rows,
+                    page_table_k_rows=profile_k_rows,
+                    output_physical_slots=output_physical_slots,
                 )
-                dcp_warmup_k_rows = _get_b12x_paged_indexer_profile_warmup_k_rows(
-                    dcp_profile_k_rows
-                )
-                if dcp_warmup_k_rows != warmup_k_rows:
-                    _prewarm_b12x_paged_indexer_prefill(
-                        q_quant=q_quant,
-                        weights=weights,
-                        kv_cache=kv_cache,
-                        topk_tokens=int(topk_tokens),
-                        profile_q_rows=profile_q_rows,
-                        profile_k_rows=dcp_warmup_k_rows,
-                        page_table_k_rows=dcp_profile_k_rows,
-                        output_physical_slots=output_physical_slots,
+                if dcp_world_size > 1:
+                    dcp_profile_k_rows = _get_dcp_local_k_rows(
+                        profile_k_rows,
+                        dcp_world_size,
+                        dcp_rank,
+                        cp_kv_cache_interleave_size,
                     )
+                    dcp_warmup_k_rows = _get_b12x_paged_indexer_profile_warmup_k_rows(
+                        dcp_profile_k_rows
+                    )
+                    if dcp_warmup_k_rows != warmup_k_rows:
+                        _prewarm_b12x_paged_indexer_prefill(
+                            q_quant=q_quant,
+                            weights=weights,
+                            kv_cache=kv_cache,
+                            topk_tokens=int(topk_tokens),
+                            profile_q_rows=profile_q_rows,
+                            profile_k_rows=dcp_warmup_k_rows,
+                            page_table_k_rows=dcp_profile_k_rows,
+                            output_physical_slots=output_physical_slots,
+                        )
             _prewarm_b12x_dcp_topk_merge(
                 q_rows=profile_q_rows,
                 topk_tokens=int(topk_tokens),
@@ -1401,13 +1419,14 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                 device=q_quant.device,
             )
-            _prewarm_b12x_contiguous_prefill_variants(
-                q_quant=q_quant,
-                weights=weights,
-                topk_tokens=int(topk_tokens),
-                profile_q_rows=profile_q_rows,
-            )
-        else:
+            if not b12x_prefill_mqa:
+                _prewarm_b12x_contiguous_prefill_variants(
+                    q_quant=q_quant,
+                    weights=weights,
+                    topk_tokens=int(topk_tokens),
+                    profile_q_rows=profile_q_rows,
+                )
+        if not b12x_indexer_requested or b12x_prefill_mqa:
             # Reserve workspace for indexer during profiling run.
             current_workspace_manager().get_simultaneous(
                 values_spec, scales_spec, ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8)
@@ -1489,7 +1508,11 @@ def sparse_attn_indexer(
             scale_fmt,
         )
 
-    if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
+    _use_b12x_any = _use_b12x_sparse_indexer(use_b12x_sparse_indexer)
+    _use_b12x_prefill = _use_b12x_any and not _b12x_prefill_uses_mqa_logits(
+        output_physical_slots
+    )
+    if not _use_b12x_prefill:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
@@ -1498,8 +1521,8 @@ def sparse_attn_indexer(
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
         # scales) based on use_fp4_cache.
-        use_b12x_indexer = _use_b12x_sparse_indexer(use_b12x_sparse_indexer)
-        if use_b12x_indexer and use_fp4_cache:
+        use_b12x_indexer = _use_b12x_prefill
+        if _use_b12x_any and use_fp4_cache:
             raise RuntimeError(
                 "b12x sparse indexer currently requires the FP8 indexer cache; "
                 "disable use_fp4_indexer_cache or disable b12x sparse indexer."

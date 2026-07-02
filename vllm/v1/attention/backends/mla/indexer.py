@@ -760,7 +760,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 num_decodes : num_decodes + num_prefills
             ]
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            # The compressed (C4) indexer has a logical top-k contract, so its
+            # prefill chunks may be rerouted to the DeepGEMM MQA-logits path;
+            # size them for the full-context logits blob in that case. The
+            # non-compressed (GLM) physical-slot contract always keeps the
+            # b12x supertile chunking.
+            b12x_prefill_chunking = envs.VLLM_USE_B12X_SPARSE_INDEXER and not (
+                envs.VLLM_B12X_INDEXER_PREFILL_MQA_LOGITS and self.compress_ratio > 1
+            )
+            if b12x_prefill_chunking:
                 chunk_specs = []
                 b12x_budget_seq_lens = np.array(
                     [_get_b12x_paged_indexer_supertile_k()],
