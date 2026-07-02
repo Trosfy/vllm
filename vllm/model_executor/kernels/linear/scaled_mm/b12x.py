@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -25,9 +26,16 @@ from .BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
+from .deep_gemm import DeepGemmFp8BlockScaledMMKernel
 
 _B12X_BLOCK_FP8: Any | None = None
 _B12X_BLOCK_FP8_MISSING = False
+
+# Measured crossover on RTX PRO 6000 Blackwell (DSV4-Flash TP2 dense shapes,
+# b12x benchmark_dense_fp8_vs_deepgemm 2026-07-02): the b12x MXFP8 dense GEMM
+# beats DeepGEMM up to M=2048 (0.73-0.95x) and loses above (1.05-1.21x at
+# M=4096-8192), so prefill-sized token batches route to DeepGEMM.
+_B12X_DG_PREFILL_DEFAULT_MIN_TOKENS = 2049
 
 if TYPE_CHECKING:
     from typing import TypeAlias
@@ -109,12 +117,28 @@ def _run_b12x_fp8_block_scaled_linear(
     )
 
 
+def _b12x_dg_prefill_min_tokens() -> int:
+    raw = os.getenv("VLLM_B12X_FP8_LINEAR_DG_PREFILL_MIN_TOKENS")
+    if raw is None:
+        return _B12X_DG_PREFILL_DEFAULT_MIN_TOKENS
+    return int(raw)
+
+
 def _apply_b12x_fp8_block_scaled_linear(
     layer: torch.nn.Module,
     x: torch.Tensor,
     bias: torch.Tensor | None,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
+    dg_kernel = getattr(layer, "b12x_dg_prefill_kernel", None)
+    if (
+        dg_kernel is not None
+        and x.numel() // x.shape[-1] >= _b12x_dg_prefill_min_tokens()
+    ):
+        # Prefill-regime token counts run the DeepGEMM path on the
+        # dg-processed copy of the weights; decode/small batches stay on the
+        # b12x MXFP8 dense GEMM, which wins below the crossover.
+        return dg_kernel.apply_weights(layer, x, bias)
     packed_weight = getattr(layer, "b12x_packed_weight", None)
     if packed_weight is None:
         raise RuntimeError(
@@ -167,7 +191,28 @@ direct_register_custom_op(
 
 
 class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
-    """Block-FP8 linear through the native b12x SM120 MXFP8 GEMM path."""
+    """Block-FP8 linear through the native b12x SM120 MXFP8 GEMM path.
+
+    When ``VLLM_B12X_FP8_LINEAR_DG_PREFILL`` is enabled (default), layers also
+    keep a DeepGEMM-processed copy of the weights and route token batches at
+    or above the prefill crossover to the DeepGEMM fp8 GEMM, where it is
+    faster than the b12x MXFP8 dense GEMM. Decode and small batches stay on
+    the b12x path. Memory cost is unchanged: the b12x pack always duplicates
+    the weight, and the DeepGEMM processing replaces the original copy
+    in place.
+    """
+
+    def __init__(self, config: FP8ScaledMMLinearLayerConfig):
+        super().__init__(config)
+        self._dg_prefill_kernel: DeepGemmFp8BlockScaledMMKernel | None = None
+        if os.getenv("VLLM_B12X_FP8_LINEAR_DG_PREFILL", "1") == "1":
+            dg_supported, _ = DeepGemmFp8BlockScaledMMKernel.is_supported()
+            if dg_supported:
+                dg_can_implement, _ = DeepGemmFp8BlockScaledMMKernel.can_implement(
+                    config
+                )
+                if dg_can_implement:
+                    self._dg_prefill_kernel = DeepGemmFp8BlockScaledMMKernel(config)
 
     @classmethod
     def is_supported(
@@ -239,6 +284,11 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             block_size=tuple(layer.weight_block_size),
         )
         _register_b12x_fp8_block_scaled_linear_layer(layer)
+        if self._dg_prefill_kernel is not None:
+            # Must run after the b12x pack: DeepGEMM processing replaces the
+            # original checkpoint-layout weight/scale parameters in place.
+            self._dg_prefill_kernel.process_weights_after_loading(layer)
+            layer.b12x_dg_prefill_kernel = self._dg_prefill_kernel
 
     def apply_weights(
         self,
