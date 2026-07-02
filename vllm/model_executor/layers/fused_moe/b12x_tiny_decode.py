@@ -93,7 +93,7 @@ def _tiny_fc1_kernel(
     v_r = tl.arange(0, 4)[None, None, :]
     p_full = nt * 256 + n8c_r * 32 + v_r * 8 + r8_r
     r_log = (p_full + ROT) % N2
-    tl.atomic_add(inter_ptr + pid_rt.to(tl.int64) * N2 + r_log, row_part, sem='relaxed')
+    tl.atomic_add(inter_ptr + pid_rt.to(tl.int64) * N2 + r_log, row_part)
 
 
 @triton.jit
@@ -149,7 +149,7 @@ def _tiny_fc2_kernel(
     r8_r = tl.arange(0, 8)[None, :, None]
     v_r = tl.arange(0, 4)[None, None, :]
     p_full = nt * 256 + n8c_r * 32 + v_r * 8 + r8_r
-    tl.atomic_add(out_ptr + tok.to(tl.int64) * K_OUT + p_full, row_part * rw, sem='relaxed')
+    tl.atomic_add(out_ptr + tok.to(tl.int64) * K_OUT + p_full, row_part * rw)
 
 
 
