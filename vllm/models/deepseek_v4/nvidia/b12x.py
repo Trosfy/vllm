@@ -322,6 +322,9 @@ def _run_compressed_mla(
     # rank contributes the gathered sink so the LSE reducer does not count it
     # once per DCP rank.
     sink = attn_sink[:heads].contiguous() if attn_sink is not None else None
+    # b12x writes the final O directly into `output` (no workspace-to-caller
+    # DtoD copy); the [tokens, heads, 512] bf16 contiguous contract is enforced
+    # by b12x and raises on mismatch.
     result = compressed_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_k_cache,
@@ -333,13 +336,11 @@ def _run_compressed_mla(
         expected_num_q_heads=heads,
         return_lse=return_lse,
         lse_scale=lse_scale,
+        out=output,
     )
     if return_lse:
-        out, lse = cast(tuple[torch.Tensor, torch.Tensor], result)
-        output.copy_(out)
+        _, lse = cast(tuple[torch.Tensor, torch.Tensor], result)
         return lse
-    out = cast(torch.Tensor, result)
-    output.copy_(out)
     return None
 
 
@@ -422,6 +423,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
     """b12x compressed sparse-MLA attention layer for DeepSeek-V4 (SM120)."""
 
     backend_cls: ClassVar[type[AttentionBackend]] = DeepseekV4B12xMLASparseBackend
+    enqueue_default_before_indexer: ClassVar[bool] = True
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -447,7 +449,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         views = getattr(self, "_b12x_cache_page_views", None)
         if views is None:
             views = {}
-            setattr(self, "_b12x_cache_page_views", views)
+            self._b12x_cache_page_views = views
         key = _b12x_cache_page_view_key(cache, page_size)
         view = views.get(key)
         if view is None:

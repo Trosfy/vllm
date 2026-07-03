@@ -38,6 +38,7 @@ export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_S
 
 export B12X_DENSE_SPLITK_TURBO="${B12X_DENSE_SPLITK_TURBO:-1}"
 export B12X_W4A16_TC_DECODE="${B12X_W4A16_TC_DECODE:-1}"
+export B12X_MOE_FORCE_A16=1
 
 json_bool() {
   local name="$1"
@@ -57,33 +58,125 @@ json_bool() {
   esac
 }
 
-MODEL="${MODEL:-/models/GLM-5.2-NVFP4}"
+VLLM_EXTRA_ARGS=()
+while (($#)); do
+  case "$1" in
+    --causal-cascade)
+      GLM52_CAUSAL_CASCADE=1
+      shift
+      ;;
+    --no-causal-cascade)
+      GLM52_CAUSAL_CASCADE=0
+      shift
+      ;;
+    --no-mtp)
+      GLM51_DISABLE_MTP=1
+      shift
+      ;;
+    *)
+      VLLM_EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${VLLM_EXTRA_ARGS[@]}"
+
+MODEL="${MODEL:-lukealonso/GLM-5.2-NVFP4}"
 MTP_MODEL="${MTP_MODEL:-${MODEL}}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.2}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-DCP_SIZE="${DCP_SIZE:-4}"
+DCP_SIZE="${DCP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_CUDAGRAPH_CAPTURE_SIZE=128
+GENERATION_CONFIG="${GENERATION_CONFIG:-vllm}"
 
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
 MOE_SPEC_BACKEND="${MOE_SPEC_BACKEND:-b12x}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 GLM51_PROFILE="${GLM51_PROFILE:-0}"
+GLM52_CAUSAL_CASCADE="${GLM52_CAUSAL_CASCADE:-0}"
+ADAPTIVE_SPEC_WINDOW="${GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:-}"
+
+if [[ -n "${ADAPTIVE_SPEC_WINDOW}" \
+  && ! "${ADAPTIVE_SPEC_WINDOW}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW must be a positive" \
+    "integer; got '${ADAPTIVE_SPEC_WINDOW}'" >&2
+  exit 1
+fi
+
+DEFAULT_CAUSAL_CASCADE_MODEL="/data/datasets/glmflash/runs/train/mtp-v10-clean-p1r256-dualstream2-markov-tv-20260701-161620-prefixgrad01-bufferfix-fromstep5000/checkpoints/latest"
+CAUSAL_CASCADE_MODEL="${CAUSAL_CASCADE_MODEL:-${DEFAULT_CAUSAL_CASCADE_MODEL}}"
+CAUSAL_CASCADE_BLOCK_SIZE="${CAUSAL_CASCADE_BLOCK_SIZE:-9}"
+# Slot 0 is the verifier bonus/known token; slots 1 through 8 are drafts.
+export CAUSAL_CASCADE_FIRST_DRAFT_SLOT="${CAUSAL_CASCADE_FIRST_DRAFT_SLOT:-1}"
+export CAUSAL_CASCADE_USE_CAPTURE_POSITIONS="${CAUSAL_CASCADE_USE_CAPTURE_POSITIONS:-0}"
+CAUSAL_CASCADE_DRAFT_SAMPLE_METHOD="${CAUSAL_CASCADE_DRAFT_SAMPLE_METHOD:-greedy}"
+CAUSAL_CASCADE_DEFAULT_NUM_SPECULATIVE_TOKENS="$((CAUSAL_CASCADE_BLOCK_SIZE - CAUSAL_CASCADE_FIRST_DRAFT_SLOT))"
+CAUSAL_CASCADE_NUM_SPECULATIVE_TOKENS="${CAUSAL_CASCADE_NUM_SPECULATIVE_TOKENS:-${CAUSAL_CASCADE_DEFAULT_NUM_SPECULATIVE_TOKENS}}"
+export CAUSAL_CASCADE_MIN_CONTEXT_TOKENS="${CAUSAL_CASCADE_MIN_CONTEXT_TOKENS:-128}"
+CAUSAL_CASCADE_ENFORCE_EAGER="${CAUSAL_CASCADE_ENFORCE_EAGER:-0}"
 
 GLM52_INDEX_TOPK_PATTERN="FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS"
 DEFAULT_HF_OVERRIDES="$(printf '{"index_topk_pattern":"%s"}' "${GLM52_INDEX_TOPK_PATTERN}")"
 HF_OVERRIDES="${HF_OVERRIDES:-$DEFAULT_HF_OVERRIDES}"
 
 SPEC_ARGS=()
-if [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
-  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
-  SPEC_CONFIG="${SPEC_CONFIG:-$(printf '{"model":"%s","method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","draft_sample_method":"probabilistic"}' "${MTP_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${MOE_SPEC_BACKEND}")}"
+CAUSAL_CASCADE_ARGS=()
+GLM52_CAUSAL_CASCADE_JSON="$(json_bool GLM52_CAUSAL_CASCADE "${GLM52_CAUSAL_CASCADE}")"
+if [[ "${GLM52_CAUSAL_CASCADE_JSON}" == "true" ]]; then
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+    echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW requires the MTP" \
+      "speculative path; disable GLM52_CAUSAL_CASCADE" >&2
+    exit 1
+  fi
+
+  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${CAUSAL_CASCADE_NUM_SPECULATIVE_TOKENS}}"
+  SPEC_CONFIG="${SPEC_CONFIG:-$(printf '{"model":"%s","method":"causal_cascade","num_speculative_tokens":%s,"draft_sample_method":"%s"}' "${CAUSAL_CASCADE_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${CAUSAL_CASCADE_DRAFT_SAMPLE_METHOD}")}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+
+  echo "CausalCascade native inference enabled." >&2
+
+  CAUSAL_CASCADE_ENFORCE_EAGER_JSON="$(json_bool CAUSAL_CASCADE_ENFORCE_EAGER "${CAUSAL_CASCADE_ENFORCE_EAGER}")"
+  if [[ "${CAUSAL_CASCADE_ENFORCE_EAGER_JSON}" == "true" ]]; then
+    CAUSAL_CASCADE_ARGS+=(--enforce-eager)
+  fi
+elif [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" && -n "${SPEC_CONFIG:-}" ]]; then
+    echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW cannot be combined" \
+      "with an explicit SPEC_CONFIG" >&2
+    exit 1
+  fi
+
+  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+  ADAPTIVE_SPEC_CONFIG=""
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+    ADAPTIVE_SPEC_CONFIG="$(
+      printf ',"adaptive_speculative_tokens_window":%s' \
+        "${ADAPTIVE_SPEC_WINDOW}"
+    )"
+    echo "Adaptive speculative depth enabled with a ${ADAPTIVE_SPEC_WINDOW}-step" \
+      "window and maximum depth ${NUM_SPECULATIVE_TOKENS}." >&2
+  fi
+  DEFAULT_SPEC_CONFIG="$(
+    printf \
+      '{"model":"%s","method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","draft_sample_method":"probabilistic"%s}' \
+      "${MTP_MODEL}" \
+      "${NUM_SPECULATIVE_TOKENS}" \
+      "${MOE_SPEC_BACKEND}" \
+      "${ADAPTIVE_SPEC_CONFIG}"
+  )"
+  SPEC_CONFIG="${SPEC_CONFIG:-${DEFAULT_SPEC_CONFIG}}"
+  SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+elif [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+  echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW requires MTP; remove" \
+    "--no-mtp or unset GLM51_DISABLE_MTP" >&2
+  exit 1
 fi
 
 PROFILER_ARGS=()
@@ -139,7 +232,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --trust-remote-code \
   --host "${HOST}" \
   --port "${PORT}" \
-  --max-model-len auto \
+  --max-model-len "${MAX_MODEL_LEN}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --pipeline-parallel-size 1 \
   --decode-context-parallel-size "${DCP_SIZE}" \
@@ -161,7 +254,9 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --tool-call-parser glm47 \
   --enable-auto-tool-choice \
   --reasoning-parser glm45 \
+  --generation-config "${GENERATION_CONFIG}" \
   --hf-overrides "${HF_OVERRIDES}" \
   "${SPEC_ARGS[@]}" \
   "${PROFILER_ARGS[@]}" \
+  "${CAUSAL_CASCADE_ARGS[@]}" \
   "$@"

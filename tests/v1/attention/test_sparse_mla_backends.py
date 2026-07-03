@@ -36,7 +36,10 @@ if not current_platform.is_cuda():
     )
 
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xMLASparseBackend,
+    B12xMLASparseImpl,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
 )
@@ -67,6 +70,112 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "kernel_num_heads"), [(8, 8), (11, 16), (24, 24)]
+)
+def test_b12x_sparse_glm_uses_8_head_alignment(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+    num_heads: int,
+    kernel_num_heads: int,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("b12x") is None:
+        pytest.skip("b12x package not available")
+
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 2
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+
+    topk_indices = torch.zeros((2, 2048), dtype=torch.int32, device=DEVICE_TYPE)
+    impl = B12xMLASparseImpl(
+        num_heads=num_heads,
+        head_size=576,
+        scale=1.0 / math.sqrt(576),
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=topk_indices,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+
+    # TP=8 keeps GLM's 8 local heads native; virtual TP=6 exposes 11 local
+    # heads and pads only the kernel-facing tail to the next 8-head boundary.
+    assert impl._kernel_num_heads == kernel_num_heads
+    assert impl._pad_heads is (num_heads != kernel_num_heads)
+    assert impl._decode_plan.caps.num_q_heads == kernel_num_heads
+    assert impl._extend_plan.caps.num_q_heads == kernel_num_heads
+
+    captured: dict[str, tuple[int, ...]] = {}
+    real_decode_forward = impl._sparse_mla_decode_forward
+
+    def fake_decode_forward(*, binding, **kwargs):
+        captured["q_shape"] = tuple(binding.q.shape)
+        if num_heads == 8:
+            return real_decode_forward(binding=binding, **kwargs)
+        output = binding.scratch.output_buffer[: binding.q.shape[0]]
+        output.zero_()
+        return output
+
+    impl._sparse_mla_decode_forward = fake_decode_forward
+    q_nope = torch.zeros((1, num_heads, 512), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    q_rope = torch.zeros((1, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv_cache = torch.zeros((1, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
+    metadata = SimpleNamespace(
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=DEVICE_TYPE),
+        block_size=64,
+        cache_seq_lens_per_token=torch.full(
+            (1,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        cache_seq_lens_per_req=torch.full(
+            (1,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        max_query_len=1,
+        num_reqs=1,
+    )
+
+    output, lse = impl.forward_mqa((q_nope, q_rope), kv_cache, metadata, layer=None)
+    assert captured["q_shape"] == (1, kernel_num_heads, 576)
+    assert output.shape == (1, num_heads, 512)
+    assert lse is None
+
+    if num_heads == 8:
+        import b12x.attention.mla.kernel as b12x_mla_kernel
+
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+        assert b12x_mla_kernel.LAST_DECODE_PLAN.get("native_glm_h8") is True
+
+        q_nope = torch.zeros(
+            (2, num_heads, 512), dtype=torch.bfloat16, device=DEVICE_TYPE
+        )
+        q_rope = torch.zeros(
+            (2, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE
+        )
+        metadata.cache_seq_lens_per_token = torch.full(
+            (2,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        )
+        metadata.max_query_len = 2
+        output, lse = impl.forward_mqa((q_nope, q_rope), kv_cache, metadata, layer=None)
+        torch.cuda.synchronize()
+        assert output.shape == (2, 8, 512)
+        assert torch.isfinite(output).all()
+        assert lse is None
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
@@ -256,7 +365,10 @@ def test_sparse_backend_decode_correctness(
     qk_rope_head_dim = 64
     v_head_dim = 128
     head_size = kv_lora_rank + qk_rope_head_dim
-    topk_tokens = 128
+    # GLM 5.2 selects 2048 rows. Keep the shared backend test small for other
+    # implementations, but validate b12x at the model's real contract instead of
+    # relying on a smaller kernel-supported regime.
+    topk_tokens = 2048 if backend_cls is B12xMLASparseBackend else 128
 
     max_seqlen = max(batch_spec.seq_lens)
     total_cache_tokens = sum(batch_spec.seq_lens)
@@ -472,8 +584,27 @@ def test_sparse_backend_decode_correctness(
         common_prefix_len=0, common_attn_metadata=common_attn_metadata
     )
 
-    # Use the pre-computed sparse_indices for the mock indexer
-    mock_indexer = SimpleNamespace(topk_indices_buffer=sparse_indices)
+    # B12X owns both ends of the GLM sparse-attention pipeline, so its indexer
+    # buffer already contains native physical cache slots. Other backends retain
+    # the request-relative sparse-index contract exercised by this shared test.
+    backend_sparse_indices = sparse_indices
+    output_physical_slots = backend_cls is B12xMLASparseBackend
+    if output_physical_slots:
+        req_ids = torch.repeat_interleave(
+            torch.arange(batch_spec.batch_size, dtype=torch.int32, device=device),
+            torch.tensor(query_lens, dtype=torch.int64, device=device),
+        )
+        backend_sparse_indices = triton_convert_req_index_to_global_index(
+            req_ids,
+            common_attn_metadata.block_table_tensor,
+            sparse_indices,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_tokens,
+        )
+    mock_indexer = SimpleNamespace(
+        topk_indices_buffer=backend_sparse_indices,
+        output_physical_slots=output_physical_slots,
+    )
 
     kv_b_proj_weight = torch.cat([W_UK, W_UV], dim=-1)
     kv_b_proj_weight = kv_b_proj_weight.view(

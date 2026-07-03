@@ -4,6 +4,7 @@
 
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -66,21 +67,17 @@ def _env_first(*names: str) -> str | None:
 
 
 def _moe_repeat_check_enabled() -> bool:
-    return _env_flag("B12X_MOE_REPEAT_CHECK") or _env_flag(
-        "VLLM_B12X_MOE_REPEAT_CHECK"
-    )
+    return _env_flag("B12X_MOE_REPEAT_CHECK") or _env_flag("VLLM_B12X_MOE_REPEAT_CHECK")
 
 
 def _moe_repeat_check_after_engine_start() -> bool:
-    return _env_flag(
-        "B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START"
-    ) or _env_flag("VLLM_B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START")
+    return _env_flag("B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START") or _env_flag(
+        "VLLM_B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START"
+    )
 
 
 def _moe_zero_scratch_enabled() -> bool:
-    return _env_flag("B12X_MOE_ZERO_SCRATCH") or _env_flag(
-        "VLLM_B12X_MOE_ZERO_SCRATCH"
-    )
+    return _env_flag("B12X_MOE_ZERO_SCRATCH") or _env_flag("VLLM_B12X_MOE_ZERO_SCRATCH")
 
 
 def _moe_force_a8_enabled() -> bool:
@@ -245,9 +242,7 @@ class _B12XMoeActivationAmaxState:
         }
 
 
-_activation_amax_states: dict[
-    tuple[str, str, int], _B12XMoeActivationAmaxState
-] = {}
+_activation_amax_states: dict[tuple[str, str, int], _B12XMoeActivationAmaxState] = {}
 
 
 def _parse_layer_index(prefix: str) -> int | None:
@@ -398,17 +393,10 @@ def _reset_b12x_moe_activation_amax_for_tests() -> None:
 def _plan_b12x_moe_fp4_scratch(
     *,
     tokens: int,
-    weight_E: int,
-    k: int,
-    n: int,
     topk: int,
     device: torch.device,
-    dtype: torch.dtype,
-    activation: str,
     quant_mode: str,
-    source_format: str,
-    w13_layout: str,
-    prepared_w4a16: Any | None = None,
+    experts: Any,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
@@ -417,36 +405,49 @@ def _plan_b12x_moe_fp4_scratch(
 ):
     from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
 
-    w4a16_weight_layout = None
-    w4a16_scale_format = None
-    if prepared_w4a16 is not None:
-        w4a16_weight_layout = getattr(prepared_w4a16, "weight_layout", None)
-        w4a16_scale_format = getattr(prepared_w4a16, "scale_format", None)
-
     return plan_tp_moe_scratch(
         TPMoEScratchCaps(
             max_tokens=max(int(tokens), 1),
-            weight_E=int(weight_E),
-            k=int(k),
-            n=int(n),
             num_topk=int(topk),
             device=device,
-            dtype=dtype,
+            weight_plan=experts.plan,
             core_token_counts=(max(int(tokens), 1),),
             route_num_experts=0,
             quant_mode=quant_mode,
-            activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
-            source_format=source_format,
-            w13_layout=w13_layout,
-            w4a16_weight_layout=w4a16_weight_layout,
-            w4a16_scale_format=w4a16_scale_format,
             collect_activation_amax=bool(collect_activation_amax),
             frozen=True,
         )
+    )
+
+
+def _plan_b12x_moe_execution(
+    *,
+    tokens: int,
+    topk: int,
+    device: torch.device,
+    quant_mode: str,
+    experts: Any,
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+):
+    from b12x.integration.tp_moe import plan_tp_moe_execution
+
+    return plan_tp_moe_execution(
+        num_tokens=max(int(tokens), 1),
+        num_topk=int(topk),
+        device=device,
+        weight_plan=experts.plan,
+        quant_mode=quant_mode,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
 
 
@@ -488,6 +489,34 @@ def _dynamic_moe_warmup_tokens(
     )
 
 
+def _b12x_moe_warmup_token_counts(
+    *,
+    max_tokens: int,
+    token_counts: Iterable[int] = (),
+) -> tuple[int, ...]:
+    """Probe powers of two plus serving sizes supplied by vLLM."""
+    max_tokens = max(int(max_tokens), 1)
+    counts = {
+        int(token_count)
+        for token_count in token_counts
+        if 0 < int(token_count) <= max_tokens
+    }
+    token_count = 1
+    while token_count < max_tokens:
+        counts.add(token_count)
+        token_count *= 2
+    counts.add(max_tokens)
+    return tuple(sorted(counts))
+
+
+def _b12x_moe_warmup_plan_signature(launch_plan: Any) -> tuple[Any, ...]:
+    """Fields through which the planner selects a compiled kernel regime."""
+    return (
+        launch_plan.implementation,
+        launch_plan.execution,
+    )
+
+
 def _workspace2_as_b12x_scratch(
     workspace2: torch.Tensor | None,
     plan: Any,
@@ -509,30 +538,12 @@ def _workspace2_as_b12x_scratch(
 def _run_b12x_moe_fp4(
     *,
     a: torch.Tensor,
-    a1_gscale: torch.Tensor,
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
-    a2_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
+    experts: Any,
     output: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    apply_router_weight_on_input: bool,
-    input_scales_are_reciprocal: bool,
     input_scales_static: bool,
-    activation: str,
-    quant_mode: str,
     unit_scale_contract: bool,
-    source_format: str,
-    w13_layout: str,
-    prepared_w4a16: Any,
-    prepared_w4a8: Any,
-    swiglu_limit: float | None,
-    swiglu_alpha: float | None,
-    swiglu_beta: float | None,
     plan: Any,
     scratch: torch.Tensor,
     activation_amax: torch.Tensor | None = None,
@@ -543,38 +554,18 @@ def _run_b12x_moe_fp4(
 
     if _moe_zero_scratch_enabled():
         if _is_current_stream_capturing():
-            raise RuntimeError(
-                "B12X_MOE_ZERO_SCRATCH is a diagnostic eager-only mode"
-            )
+            raise RuntimeError("B12X_MOE_ZERO_SCRATCH is a diagnostic eager-only mode")
         scratch.zero_()
 
     binding = plan.bind(
         scratch=scratch,
         a=a,
-        a1_gscale=a1_gscale,
-        w1_fp4=w1_fp4,
-        w1_blockscale=w1_blockscale,
-        w1_alphas=w1_alphas,
-        a2_gscale=a2_gscale,
-        w2_fp4=w2_fp4,
-        w2_blockscale=w2_blockscale,
-        w2_alphas=w2_alphas,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        apply_router_weight_on_input=apply_router_weight_on_input,
         output=output,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         input_scales_static=input_scales_static,
-        activation=activation,
-        quant_mode=quant_mode,
         unit_scale_contract=unit_scale_contract,
-        source_format=source_format,
-        w13_layout=w13_layout,
-        prepared_w4a16=prepared_w4a16,
-        prepared_w4a8=prepared_w4a8,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
         layer_idx=layer_idx,
     )
@@ -596,50 +587,6 @@ def _first_not_none(*values: Any) -> Any | None:
         if value is not None:
             return value
     return None
-
-
-def _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs):
-    from b12x.integration import B12XPreparedFP4MoEWeights
-    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_e8m0_native_weights
-
-    w13_layout = kwargs.get("w13_layout", "w13")
-    w4a16 = prepare_w4a16_e8m0_native_weights(
-        kwargs["w1_fp4"],
-        kwargs["w1_blockscale"],
-        kwargs["w1_global_scale"],
-        kwargs["w2_fp4"],
-        kwargs["w2_blockscale"],
-        kwargs["w2_global_scale"],
-        activation=kwargs["activation"],
-        params_dtype=kwargs["params_dtype"],
-        w13_layout=w13_layout,
-    )
-    return B12XPreparedFP4MoEWeights(
-        source_format=kwargs.get("source_format", "fp4_e8m0_k32"),
-        w13_layout=w13_layout,
-        w4a16=w4a16,
-    )
-
-
-def _prepare_b12x_fp4_moe_weights(**kwargs):
-    from b12x.integration import prepare_b12x_fp4_moe_weights
-
-    w2_fp4 = kwargs.get("w2_fp4")
-    has_compact_e8m0_tail = (
-        isinstance(w2_fp4, torch.Tensor) and int(w2_fp4.shape[2]) * 2 % 32 != 0
-    )
-    should_use_native_e8m0 = (
-        kwargs.get("source_format") == "fp4_e8m0_k32"
-        and kwargs.get("prepare_w4a16", False)
-        and not kwargs.get("prepare_runtime_alphas", False)
-        and (
-            has_compact_e8m0_tail
-            or envs.VLLM_B12X_MOE_FORCE_MODELOPT_PREP
-        )
-    )
-    if should_use_native_e8m0:
-        return _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs)
-    return prepare_b12x_fp4_moe_weights(**kwargs)
 
 
 def _replace_parameter_with_empty(
@@ -699,29 +646,11 @@ def _maybe_repeat_check_b12x_moe(
     *,
     original_output: torch.Tensor,
     a: torch.Tensor,
-    a1_gscale: torch.Tensor,
-    w1_fp4: torch.Tensor,
-    w1_blockscale: torch.Tensor,
-    w1_alphas: torch.Tensor,
-    a2_gscale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_alphas: torch.Tensor,
+    experts: Any,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    apply_router_weight_on_input: bool,
-    input_scales_are_reciprocal: bool,
     input_scales_static: bool,
-    activation: str,
-    quant_mode: str,
     unit_scale_contract: bool,
-    source_format: str,
-    w13_layout: str,
-    prepared_w4a16: Any,
-    prepared_w4a8: Any,
-    swiglu_limit: float | None,
-    swiglu_alpha: float | None,
-    swiglu_beta: float | None,
     plan: Any,
     scratch: torch.Tensor,
 ) -> None:
@@ -740,30 +669,12 @@ def _maybe_repeat_check_b12x_moe(
     repeat_output = torch.empty_like(original_output)
     _run_b12x_moe_fp4(
         a=a,
-        a1_gscale=a1_gscale,
-        w1_fp4=w1_fp4,
-        w1_blockscale=w1_blockscale,
-        w1_alphas=w1_alphas,
-        a2_gscale=a2_gscale,
-        w2_fp4=w2_fp4,
-        w2_blockscale=w2_blockscale,
-        w2_alphas=w2_alphas,
+        experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        apply_router_weight_on_input=apply_router_weight_on_input,
         output=repeat_output,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
         input_scales_static=input_scales_static,
-        activation=activation,
-        quant_mode=quant_mode,
         unit_scale_contract=unit_scale_contract,
-        source_format=source_format,
-        w13_layout=w13_layout,
-        prepared_w4a16=prepared_w4a16,
-        prepared_w4a8=prepared_w4a8,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
         plan=plan,
         scratch=scratch,
     )
@@ -803,8 +714,8 @@ def _maybe_repeat_check_b12x_moe(
         cosine,
         tuple(original_output.shape),
         original_output.dtype,
-        quant_mode,
-        activation,
+        getattr(core_plan, "quant_mode", None),
+        getattr(core_plan, "activation", getattr(experts, "activation", None)),
         getattr(core_plan, "implementation", None),
         getattr(core_plan, "routed_rows", None),
         getattr(core_plan, "max_rows", None),
@@ -874,8 +785,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             f"{quant_config.weight_quant_dtype}"
         )
 
-        self._prepared_fp4_moe_by_dtype: dict[torch.dtype, Any] = {}
-        self._source_params_compacted = False
+        self._prepared_experts: Any | None = None
+        self._source_parameters_released = False
         self._unit_scale_by_device: dict[torch.device, torch.Tensor] = {}
         self._activation_amax_enabled = _moe_activation_amax_enabled()
         self._activation_amax_base_num_layers = _current_config_num_hidden_layers()
@@ -898,13 +809,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 )
                 return "w4a8_nvfp4"
             raise RuntimeError(
-                "B12X MoE force-A8 does not support source_format="
-                f"{source_format!r}"
+                f"B12X MoE force-A8 does not support source_format={source_format!r}"
             )
         if _moe_force_a16_enabled():
-            logger.warning_once(
-                "B12X MoE force-A16 enabled: using quant_mode=w4a16."
-            )
+            logger.warning_once("B12X MoE force-A16 enabled: using quant_mode=w4a16.")
             return "w4a16"
         return "nvfp4" if self.quant_config.quant_dtype == "nvfp4" else "w4a16"
 
@@ -914,10 +822,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return "fp4_e8m0_k32"
 
     def _w13_layout(self) -> str:
-        if (
-            self._source_format() == "modelopt_nvfp4"
-            and self._quant_mode() == "w4a16"
-        ):
+        if self._source_format() == "modelopt_nvfp4" and self._quant_mode() == "w4a16":
             return "w13"
         # vLLM fused MoE loading stores fused W13 as [w1/gate, w3/up], which is
         # the row order consumed by b12x for the runtime SwiGLU path. Declaring
@@ -1074,27 +979,20 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation = getattr(moe_config, "activation", MoEActivation.SILU)
         activation = cast(MoEActivation, activation)
 
-        prepared = self._get_or_prepare_fp4_moe_weights(
+        prepared = self._get_or_prepare_experts(
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             activation=activation,
             params_dtype=params_dtype,
         )
         if self._quant_mode() == "w4a16":
-            prepared_w4a16 = getattr(prepared, "w4a16", None)
-            num_experts = (
-                int(prepared_w4a16.num_experts)
-                if prepared_w4a16 is not None
-                else int(layer.w13_weight.shape[0])
-            )
             self._register_activation_amax(
                 layer=layer,
                 device=device,
-                num_experts=num_experts,
+                num_experts=prepared.num_experts,
             )
-        if self._quant_mode() in ("w4a16", "w4a8_mx"):
-            self._compact_source_scales(layer)
-            self._compact_source_weights(layer)
+        if prepared.plan.discards_source_parameters:
+            self._release_source_parameters(layer)
             _maybe_release_cuda_cache(device)
 
     @staticmethod
@@ -1158,7 +1056,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
-    def _get_or_prepare_fp4_moe_weights(
+    def _get_or_prepare_experts(
         self,
         *,
         w1: torch.Tensor,
@@ -1167,30 +1065,30 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         params_dtype: torch.dtype,
     ):
         quant_mode = self._quant_mode()
-        prepared = self._prepared_fp4_moe_by_dtype.get(params_dtype)
+        prepared = self._prepared_experts
         if prepared is not None:
-            if quant_mode == "w4a16" and getattr(prepared, "w4a16", None) is not None:
-                return prepared
+            requested_dtype = str(params_dtype).removeprefix("torch.")
             if (
-                quant_mode in ("nvfp4", "w4a8_nvfp4")
-                and getattr(prepared, "w1_runtime_alphas", None) is not None
-                and getattr(prepared, "w2_runtime_alphas", None) is not None
+                quant_mode in prepared.plan.quant_modes
+                and requested_dtype == prepared.plan.io_dtype
+                and _b12x_activation_name(activation) == prepared.plan.activation
             ):
                 return prepared
-            if (
-                quant_mode == "w4a8_mx"
-                and getattr(prepared, "w4a8_tier", None) is not None
-            ):
-                return prepared
-
-        if self._source_params_compacted:
-            prepared_dtypes = ", ".join(
-                str(dtype) for dtype in self._prepared_fp4_moe_by_dtype
-            )
             raise RuntimeError(
-                "B12X FP4 MoE source parameters were already compacted; "
-                f"cannot prepare FP4 MoE weights for dtype {params_dtype}. "
-                f"Prepared dtypes: {prepared_dtypes or 'none'}."
+                "B12X FP4 MoE already transferred its source allocation into "
+                "one prepared expert owner; the requested runtime contract does "
+                "not match that owner: "
+                f"quant_mode={quant_mode!r}, dtype={requested_dtype!r}, "
+                f"activation={_b12x_activation_name(activation)!r}; "
+                f"prepared_modes={sorted(prepared.plan.quant_modes)}, "
+                f"prepared_dtype={prepared.plan.io_dtype!r}, "
+                f"prepared_activation={prepared.plan.activation!r}."
+            )
+
+        if self._source_parameters_released:
+            raise RuntimeError(
+                "B12X FP4 MoE source parameters were released without a "
+                "prepared expert owner"
             )
 
         if w1.device.type == "cuda" and _is_current_stream_capturing():
@@ -1203,12 +1101,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
         num_experts = int(w1.shape[0])
+        hidden_size = int(w2.shape[1])
+        intermediate_size = int(w2.shape[2]) * 2
         unit_scale = self._unit_expert_scale(w1.device, num_experts)
         if quant_mode in ("nvfp4", "w4a8_nvfp4"):
             if self.quant_config.weight_quant_dtype != "nvfp4":
-                raise RuntimeError(
-                    f"B12X {quant_mode} mode requires NVFP4 weights"
-                )
+                raise RuntimeError(f"B12X {quant_mode} mode requires NVFP4 weights")
             if self.g1_alphas is None or self.g2_alphas is None:
                 raise RuntimeError(
                     f"B12X {quant_mode} MoE requires w1/w2 global scales"
@@ -1232,42 +1130,33 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_global_scale = self._weight_global_scale(
                 w2.device, num_experts, weight_name="w2"
             )
-            if self._source_format() == "modelopt_nvfp4":
-                if quant_mode != "w4a16":
-                    raise RuntimeError(
-                        "B12X w4a8_mx mode requires E8M0 FP4 source weights"
-                    )
-                from b12x.moe.fused.w4a16.prepare import (
-                    prepare_w4a16_modelopt_native_weights,
-                )
-
-                w4a16 = prepare_w4a16_modelopt_native_weights(
-                    w1,
-                    self.w1_scale,
-                    w1_global_scale,
-                    w2,
-                    self.w2_scale,
-                    w2_global_scale,
-                    activation=_b12x_activation_name(activation),
-                    params_dtype=params_dtype,
-                    w13_layout=self._w13_layout(),
-                )
-                prepared = SimpleNamespace(
-                    source_format=self._source_format(),
-                    w13_layout=self._w13_layout(),
-                    w1_runtime_alphas=None,
-                    w2_runtime_alphas=None,
-                    w4a16=w4a16,
-                    w4a8_tier=None,
-                )
-                self._prepared_fp4_moe_by_dtype[params_dtype] = prepared
-                return prepared
             a1_gscale = unit_scale
             a2_gscale = unit_scale
 
-        prepared = _prepare_b12x_fp4_moe_weights(
+        from b12x.integration import (
+            plan_b12x_fp4_moe_weights,
+            prepare_b12x_fp4_moe_weights,
+        )
+        from b12x.moe.execution import PreparedWeightLayout
+
+        w4a16_layout = (
+            PreparedWeightLayout.SOURCE_NATIVE
+            if quant_mode == "w4a16" and envs.VLLM_B12X_MOE_FORCE_MODELOPT_PREP
+            else None
+        )
+        weight_plan = plan_b12x_fp4_moe_weights(
+            quant_modes=quant_mode,
             source_format=self._source_format(),
+            activation=_b12x_activation_name(activation),
+            params_dtype=params_dtype,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             w13_layout=self._w13_layout(),
+            w4a16_layout=w4a16_layout,
+        )
+        prepared = prepare_b12x_fp4_moe_weights(
+            plan=weight_plan,
             w1_fp4=w1,
             w1_blockscale=self.w1_scale,
             w1_global_scale=w1_global_scale,
@@ -1276,14 +1165,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_blockscale=self.w2_scale,
             w2_global_scale=w2_global_scale,
             a2_gscale=a2_gscale,
-            activation=_b12x_activation_name(activation),
             params_dtype=params_dtype,
-            prepare_runtime_alphas=quant_mode in ("nvfp4", "w4a8_nvfp4"),
-            prepare_w4a16=quant_mode == "w4a16",
-            prepare_w4a8_tier=quant_mode == "w4a8_mx",
-            reuse_input_storage=quant_mode in ("w4a16", "w4a8_mx"),
         )
-        self._prepared_fp4_moe_by_dtype[params_dtype] = prepared
+        self._prepared_experts = prepared
         return prepared
 
     def _b12x_swiglu_params(
@@ -1307,19 +1191,17 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
         return swiglu_limit, swiglu_alpha, swiglu_beta
 
-    def _lookup_prepared_w4a16(self) -> Any | None:
-        for prepared in self._prepared_fp4_moe_by_dtype.values():
-            w4a16 = getattr(prepared, "w4a16", None)
-            if w4a16 is not None:
-                return w4a16
-        return None
-
-    def _lookup_prepared_w4a8(self) -> Any | None:
-        for prepared in self._prepared_fp4_moe_by_dtype.values():
-            w4a8 = getattr(prepared, "w4a8_tier", None)
-            if w4a8 is not None:
-                return w4a8
-        return None
+    def _lookup_prepared_experts(self) -> Any | None:
+        prepared = self._prepared_experts
+        if prepared is None:
+            return None
+        quant_mode = self._quant_mode()
+        if quant_mode not in prepared.plan.quant_modes:
+            raise RuntimeError(
+                f"B12X quant_mode={quant_mode!r} does not match the prepared "
+                f"expert owner {sorted(prepared.plan.quant_modes)}"
+            )
+        return prepared
 
     def _warmup_metadata(self, layer: torch.nn.Module) -> SimpleNamespace | None:
         w1 = getattr(layer, "w13_weight", None)
@@ -1337,39 +1219,22 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation = cast(MoEActivation, activation)
 
         quant_mode = self._quant_mode()
-        prepared_w4a16 = (
-            self._lookup_prepared_w4a16() if quant_mode == "w4a16" else None
-        )
-        prepared_w4a8 = (
-            self._lookup_prepared_w4a8() if quant_mode == "w4a8_mx" else None
-        )
-        if (
-            (w1.numel() == 0 or w2.numel() == 0)
-            and prepared_w4a16 is None
-            and prepared_w4a8 is None
-        ):
+        prepared = self._lookup_prepared_experts()
+        if (w1.numel() == 0 or w2.numel() == 0) and prepared is None:
             return None
 
-        if prepared_w4a8 is not None:
-            num_experts = int(prepared_w4a8.num_experts)
-            n = int(prepared_w4a8.intermediate_size)
-            k = int(prepared_w4a8.hidden_size)
-            device = prepared_w4a8.w13_rp.device
-        elif prepared_w4a16 is not None:
-            num_experts = int(prepared_w4a16.num_experts)
-            n = int(prepared_w4a16.intermediate_size)
-            k = int(prepared_w4a16.hidden_size)
-            w13 = getattr(prepared_w4a16, "w13", None)
-            device = w13.device if isinstance(w13, torch.Tensor) else w1.device
+        if prepared is not None:
+            num_experts = prepared.num_experts
+            n = prepared.intermediate_size
+            k = prepared.hidden_size
+            device = prepared.w1_fp4.device
         else:
             num_experts = int(w1.shape[0])
             n = int(w2.shape[2]) * 2
             k = int(w2.shape[1])
             device = w1.device
 
-        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
-            activation
-        )
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(activation)
         if (
             not _supports_swiglu_limit(quant_mode)
             and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
@@ -1382,8 +1247,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation=activation,
             activation_name=_b12x_activation_name(activation),
             quant_mode=quant_mode,
-            prepared_w4a16=prepared_w4a16,
-            prepared_w4a8=prepared_w4a8,
             num_experts=num_experts,
             n=n,
             k=k,
@@ -1429,79 +1292,26 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     @torch.inference_mode()
-    def warmup_dynamic_launch(
+    def warmup_dynamic_launches(
         self,
         layer: torch.nn.Module,
         *,
-        tokens: int = 1,
-    ) -> None:
-        """Compile the b12x dynamic MoE launch before serving starts."""
+        token_counts: Iterable[int],
+    ) -> int:
+        """Compile one representative of every planned dynamic MoE regime."""
         meta = self._warmup_metadata(layer)
         if meta is None:
-            return
+            return 0
 
-        tokens = _dynamic_moe_warmup_tokens(
-            topk=meta.topk,
-            quant_mode=meta.quant_mode,
-            requested_tokens=tokens,
-        )
-        prepared = self._get_or_prepare_fp4_moe_weights(
+        prepared = self._get_or_prepare_experts(
             w1=meta.w1,
             w2=meta.w2,
             activation=meta.activation,
             params_dtype=meta.dtype,
         )
-        prepared_w4a16 = prepared.w4a16 if meta.quant_mode == "w4a16" else None
-        prepared_w4a8 = (
-            prepared.w4a8_tier if meta.quant_mode == "w4a8_mx" else None
-        )
-
-        if meta.quant_mode == "w4a8_mx":
-            assert prepared_w4a8 is not None
-            num_experts = int(prepared_w4a8.num_experts)
-            n = int(prepared_w4a8.intermediate_size)
-            unit_scale = self._unit_expert_scale(meta.device, num_experts)
-            a1_gscale = unit_scale
-            a2_gscale = unit_scale
-            w1_alphas = unit_scale
-            w2_alphas = unit_scale
-            input_scales_static = True
-            unit_scale_contract = False
-        elif meta.quant_mode == "w4a16":
-            assert prepared_w4a16 is not None
-            num_experts = int(prepared_w4a16.num_experts)
-            n = int(prepared_w4a16.intermediate_size)
-            unit_scale = self._unit_expert_scale(meta.device, num_experts)
-            a1_gscale = unit_scale
-            a2_gscale = unit_scale
-            w1_alphas = self._weight_global_scale(
-                meta.device, num_experts, weight_name="w1"
-            )
-            w2_alphas = self._weight_global_scale(
-                meta.device, num_experts, weight_name="w2"
-            )
-            input_scales_static = True
-            unit_scale_contract = True
-        else:
-            if self.a1_gscale is None or self.a2_gscale is None:
-                raise RuntimeError(
-                    "B12X native NVFP4 MoE requires a1/a2 global scales"
-                )
-            if (
-                prepared.w1_runtime_alphas is None
-                or prepared.w2_runtime_alphas is None
-            ):
-                raise RuntimeError(
-                    "B12X native NVFP4 MoE requires prepared runtime alphas"
-                )
-            num_experts = int(meta.w1.shape[0])
-            n = int(meta.w2.shape[2]) * 2
-            a1_gscale = _normalize_modelopt_expert_scale(self.a1_gscale)
-            a2_gscale = _normalize_modelopt_expert_scale(self.a2_gscale)
-            w1_alphas = prepared.w1_runtime_alphas
-            w2_alphas = prepared.w2_runtime_alphas
-            input_scales_static = True
-            unit_scale_contract = False
+        num_experts = prepared.num_experts
+        input_scales_static = True
+        unit_scale_contract = meta.quant_mode == "w4a16"
 
         activation_amax, activation_layer_idx = (None, None)
         if meta.collect_activation_amax:
@@ -1510,87 +1320,90 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 num_experts=num_experts,
             )
 
-        assert self.w1_scale is not None and self.w2_scale is not None, (
-            "w1_scale and w2_scale must not be None for B12xExperts"
-        )
-        hidden_states = torch.zeros(
-            (tokens, meta.k),
-            dtype=meta.dtype,
-            device=meta.device,
-        )
-        output = torch.empty_like(hidden_states)
-        topk_ids = (
-            torch.arange(meta.topk, device=meta.device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(tokens, -1)
-            .contiguous()
-        )
-        if num_experts > 0:
-            topk_ids.remainder_(num_experts)
-        topk_weights = torch.full(
-            (tokens, meta.topk),
-            1.0 / max(meta.topk, 1),
-            dtype=torch.float32,
-            device=meta.device,
-        )
-        plan = _plan_b12x_moe_fp4_scratch(
-            tokens=tokens,
-            weight_E=num_experts,
-            k=meta.k,
-            n=n,
-            topk=meta.topk,
-            device=meta.device,
-            dtype=meta.dtype,
-            activation=meta.activation_name,
-            quant_mode=meta.quant_mode,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
-            apply_router_weight_on_input=meta.apply_router_weight_on_input,
-            swiglu_limit=meta.swiglu_limit,
-            swiglu_alpha=meta.swiglu_alpha,
-            swiglu_beta=meta.swiglu_beta,
-            collect_activation_amax=meta.collect_activation_amax,
-        )
-        scratch = torch.empty(
-            (_b12x_scratch_nbytes(plan),),
-            dtype=torch.uint8,
-            device=meta.device,
-        )
-        _run_b12x_moe_fp4(
-            a=hidden_states,
-            a1_gscale=a1_gscale,
-            w1_fp4=meta.w1,
-            w1_blockscale=self.w1_scale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gscale,
-            w2_fp4=meta.w2,
-            w2_blockscale=self.w2_scale,
-            w2_alphas=w2_alphas,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            apply_router_weight_on_input=meta.apply_router_weight_on_input,
-            output=output,
-            input_scales_are_reciprocal=True,
-            input_scales_static=input_scales_static,
-            activation=meta.activation_name,
-            quant_mode=meta.quant_mode,
-            unit_scale_contract=unit_scale_contract,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
-            prepared_w4a8=prepared_w4a8,
-            swiglu_limit=meta.swiglu_limit,
-            swiglu_alpha=meta.swiglu_alpha,
-            swiglu_beta=meta.swiglu_beta,
-            plan=plan,
-            scratch=scratch,
-            activation_amax=activation_amax,
-            layer_idx=activation_layer_idx,
-        )
+        # Execution planning is allocation- and compilation-free. Probe the
+        # serving range, then retain the smallest token count selecting each
+        # execution plan so large prefill regimes are compiled without
+        # allocating max-batch inputs.
+        launch_tokens: dict[tuple[Any, ...], int] = {}
+        for requested_tokens in sorted(set(int(count) for count in token_counts)):
+            tokens = _dynamic_moe_warmup_tokens(
+                topk=meta.topk,
+                quant_mode=meta.quant_mode,
+                requested_tokens=requested_tokens,
+            )
+            launch_plan = _plan_b12x_moe_execution(
+                tokens=tokens,
+                topk=meta.topk,
+                device=meta.device,
+                quant_mode=meta.quant_mode,
+                experts=prepared,
+                apply_router_weight_on_input=meta.apply_router_weight_on_input,
+                swiglu_limit=meta.swiglu_limit,
+                swiglu_alpha=meta.swiglu_alpha,
+                swiglu_beta=meta.swiglu_beta,
+            )
+            launch_tokens.setdefault(
+                _b12x_moe_warmup_plan_signature(launch_plan),
+                tokens,
+            )
 
-    def _compact_source_scales(self, layer: torch.nn.Module) -> None:
-        if self._source_params_compacted:
+        for tokens in launch_tokens.values():
+            plan = _plan_b12x_moe_fp4_scratch(
+                tokens=tokens,
+                topk=meta.topk,
+                device=meta.device,
+                quant_mode=meta.quant_mode,
+                experts=prepared,
+                apply_router_weight_on_input=meta.apply_router_weight_on_input,
+                swiglu_limit=meta.swiglu_limit,
+                swiglu_alpha=meta.swiglu_alpha,
+                swiglu_beta=meta.swiglu_beta,
+                collect_activation_amax=meta.collect_activation_amax,
+            )
+            hidden_states = torch.zeros(
+                (tokens, meta.k),
+                dtype=meta.dtype,
+                device=meta.device,
+            )
+            output = torch.empty_like(hidden_states)
+            topk_ids = (
+                torch.arange(meta.topk, device=meta.device, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(tokens, -1)
+                .contiguous()
+            )
+            if num_experts > 0:
+                topk_ids.remainder_(num_experts)
+            topk_weights = torch.full(
+                (tokens, meta.topk),
+                1.0 / max(meta.topk, 1),
+                dtype=torch.float32,
+                device=meta.device,
+            )
+            scratch = torch.empty(
+                (_b12x_scratch_nbytes(plan),),
+                dtype=torch.uint8,
+                device=meta.device,
+            )
+            _run_b12x_moe_fp4(
+                a=hidden_states,
+                experts=prepared,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=output,
+                input_scales_static=input_scales_static,
+                unit_scale_contract=unit_scale_contract,
+                plan=plan,
+                scratch=scratch,
+                activation_amax=activation_amax,
+                layer_idx=activation_layer_idx,
+            )
+        return len(launch_tokens)
+
+    def _release_source_parameters(self, layer: torch.nn.Module) -> None:
+        """Leave the planner-selected expert owner as the sole allocation."""
+
+        if self._source_parameters_released:
             return
 
         w1_scale = _replace_parameter_with_empty(layer, "w13_weight_scale")
@@ -1600,11 +1413,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if w2_scale is not None:
             _set_quant_config_weight_scale(self.quant_config, "_w2", w2_scale)
 
-        self._source_params_compacted = True
-
-    def _compact_source_weights(self, layer: torch.nn.Module) -> None:
         _replace_parameter_with_empty(layer, "w13_weight")
         _replace_parameter_with_empty(layer, "w2_weight")
+        self._source_parameters_released = True
 
     def moe_problem_size(
         self,
@@ -1616,12 +1427,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if w1.numel() != 0 and w2.numel() != 0:
             return super().moe_problem_size(a1, w1, w2, topk_ids)
 
-        quant_mode = self._quant_mode()
-        prepared = (
-            self._lookup_prepared_w4a8()
-            if quant_mode == "w4a8_mx"
-            else self._lookup_prepared_w4a16()
-        )
+        prepared = self._lookup_prepared_experts()
         if prepared is None:
             return super().moe_problem_size(a1, w1, w2, topk_ids)
 
@@ -1654,33 +1460,19 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         quant_mode = self._quant_mode()
-        prepared_w4a16 = (
-            self._lookup_prepared_w4a16() if quant_mode == "w4a16" else None
-        )
-        prepared_w4a8 = (
-            self._lookup_prepared_w4a8() if quant_mode == "w4a8_mx" else None
-        )
-        if prepared_w4a8 is not None:
-            weight_E = int(prepared_w4a8.num_experts)
-            n = int(prepared_w4a8.intermediate_size)
-            device = prepared_w4a8.w13_rp.device
-        elif prepared_w4a16 is None:
-            weight_E = int(local_num_experts)
-            n = max(int(N) // 2, 1)
-            device = torch.device(
-                "cuda", torch.cuda.current_device()
-            ) if torch.cuda.is_available() else torch.device("cpu")
-        else:
-            weight_E = int(prepared_w4a16.num_experts)
-            n = int(prepared_w4a16.intermediate_size)
-            w13 = getattr(prepared_w4a16, "w13", None)
-            device = w13.device if isinstance(w13, torch.Tensor) else torch.device(
-                "cuda", torch.cuda.current_device()
+        prepared = self._lookup_prepared_experts()
+        if prepared is None:
+            raise RuntimeError(
+                "B12X MoE workspace planning requires prepared weights; "
+                "process_weights_after_loading must run first"
             )
-        workspace_dtype = getattr(self.moe_config, "in_dtype", torch.bfloat16)
-        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
-            activation
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
         )
+        workspace_dtype = getattr(self.moe_config, "in_dtype", torch.bfloat16)
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(activation)
         if (
             not _supports_swiglu_limit(quant_mode)
             and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
@@ -1688,17 +1480,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit = None
         plan = _plan_b12x_moe_fp4_scratch(
             tokens=max(int(M), 1),
-            weight_E=weight_E,
-            k=int(K),
-            n=n,
             topk=int(topk),
             device=device,
-            dtype=workspace_dtype,
-            activation=_b12x_activation_name(activation),
             quant_mode=quant_mode,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
+            experts=prepared,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -1730,79 +1515,29 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ) -> None:
-        prepared = self._get_or_prepare_fp4_moe_weights(
+        prepared = self._get_or_prepare_experts(
             w1=w1,
             w2=w2,
             activation=activation,
             params_dtype=hidden_states.dtype,
         )
         quant_mode = self._quant_mode()
-        prepared_w4a16 = prepared.w4a16 if quant_mode == "w4a16" else None
-        prepared_w4a8 = prepared.w4a8_tier if quant_mode == "w4a8_mx" else None
-        assert self.w1_scale is not None and self.w2_scale is not None, (
-            "w1_scale and w2_scale must not be None for B12xExperts"
-        )
 
         if expert_map is not None:
             raise RuntimeError(
                 "B12X MoE does not support expert_map with the current b12x_moe_fp4 API"
             )
 
-        if quant_mode == "w4a8_mx":
-            assert prepared_w4a8 is not None
-            num_experts = int(prepared_w4a8.num_experts)
-            n = int(prepared_w4a8.intermediate_size)
-            unit_scale = self._unit_expert_scale(hidden_states.device, num_experts)
-            a1_gscale = unit_scale
-            a2_gscale = unit_scale
-            w1_alphas = unit_scale
-            w2_alphas = unit_scale
-            input_scales_static = True
-            unit_scale_contract = False
-        elif quant_mode == "w4a16":
-            assert prepared_w4a16 is not None
-            num_experts = int(prepared_w4a16.num_experts)
-            n = int(prepared_w4a16.intermediate_size)
-            unit_scale = self._unit_expert_scale(hidden_states.device, num_experts)
-            a1_gscale = unit_scale
-            a2_gscale = unit_scale
-            w1_alphas = self._weight_global_scale(
-                hidden_states.device, num_experts, weight_name="w1"
-            )
-            w2_alphas = self._weight_global_scale(
-                hidden_states.device, num_experts, weight_name="w2"
-            )
-            input_scales_static = True
-            unit_scale_contract = True
-        else:
-            if self.a1_gscale is None or self.a2_gscale is None:
-                raise RuntimeError(
-                    "B12X native NVFP4 MoE requires a1/a2 global scales"
-                )
-            if (
-                prepared.w1_runtime_alphas is None
-                or prepared.w2_runtime_alphas is None
-            ):
-                raise RuntimeError(
-                    "B12X native NVFP4 MoE requires prepared runtime alphas"
-                )
-            num_experts = int(w1.shape[0])
-            n = int(w2.shape[2]) * 2
-            a1_gscale = _normalize_modelopt_expert_scale(self.a1_gscale)
-            a2_gscale = _normalize_modelopt_expert_scale(self.a2_gscale)
-            w1_alphas = prepared.w1_runtime_alphas
-            w2_alphas = prepared.w2_runtime_alphas
-            input_scales_static = True
-            unit_scale_contract = False
+        num_experts = prepared.num_experts
+        input_scales_static = True
+        unit_scale_contract = quant_mode == "w4a16"
         activation_amax, activation_layer_idx = (None, None)
         if quant_mode == "w4a16" and self._activation_amax_enabled_for_layer():
             activation_amax, activation_layer_idx = self._activation_amax_args(
                 device=hidden_states.device,
                 num_experts=num_experts,
             )
-        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
-            activation
-        )
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(activation)
         if (
             not _supports_swiglu_limit(quant_mode)
             and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
@@ -1812,17 +1547,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
         plan = _plan_b12x_moe_fp4_scratch(
             tokens=int(hidden_states.shape[0]),
-            weight_E=num_experts,
-            k=int(hidden_states.shape[1]),
-            n=n,
             topk=int(topk_ids.shape[1]),
             device=hidden_states.device,
-            dtype=hidden_states.dtype,
-            activation=_b12x_activation_name(activation),
             quant_mode=quant_mode,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
+            experts=prepared,
             apply_router_weight_on_input=(
                 apply_router_weight_on_input
                 if apply_router_weight_on_input is not None
@@ -1837,34 +1565,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         _run_b12x_moe_fp4(
             a=hidden_states,
-            a1_gscale=a1_gscale,
-            w1_fp4=w1,
-            w1_blockscale=self.w1_scale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gscale,
-            w2_fp4=w2,
-            w2_blockscale=self.w2_scale,
-            w2_alphas=w2_alphas,
+            experts=prepared,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            apply_router_weight_on_input=(
-                apply_router_weight_on_input
-                if apply_router_weight_on_input is not None
-                else False
-            ),
             output=output,
-            input_scales_are_reciprocal=True,
             input_scales_static=input_scales_static,
-            activation=_b12x_activation_name(activation),
-            quant_mode=quant_mode,
             unit_scale_contract=unit_scale_contract,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
-            prepared_w4a8=prepared_w4a8,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
             plan=plan,
             scratch=scratch,
             activation_amax=activation_amax,
@@ -1874,33 +1580,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             _maybe_repeat_check_b12x_moe(
                 original_output=output,
                 a=hidden_states,
-                a1_gscale=a1_gscale,
-                w1_fp4=w1,
-                w1_blockscale=self.w1_scale,
-                w1_alphas=w1_alphas,
-                a2_gscale=a2_gscale,
-                w2_fp4=w2,
-                w2_blockscale=self.w2_scale,
-                w2_alphas=w2_alphas,
+                experts=prepared,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                apply_router_weight_on_input=(
-                    apply_router_weight_on_input
-                    if apply_router_weight_on_input is not None
-                    else False
-                ),
-                input_scales_are_reciprocal=True,
                 input_scales_static=input_scales_static,
-                activation=_b12x_activation_name(activation),
-                quant_mode=quant_mode,
                 unit_scale_contract=unit_scale_contract,
-                source_format=self._source_format(),
-                w13_layout=self._w13_layout(),
-                prepared_w4a16=prepared_w4a16,
-                prepared_w4a8=prepared_w4a8,
-                swiglu_limit=swiglu_limit,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
                 plan=plan,
                 scratch=scratch,
             )
@@ -1912,9 +1596,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 def warmup_b12x_moe_dynamic(
     model: torch.nn.Module,
     *,
-    tokens: int = 1,
+    max_tokens: int,
+    token_counts: Iterable[int] = (),
 ) -> int:
-    """Warm unique b12x dynamic MoE launch signatures in a loaded model."""
+    """Warm unique b12x dynamic MoE planner regimes in a loaded model."""
+    candidates = _b12x_moe_warmup_token_counts(
+        max_tokens=max_tokens,
+        token_counts=token_counts,
+    )
     seen: set[tuple[Any, ...]] = set()
     warmed = 0
     for module in model.modules():
@@ -1931,9 +1620,16 @@ def warmup_b12x_moe_dynamic(
         if signature is None or signature in seen:
             continue
         seen.add(signature)
-        fused_experts.warmup_dynamic_launch(routed_experts, tokens=tokens)
-        warmed += 1
+        warmed += fused_experts.warmup_dynamic_launches(
+            routed_experts,
+            token_counts=candidates,
+        )
 
     if warmed:
-        logger.info("Warmed up %d B12X MoE dynamic launch signature(s).", warmed)
+        logger.info(
+            "Warmed up %d B12X MoE dynamic launch variant(s) across %d "
+            "expert signature(s).",
+            warmed,
+            len(seen),
+        )
     return warmed
