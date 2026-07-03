@@ -132,11 +132,11 @@ class BaseFrontendArgs:
     max_log_len: int | None = None
     """Max number of prompt characters or prompt ID numbers being printed in
     log. The default of None means unlimited."""
-    enable_prompt_tokens_details: bool = False
+    enable_prompt_tokens_details: bool = True
     """If set to True, enable prompt_tokens_details in usage."""
     enable_server_load_tracking: bool = False
     """If set to True, enable tracking server_load_metrics in the app state."""
-    enable_force_include_usage: bool = False
+    enable_force_include_usage: bool = True
     """If set to True, including usage on every request."""
     enable_tokenizer_info_endpoint: bool = False
     """Enable the `/tokenizer_info` endpoint. May expose chat
@@ -286,7 +286,7 @@ class FrontendArgs(BaseFrontendArgs):
     is provided, vLLM will add it to the server using
     `@app.middleware('http')`. If a class is provided, vLLM will
     add it to the server using `app.add_middleware()`."""
-    enable_request_id_headers: bool = False
+    enable_request_id_headers: bool = True
     """If specified, API server will add X-Request-Id header to responses."""
     disable_fastapi_docs: bool = False
     """Disable FastAPI's OpenAPI schema, Swagger UI, and ReDoc endpoint."""
