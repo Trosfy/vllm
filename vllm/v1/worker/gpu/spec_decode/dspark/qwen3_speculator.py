@@ -38,13 +38,19 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.qwen3_utils import (
     load_qwen3_dspark_model,
 )
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
 
 
 class Qwen3DSparkSpeculator(DFlashSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+        # RedHat/Qwen3 DSpark reuses DFlash's graph and attention helpers, but
+        # not DFlash's config contract. In particular, the published
+        # speculators-format checkpoints expose mask_token_id at top level
+        # rather than under dflash_config/pard_token/ptd_token_id.
+        DraftModelSpeculator.__init__(self, vllm_config, device)
+        self.supports_mm_inputs = False
 
         # Two block layouts: DeepSpec/DeepSeek "anchor-as-first" (N slots; slot 0
         # is the anchor and predicts the first draft token; block_size == N) vs.
@@ -58,6 +64,16 @@ class Qwen3DSparkSpeculator(DFlashSpeculator):
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
+        max_query_tokens = self.max_num_reqs * self.num_query_per_req
+        assert max_query_tokens <= self.max_num_tokens, (
+            "max_num_batched_tokens is too small for the DSpark draft block "
+            f"({max_query_tokens} > {self.max_num_tokens})."
+        )
+
+        mask_token_id = getattr(self.draft_model_config.hf_config, "mask_token_id", None)
+        if mask_token_id is None:
+            raise ValueError("Qwen3 DSpark requires mask_token_id in the draft config.")
+        self.parallel_drafting_token_id = int(mask_token_id)
 
         # DSpark consumes mean-pooled target aux hidden states at the target
         # layers, combined to hidden_size via main_proj. Store that combined
@@ -69,6 +85,26 @@ class Qwen3DSparkSpeculator(DFlashSpeculator):
         )
 
         self.dflash_causal = False
+        self.context_positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        # Compatibility with DFlash helper methods; Qwen3 DSpark uses the
+        # per-group _context_slot_mappings allocated in set_attn().
+        self.context_slot_mapping = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
+        self.sample_indices = torch.zeros(
+            max_num_sampled_tokens, dtype=torch.int64, device=device
+        )
+        self.sample_pos = torch.zeros(
+            max_num_sampled_tokens, dtype=torch.int64, device=device
+        )
+        self.sample_idx_mapping = torch.zeros(
+            max_num_sampled_tokens, dtype=torch.int32, device=device
+        )
+        self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+        self.draft_kv_cache_group_id = -1
 
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
