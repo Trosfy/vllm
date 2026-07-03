@@ -327,9 +327,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 if self.speculative_config.method == "dspark":
-                    set_dspark_aux_hidden_state_layers(
-                        self.model, self.speculative_config
-                    )
+                    draft_arch = getattr(
+                        self.speculative_config.draft_model_config.hf_config,
+                        "architectures",
+                        [None],
+                    )[0]
+                    if draft_arch == "Qwen3DSparkModel":
+                        set_eagle3_aux_hidden_state_layers(
+                            self.model, self.speculative_config
+                        )
+                    else:
+                        set_dspark_aux_hidden_state_layers(
+                            self.model, self.speculative_config
+                        )
                 else:
                     set_eagle3_aux_hidden_state_layers(
                         self.model, self.speculative_config

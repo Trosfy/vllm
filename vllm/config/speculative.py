@@ -952,6 +952,15 @@ class SpeculativeConfig:
                     self.method = "dflash"
                 elif "dspark" in self.draft_model_config.model.lower():
                     self.method = "dspark"
+                elif (
+                    getattr(
+                        self.draft_model_config.hf_config,
+                        "architectures",
+                        [None],
+                    )[0]
+                    == "Qwen3DSparkModel"
+                ):
+                    self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -1007,8 +1016,16 @@ class SpeculativeConfig:
                         "dspark_block_size",
                         None,
                     )
-                    if self.num_speculative_tokens is None and block_size:
-                        self.num_speculative_tokens = int(block_size)
+                    n_predict = getattr(
+                        self.draft_model_config.hf_config,
+                        "n_predict",
+                        None,
+                    )
+                    if self.num_speculative_tokens is None:
+                        if n_predict is not None:
+                            self.num_speculative_tokens = int(n_predict)
+                        elif block_size:
+                            self.num_speculative_tokens = int(block_size)
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"

@@ -130,3 +130,52 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
         "mask_token_id": config_dict["mask_token_id"],
         "target_layer_ids": [i - 1 for i in aux_layer_ids],
     }
+
+
+@register_speculator("dspark")
+def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
+    """
+    Apply DSpark specific configuration transformations to the `dict` used to
+    construct the Transformers PreTrainedConfig.
+
+    DSpark extends DFlash with a sequential Markov logit-bias head. Dense
+    speculators-format checkpoints, such as RedHatAI/GLM-5.2-speculator.dspark,
+    are loaded as a self-contained Qwen3DSparkModel drafter.
+
+    DSpark specific fields:
+    - draft_vocab_size: draft vocab size; when smaller than the target vocab the
+        checkpoint also ships d2t/t2d remap tables.
+    - mask_token_id: token id for parallel-drafting mask slots.
+    - markov_rank / markov_head_type: low-rank Markov logit-bias head.
+    - block_size: semi-autoregressive draft block size.
+    - enable_confidence_head / confidence_head_with_markov: optional confidence
+        head metadata.
+    - aux_hidden_state_layer_ids: target layer indices feeding the drafter.
+        DSpark target-layer semantics use aux_id - 1 for hidden-state capture.
+    """
+    pre_trained_config["architectures"] = ["Qwen3DSparkModel"]
+    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
+    if config_dict.get("target_hidden_size") is not None:
+        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+
+    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    pre_trained_config["target_layer_ids"] = [i - 1 for i in aux_layer_ids]
+    proposal_methods = config_dict.get("speculators_config", {}).get(
+        "proposal_methods", []
+    )
+    if proposal_methods:
+        speculative_tokens = proposal_methods[0].get("speculative_tokens")
+        if speculative_tokens is not None:
+            pre_trained_config["n_predict"] = speculative_tokens
+
+    for key in (
+        "mask_token_id",
+        "markov_rank",
+        "markov_head_type",
+        "block_size",
+        "enable_confidence_head",
+        "confidence_head_with_markov",
+    ):
+        if config_dict.get(key) is not None:
+            pre_trained_config[key] = config_dict[key]
