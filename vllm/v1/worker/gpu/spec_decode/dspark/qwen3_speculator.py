@@ -275,6 +275,10 @@ class Qwen3DSparkSpeculator(DFlashSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        # Adaptive verification depth (0c68fd7637): the runner slices the
+        # returned block via limit_draft_tokens; the full block is drafted
+        # regardless, so the depth is accepted here but not consumed.
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         import os as _os
         _timing = _os.environ.get("VLLM_DSPARK_TIMING", "0") == "1" and not (is_profile or dummy_run)
