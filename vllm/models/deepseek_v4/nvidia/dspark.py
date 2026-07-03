@@ -165,6 +165,9 @@ def _dspark_dump_layer_parts_enabled() -> bool:
     return os.getenv("VLLM_DSPARK_TENSOR_DEBUG_LAYER_PARTS") == "1"
 
 
+_dspark_layer_shared_state: dict = {}
+
+
 def _build_dspark_topk_idxs(
     *,
     window_size: int,
@@ -1052,15 +1055,41 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         cache_rows = cache_indices.view(batch_size).long()
         cache_slots = positions.view(batch_size).remainder(window_size).long()
         self.dspark_kv_cache[cache_rows, cache_slots].copy_(main_kv)
-        cache_window = self.dspark_kv_cache[cache_rows]
-        all_kv = torch.cat([cache_window, kv], dim=1)
-        topk_idxs = _build_dspark_topk_idxs(
-            window_size=window_size,
-            batch_size=batch_size,
-            block_size=block_size,
-            positions=positions.view(batch_size),
-            device=x.device,
+        # Persistent [b, window+block] staging buffer: one gather for the
+        # window + a small copy for the block KV, replacing the per-layer
+        # gather + full-width torch.cat (saves one window-wide copy and two
+        # allocations per layer per step).
+        if (
+            getattr(self, "_dspark_allkv_buf", None) is None
+            or self._dspark_allkv_buf.shape[0] < batch_size
+        ):
+            self._dspark_allkv_buf = torch.empty(
+                batch_size,
+                window_size + block_size,
+                kv.shape[-1],
+                dtype=kv.dtype,
+                device=kv.device,
+            )
+        all_kv = self._dspark_allkv_buf[:batch_size]
+        torch.index_select(
+            self.dspark_kv_cache, 0, cache_rows, out=all_kv[:, :window_size]
         )
+        all_kv[:, window_size:].copy_(kv)
+        # topk_idxs is layer-invariant: computed once per draft step by the
+        # first dspark layer and shared via the shared-state dict.
+        shared = _dspark_layer_shared_state
+        step_key = (positions.data_ptr(), batch_size, block_size)
+        if shared.get("key") != step_key or shared.get("capturing") is not torch.cuda.is_current_stream_capturing():
+            shared["key"] = step_key
+            shared["capturing"] = torch.cuda.is_current_stream_capturing()
+            shared["topk"] = _build_dspark_topk_idxs(
+                window_size=window_size,
+                batch_size=batch_size,
+                block_size=block_size,
+                positions=positions.view(batch_size),
+                device=x.device,
+            )
+        topk_idxs = shared["topk"]
         if _dspark_dump_layer_parts_enabled():
             _maybe_save_tensor_debug(
                 "dspark_attention_inputs",
@@ -1577,10 +1606,15 @@ class DeepSeekV4DSparkDraft(nn.Module):
                 )
             else:
                 output_ids[:, idx + 1] = logits[:, idx].argmax(dim=-1)
-        confidence = final_layer.confidence_head(
-            hidden,
-            torch.stack(markov_embeds, dim=1),
-        )
+        if os.environ.get("VLLM_DSPARK_CONFIDENCE", "0") == "1":
+            confidence = final_layer.confidence_head(
+                hidden,
+                torch.stack(markov_embeds, dim=1),
+            )
+        else:
+            # The serving speculator discards confidence; skip the head
+            # (an lm-head-sized projection) unless explicitly requested.
+            confidence = None
         return output_ids, logits, confidence
 
     def forward_spec(
@@ -1606,6 +1640,7 @@ class DeepSeekV4DSparkDraft(nn.Module):
             "VLLM_DSPARK_TENSOR_DEBUG_DIR"
         ):
             debug_start_pos = int(positions[0].detach().cpu())
+        _dspark_layer_shared_state.clear()
         x, main_x, draft_input_ids = self.forward_embed(main_hidden, input_ids)
         if os.getenv("VLLM_DSPARK_DEBUG_DIR"):
             _maybe_dump_stage_debug(

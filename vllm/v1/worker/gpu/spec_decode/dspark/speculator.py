@@ -436,6 +436,14 @@ class DSparkSpeculator(DraftModelSpeculator):
                 f"expected {len(self.target_layer_ids)}, got {len(aux_hidden_states)}."
             )
 
+        _timing = os.environ.get("VLLM_DSPARK_TIMING", "0") == "1"
+        if _timing:
+            if not hasattr(self, "_tev"):
+                self._tev = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+                self._tacc = [0.0, 0.0, 0]
+                import sys
+                print("DSPARK TIMING ARMED", file=sys.stderr, flush=True)
+            self._tev[0].record()
         with record_function_or_nullcontext("vllm:v2/speculator/dspark/prepare"):
             prepare_prefill_inputs(
                 self.last_token_indices,
@@ -514,9 +522,27 @@ class DSparkSpeculator(DraftModelSpeculator):
                 self.graph_positions[num_reqs:num_reqs_padded].fill_(1)
                 self.idx_mapping[num_reqs:num_reqs_padded].zero_()
             self.active_num_reqs.fill_(num_reqs)
+            if _timing:
+                self._tev[1].record()
             self.forward_cudagraph_manager.run_fullgraph(batch_desc)
+            if _timing:
+                self._tev[2].record()
+                self._tev[2].synchronize()
+                self._tacc[0] += self._tev[0].elapsed_time(self._tev[1])
+                self._tacc[1] += self._tev[1].elapsed_time(self._tev[2])
+                self._tacc[2] += 1
+                if self._tacc[2] % 200 == 0:
+                    import sys
+                    print(
+                        f"DSPARK TIMING over {self._tacc[2]} steps: "
+                        f"prepare {self._tacc[0]/self._tacc[2]:.3f} ms/step, "
+                        f"graph-forward {self._tacc[1]/self._tacc[2]:.3f} ms/step",
+                        file=sys.stderr, flush=True,
+                    )
             return self.draft_tokens[:num_reqs]
 
+        if _timing:
+            self._tev[1].record()
         with record_function_or_nullcontext("vllm:v2/speculator/dspark/forward"):
             # DSpark uses its own TileLang attention path, but the inherited
             # DeepSeek MoE layers still read vLLM's forward context to resolve
@@ -544,4 +570,19 @@ class DSparkSpeculator(DraftModelSpeculator):
                 )
         steps = self.num_speculative_steps
         self.draft_tokens[:num_reqs, :steps].copy_(output_ids[:, 1 : 1 + steps])
+        if _timing:
+            self._tev[2].record()
+            self._tev[2].synchronize()
+            self._tacc[0] += self._tev[0].elapsed_time(self._tev[1])
+            self._tacc[1] += self._tev[1].elapsed_time(self._tev[2])
+            self._tacc[2] += 1
+            if self._tacc[2] % 50 == 0:
+                import sys
+                print(
+                    f"DSPARK TIMING over {self._tacc[2]} steps: "
+                    f"prepare {self._tacc[0]/self._tacc[2]:.3f} ms/step, "
+                    f"forward {self._tacc[1]/self._tacc[2]:.3f} ms/step",
+                    file=sys.stderr, flush=True,
+                )
+
         return self.draft_tokens[:num_reqs]
