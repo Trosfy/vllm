@@ -206,6 +206,16 @@ class Fp8Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
+            if self.store_dtype == "nvfp4":
+                from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+                    CompressedTensorsW4A4Nvfp4MoEMethod,
+                )
+
+                logger.info_once(
+                    "Using NVFP4 MoE method for FP8 checkpoint with "
+                    "store_dtype=nvfp4."
+                )
+                return CompressedTensorsW4A4Nvfp4MoEMethod(layer.moe_config)
             if self.store_dtype == "mxfp4":
                 from vllm.model_executor.layers.quantization.mxfp4 import (
                     GptOssMxfp4MoEMethod,
