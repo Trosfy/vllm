@@ -358,6 +358,49 @@ class Qwen3DSparkSpeculator(DFlashSpeculator):
                 self._context_slot_mappings[gidx][:num_target_tokens]
                 for gidx in self._layer_group_idx
             ]
+        if (
+            _os.environ.get("VLLM_DSPARK_CTX_DEBUG", "0") == "1"
+            and not dummy_run
+            and num_target_tokens <= 8
+        ):
+            import sys as _sys
+
+            _sl0 = self.input_buffers.seq_lens[0].item()
+            if _sl0 > 2000:
+                _gid = self.draft_kv_cache_group_id
+                _bt = self.block_tables.input_block_tables[_gid][0]
+                _bs = self.draft_block_size
+                _need = (_sl0 + _bs - 1) // _bs
+                _nz = int((_bt[:_need] > 0).sum().item())
+                print(
+                    f"RDDBG seq_len={_sl0} pages_needed={_need} "
+                    f"pages_nonzero={_nz} bt[:4]={_bt[:4].tolist()} "
+                    f"bt[{_need-3}:{_need}]={_bt[max(_need-3,0):_need].tolist()} "
+                    f"bt_width={_bt.numel()}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+        if (
+            _os.environ.get("VLLM_DSPARK_CTX_DEBUG", "0") == "1"
+            and not dummy_run
+            and num_target_tokens > 100
+        ):
+            import sys as _sys
+
+            _cp = self.context_positions[:num_target_tokens]
+            _sl = per_layer_context_slots[0][:num_target_tokens] if per_layer_context_slots else None
+            _valid = _sl[_sl >= 0] if _sl is not None else None
+            print(
+                f"CTXDBG ntok={num_target_tokens} "
+                f"pos[:3]={_cp[:3].tolist()} pos[-3:]={_cp[-3:].tolist()} "
+                f"slots: n={_sl.numel() if _sl is not None else 0} "
+                f"valid={_valid.numel() if _valid is not None else 0} "
+                f"uniq={_valid.unique().numel() if _valid is not None and _valid.numel() else 0} "
+                f"min={_valid.min().item() if _valid is not None and _valid.numel() else -1} "
+                f"max={_valid.max().item() if _valid is not None and _valid.numel() else -1}",
+                file=_sys.stderr,
+                flush=True,
+            )
         self.model.precompute_and_store_context_kv(
             self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
