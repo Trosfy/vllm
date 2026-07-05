@@ -973,7 +973,9 @@ def get_max_concurrency_for_kv_cache_config(
     max_memory_usage_per_request = _max_memory_usage_bytes_from_groups(
         vllm_config, kv_cache_config.kv_cache_groups
     )
-    memory_per_block = _pool_bytes_per_block(kv_cache_config.kv_cache_groups)
+    memory_per_block = _pool_bytes_per_block(
+        vllm_config, kv_cache_config.kv_cache_groups
+    )
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
     return max_concurrency
