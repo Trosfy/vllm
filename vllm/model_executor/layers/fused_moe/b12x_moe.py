@@ -1103,6 +1103,65 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         num_experts = int(w1.shape[0])
         hidden_size = int(w2.shape[1])
         intermediate_size = int(w2.shape[2]) * 2
+        w1_blockscale = self.w1_scale
+        w2_blockscale = self.w2_scale
+        if (
+            quant_mode in ("w4a8_mx", "w4a16")
+            and self._source_format() == "fp4_e8m0_k32"
+            and intermediate_size % 128 != 0
+            and intermediate_size % 32 == 0
+            and tuple(w1.shape) == (
+                num_experts,
+                2 * intermediate_size,
+                hidden_size // 2,
+            )
+            and tuple(w1_blockscale.shape) == (
+                num_experts,
+                2 * intermediate_size,
+                hidden_size // 32,
+            )
+            and tuple(w2_blockscale.shape) == (
+                num_experts,
+                hidden_size,
+                intermediate_size // 32,
+            )
+        ):
+            # The W4A8-MX QMMA repack tiles the intermediate dimension in
+            # 128-column blocks and the packed W4A16 e8m0 kernels have no
+            # tile configs for odd K (e.g. 'no valid W4A16 tile config for
+            # M/N/K=.../352'), which odd TP shards cannot satisfy (GLM-5.2
+            # moe_intermediate 2048 at TP6 -> 352 per rank). Zero-pad the
+            # shard up to the next 128 multiple instead of failing boot:
+            # padded gate/up rows yield silu(0) * 0 = 0 activations and the
+            # padded w2 columns only ever multiply those zeros, so the MoE
+            # output is bit-exact; the cost is proportional to the padding
+            # (352 -> 384 is ~9% extra expert GEMM work on this rank).
+            padded_size = -(-intermediate_size // 128) * 128
+            pad_rows = padded_size - intermediate_size
+            w1 = torch.nn.functional.pad(
+                w1.view(num_experts, 2, intermediate_size, hidden_size // 2),
+                (0, 0, 0, pad_rows),
+            ).reshape(num_experts, 2 * padded_size, hidden_size // 2)
+            w1_blockscale = torch.nn.functional.pad(
+                w1_blockscale.view(
+                    num_experts, 2, intermediate_size, hidden_size // 32
+                ),
+                (0, 0, 0, pad_rows),
+            ).reshape(num_experts, 2 * padded_size, hidden_size // 32)
+            w2 = torch.nn.functional.pad(w2, (0, pad_rows // 2))
+            w2_blockscale = torch.nn.functional.pad(
+                w2_blockscale, (0, pad_rows // 32)
+            )
+            logger.warning_once(
+                "B12X %s: expert intermediate size %d is not a multiple "
+                "of 128; zero-padding the shard to %d for the kernel tile "
+                "layout (exact results, ~%.0f%% extra expert GEMM work).",
+                quant_mode,
+                intermediate_size,
+                padded_size,
+                100.0 * pad_rows / intermediate_size,
+            )
+            intermediate_size = padded_size
         unit_scale = self._unit_expert_scale(w1.device, num_experts)
         if quant_mode in ("nvfp4", "w4a8_nvfp4"):
             if self.quant_config.weight_quant_dtype != "nvfp4":
@@ -1158,11 +1217,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = prepare_b12x_fp4_moe_weights(
             plan=weight_plan,
             w1_fp4=w1,
-            w1_blockscale=self.w1_scale,
+            w1_blockscale=w1_blockscale,
             w1_global_scale=w1_global_scale,
             a1_gscale=a1_gscale,
             w2_fp4=w2,
-            w2_blockscale=self.w2_scale,
+            w2_blockscale=w2_blockscale,
             w2_global_scale=w2_global_scale,
             a2_gscale=a2_gscale,
             params_dtype=params_dtype,
