@@ -3,7 +3,8 @@
 
 import torch
 
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -32,7 +33,17 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    Mxfp8OnlineLinearMethod,
+    is_shared_expert_projection,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+    kMxfp8Dynamic,
+)
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
@@ -241,10 +252,47 @@ class Mxfp4Config(QuantizationConfig):
 
     # TODO (zyongye) This is only temporaty fallback.
     # We should have `Mxfp4MoEMethod` after this migration is complete.
+    def _get_dense_linear_online_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        """Overlay online MXFP8 on BF16 dense linears in MXFP4 checkpoints."""
+        if not isinstance(layer, LinearBase) or is_shared_expert_projection(prefix):
+            return None
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        args = vllm_config.model_config.quantization_config
+        if not isinstance(args, QuantizationConfigArgs):
+            return None
+        spec = args.linear
+        if spec is None:
+            return None
+        if args.ignore and should_ignore_layer(
+            prefix,
+            ignore=args.ignore,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return None
+        if spec.weight != kMxfp8Dynamic or spec.activation is not None:
+            raise ValueError(
+                "MXFP4 dense-linear overlay only supports weight='mxfp8' "
+                "with no activation override."
+            )
+        logger.info_once(
+            "MXFP4 dense-linear overlay: quantizing BF16 linears to MXFP8 "
+            "at load time (module example: %s).",
+            prefix,
+        )
+        logger.debug("MXFP8 dense-linear overlay applied to %s", prefix)
+        return Mxfp8OnlineLinearMethod()
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
+            if method := self._get_dense_linear_online_method(layer, prefix):
+                return method
             if self.ignored_layers and is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,

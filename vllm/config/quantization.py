@@ -151,7 +151,14 @@ ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
 # which the checkpoint explicitly leaves unquantized (shared experts via
 # `shared_experts`, other dense linears via `linear`).
 _MODELOPT_MXFP8_OVERLAY_NAMES = frozenset(
-    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"}
+    {
+        "gpt_oss_mxfp4",
+        "modelopt",
+        "modelopt_fp4",
+        "modelopt_mixed",
+        "modelopt_mxfp8",
+        "mxfp4",
+    }
 )
 
 
@@ -194,7 +201,7 @@ def resolve_quantization_config(
             raise ValueError(
                 f"quantization_config is only supported when quantization is "
                 f"one of {sorted(ONLINE_QUANT_SHORTHAND_NAMES)}, or when "
-                f"using the ModelOpt MXFP8 overlay (weight='mxfp8' on "
+                f"using the MXFP8 overlay (weight='mxfp8' on "
                 f"'shared_experts' and/or 'linear', optional 'ignore'), "
                 f"got quantization={quantization!r}"
             )
