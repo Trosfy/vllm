@@ -515,8 +515,8 @@ def kernel_unified_attention(
         seq_mask = compute_kv_seq_mask(
             query_abs_pos,
             seq_offset,
-            seq_len,
             seq_idx,
+            seq_len,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
