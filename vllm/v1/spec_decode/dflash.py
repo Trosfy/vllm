@@ -436,25 +436,16 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
             per_group.append(attn_metadata)
 
-            # Full-attention DFlash layers attend to the draft block
-            # bidirectionally (cad.causal reflects dflash_config.causal).
-            # SWA layers bound how far back a query may look; sliding-window
-            # kernels apply the window relative to the causal diagonal, so
-            # those layers need causal metadata even in non-causal mode.
-            sliding_metadata = None
             for layer_name in attn_group.layer_names:
-                if layer_name in sliding_layer_names and not group_cad.causal:
-                    if sliding_metadata is None:
-                        sliding_metadata = builder.build_for_drafting(
-                            common_attn_metadata=group_cad.replace(causal=True),
-                            draft_index=draft_index,
-                        )
-                    per_layer[layer_name] = sliding_metadata
-                else:
-                    per_layer[layer_name] = attn_metadata
+                per_layer[layer_name] = attn_metadata
 
+        # DFlash draft attention is non-causal by default: every block slot
+        # attends to the full draft block bidirectionally. SWA layers still
+        # bound the context window, but must not force a causal draft-block
+        # mask unless dflash_config.causal explicitly asks for it.
+        del sliding_layer_names
         for layer_name, attn_metadata in per_layer.items():
-            expected_causal = layer_name in sliding_layer_names or cad.causal
+            expected_causal = cad.causal
             assert getattr(attn_metadata, "causal", None) is expected_causal, (
                 f"Attention metadata for layer {layer_name} does not have"
                 f" causal={expected_causal} support, which is required for"
