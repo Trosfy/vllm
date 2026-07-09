@@ -3,6 +3,7 @@
 
 import dataclasses
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -105,7 +106,14 @@ def _resolve_layer_attention(
             )
 
     default_causal = False
-    if layer_types is None or (use_swa and not any_sliding):
+    force_single_swa = (
+        os.environ.get("VLLM_DFLASH_FORCE_SINGLE_SWA", "0").lower()
+        in ("1", "true", "yes")
+    )
+    if force_single_swa and any_sliding:
+        is_sliding = True
+        default_causal = False
+    elif layer_types is None or (use_swa and not any_sliding):
         # An absent ``layer_types`` (or the all-"full_attention" one that may
         # be synthesized when the checkpoint omits it) must not override
         # ``dflash_config.use_swa``, which forces SWA on every layer.
@@ -266,7 +274,7 @@ class DFlashQwen3Attention(nn.Module):
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Per-head RMSNorm
