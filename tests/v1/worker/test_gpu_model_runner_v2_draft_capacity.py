@@ -13,12 +13,16 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required for draft capacity tests", allow_module_level=True)
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backends.mla.indexer import (
+    _needs_varlen_decode,
+    _uses_varlen_dspark_capacity,
+)
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.capacity import (
     DSparkDynamicDraftDepthController,
     MaskedCapacityBasedVerificationManager,
@@ -29,6 +33,37 @@ from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.states import RequestState
+
+
+def test_varlen_indexer_is_limited_to_active_dspark_capacity():
+    def config(**overrides):
+        values = {
+            "use_dspark": lambda: True,
+            "dspark_capacity_verification_mode": "varlen",
+            "dspark_confidence_threshold": 0.0,
+            "dspark_budget_frac": 1.0,
+            "dspark_sps_curve": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(
+            speculative_config=SimpleNamespace(**values),
+        )
+
+    assert not _uses_varlen_dspark_capacity(config())
+    assert _uses_varlen_dspark_capacity(config(dspark_confidence_threshold=0.5))
+    assert _uses_varlen_dspark_capacity(config(dspark_budget_frac=0.5))
+    assert _uses_varlen_dspark_capacity(config(dspark_sps_curve="auto"))
+    assert not _uses_varlen_dspark_capacity(
+        config(dspark_capacity_verification_mode="mask")
+    )
+    assert not _uses_varlen_dspark_capacity(config(use_dspark=lambda: False))
+
+
+def test_varlen_indexer_skips_uniform_full_width_batches():
+    assert not _needs_varlen_decode(True, True, 6, 6)
+    assert _needs_varlen_decode(True, False, 4, 4)
+    assert _needs_varlen_decode(True, False, 6, 6)
+    assert not _needs_varlen_decode(False, False, 6, 6)
 
 
 def test_dynamic_draft_depth_tracks_capacity_and_probes_upward():
@@ -156,7 +191,8 @@ def test_compute_draft_token_capacity_uses_budgeted_global_prefix_order():
     )
 
     torch.accelerator.synchronize()
-    assert draft_token_capacity.cpu().tolist() == [2, 1]
+    # ceil(4 * 0.5) admits exactly two globally ranked prefixes.
+    assert draft_token_capacity.cpu().tolist() == [1, 1]
 
 
 def test_compute_draft_token_capacity_keeps_threshold_ties():
@@ -315,9 +351,9 @@ def test_compute_draft_token_capacity_temperature_desaturates_zeros():
     torch.accelerator.synchronize()
     # T=1: exact-zero survival past position 2 truncates both requests.
     assert capacity_t1.cpu().tolist() == [2, 2]
-    # T=10: sigmoid(-10) > 0, so the budget (int(10*0.9)+1 = 10 admissions,
-    # capped at 5 per request) is fully spent.
-    assert capacity_t10.cpu().tolist() == [5, 5]
+    # T=10: sigmoid(-10) > 0, so the ceil(10*0.9) = 9 admission
+    # budget is fully spent.
+    assert capacity_t10.cpu().tolist() == [5, 4]
 
 
 def test_online_sts_fits_order_preserving_temperatures():
@@ -407,6 +443,56 @@ def test_capacity_based_verification_manager_updates_cpu_capacities():
     handler.draft_token_capacity_np.fill(3)
     handler.trim_batch(input_batch)
     assert handler.draft_token_capacity_np.tolist() == [2, 3, 3, 3]
+
+
+def test_capacity_manager_bypasses_readback_below_profiled_knee():
+    device = torch.device("cuda")
+    req_states = RequestState(
+        max_num_reqs=4,
+        max_model_len=4,
+        max_num_batched_tokens=16,
+        num_speculative_steps=3,
+        vocab_size=32,
+        device=device,
+    )
+    handler = VarlenCapacityBasedVerificationManager(
+        max_num_tokens=16,
+        req_states=req_states,
+        device=device,
+    )
+    handler.capacity_activation_batch_size = 2
+    handler.draft_token_capacity_np.fill(0)
+
+    assert not handler.should_apply_capacity(1)
+    assert handler.capacity_bypassed
+    assert handler.draft_token_capacity_np.tolist() == [3, 3, 3, 3]
+
+    handler.idx_mapping_np = np.array([0], dtype=np.int32)
+    handler.update_capacities(torch.tensor([1], dtype=torch.int32, device=device))
+    assert not handler.copy_event_pending
+
+    assert handler.should_apply_capacity(2)
+    assert not handler.capacity_bypassed
+
+
+def test_varlen_capacity_manager_warmup_compacts_inputs_in_place():
+    device = torch.device("cuda")
+    req_states = RequestState(
+        max_num_reqs=4,
+        max_model_len=8,
+        max_num_batched_tokens=16,
+        num_speculative_steps=3,
+        vocab_size=32,
+        device=device,
+    )
+    handler = VarlenCapacityBasedVerificationManager(
+        max_num_tokens=16,
+        req_states=req_states,
+        device=device,
+    )
+
+    handler.warmup(InputBuffers(4, 16, device))
+    torch.accelerator.synchronize()
 
 
 def test_varlen_capacity_manager_compacts_verifier_batch():
@@ -704,6 +790,49 @@ def test_varlen_cudagraph_capture_adds_full_desc():
         desc.max_req_tokens == manager.decode_query_len
         for desc in manager._capture_descs[CUDAGraphMode.FULL]
     )
+
+
+def test_varlen_cudagraph_prefers_uniform_below_capacity_knee(monkeypatch):
+    monkeypatch.setenv("VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE", "4")
+    manager = object.__new__(CudaGraphManager)
+    manager.vllm_config = SimpleNamespace(speculative_config=None)
+    manager.compilation_config = SimpleNamespace(
+        cudagraph_capture_sizes=[12, 16],
+        max_cudagraph_capture_size=64,
+    )
+    manager.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    manager.decode_query_len = 4
+    manager.varlen_spec_decode = True
+    manager.max_num_reqs = 16
+    manager.lora_capture_cases = [0]
+    manager._lora_dispatch_map = {}
+    manager._max_lora_case = 0
+    manager._candidates = {}
+    manager._capture_descs = {}
+
+    manager._init_candidates()
+    manager._graphs_captured = True
+
+    low_load_desc = manager.dispatch(
+        num_reqs=3,
+        num_tokens=12,
+        uniform_token_count=4,
+        num_active_loras=0,
+        max_req_tokens=4,
+    )
+    assert low_load_desc.uniform_token_count == 4
+    assert low_load_desc.num_reqs == 3
+
+    capacity_desc = manager.dispatch(
+        num_reqs=4,
+        num_tokens=13,
+        uniform_token_count=None,
+        num_active_loras=0,
+        max_req_tokens=4,
+    )
+    assert capacity_desc.uniform_token_count is None
+    assert capacity_desc.max_req_tokens == 4
+    assert capacity_desc.num_tokens == 16
 
 
 def test_varlen_cudagraph_dispatch_skips_incompatible_uniform_grid():
