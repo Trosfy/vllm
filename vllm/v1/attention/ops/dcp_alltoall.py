@@ -50,6 +50,19 @@ def _load_b12x_dcp_a2a_pool() -> Any | None:
     return PCIeDCPA2APool
 
 
+def _b12x_dcp_init_failed(
+    cp_group: GroupCoordinator,
+    device: torch.device,
+    init_error: Exception | None,
+) -> bool:
+    """Reach consensus on pool initialization through its exchange group."""
+    failed = torch.tensor(
+        [int(init_error is not None)], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=cp_group.device_group)
+    return bool(failed.item())
+
+
 def _get_b12x_dcp_a2a_pool(
     cp_group: GroupCoordinator,
     *,
@@ -101,13 +114,10 @@ def _get_b12x_dcp_a2a_pool(
     except Exception as exc:
         init_error = exc
 
-    cpu_group = getattr(cp_group, "cpu_group", None)
-    if cpu_group is not None:
-        failed = torch.tensor([int(init_error is not None)], dtype=torch.int32)
-        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=cpu_group)
-        any_failed = bool(failed.item())
-    else:
-        any_failed = init_error is not None
+    # Keep the status collective ordered with the NCCL group used above for
+    # IPC-handle exchange. A separate Gloo group can be at a different startup
+    # sequence when vLLM initializes overlapping TP/DCP coordinators.
+    any_failed = _b12x_dcp_init_failed(cp_group, device, init_error)
 
     if any_failed:
         if pool is not None:
