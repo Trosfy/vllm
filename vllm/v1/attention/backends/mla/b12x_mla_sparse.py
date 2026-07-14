@@ -53,7 +53,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -240,6 +243,8 @@ class B12xMLASparseMetadata(AttentionMetadata):
     max_query_len: int
     max_seq_len: int
     num_actual_tokens: int
+    num_decode_tokens: int
+    num_prefill_tokens: int
 
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
@@ -328,6 +333,24 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
     ) -> B12xMLASparseMetadata:
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
+        if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
+            num_decode_tokens = num_tokens
+            num_prefill_tokens = 0
+        elif cm.batch_topology is not None:
+            _, _, num_decode_tokens, num_prefill_tokens = (
+                cm.batch_topology.split_decodes_and_prefills(
+                    cm,
+                    decode_threshold=1,
+                    treat_short_extends_as_decodes=True,
+                )
+            )
+        else:
+            _, _, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
+                cm,
+                decode_threshold=1,
+                treat_short_extends_as_decodes=True,
+            )
+        assert num_decode_tokens + num_prefill_tokens == num_tokens
 
         use_dcp = self.dcp_world_size > 1
         seq_lens_for_req = (
@@ -453,6 +476,8 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,
             num_actual_tokens=num_tokens,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_tokens=num_prefill_tokens,
             query_start_loc=cm.query_start_loc,
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
@@ -479,6 +504,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     """b12x unified sparse-MLA implementation (decode + extend/prefill)."""
 
     can_return_lse_for_decode: bool = True
+    supports_dcp_project_before_merge: bool = True
 
     def __init__(
         self,
