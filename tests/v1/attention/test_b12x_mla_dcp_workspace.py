@@ -78,6 +78,7 @@ def test_cp_lse_ag_out_rs_into_preserves_borrowed_output(monkeypatch, world_size
 
     class FakeGroup:
         rank_in_group = rank
+        world_size: int
 
         def reduce_scatter_into(self, input_, output, dim):
             assert input_ is corrected

@@ -73,9 +73,7 @@ logger = init_logger(__name__)
 _DECODE_SPLIT_TILE = 64
 _HEAD_ALIGNMENT = 8
 _BF16_BYTES = 2
-_EXTEND_PREWARM_DONE: set[
-    tuple[int | None, int, int, int, int, int, bool, str, int | None]
-] = set()
+_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -870,7 +868,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     local_chunk,
                 )
             else:
-                local_chunk = q.narrow(0, chunk_start, chunk_rows)
+                local_chunk = cast(torch.Tensor, q).narrow(0, chunk_start, chunk_rows)
 
             gather_numel = world_size * chunk_rows * local_heads * head_dim
             gathered = (
