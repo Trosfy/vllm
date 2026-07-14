@@ -259,10 +259,8 @@ def cp_lse_ag_out_rs_into(
     is_lse_base_on_e: bool = True,
 ):
     """Correct DCP partials and reduce-scatter into borrowed output storage."""
-    if cp_group.world_size != 4:
-        raise RuntimeError(
-            "cp_lse_ag_out_rs_into is restricted to the validated DCP4 path"
-        )
+    if cp_group.world_size <= 1:
+        raise RuntimeError("cp_lse_ag_out_rs_into requires DCP world size > 1")
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("cp_lse_ag_out_rs_into is eager-only")
 
