@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
@@ -71,7 +72,10 @@ logger = init_logger(__name__)
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
 _HEAD_ALIGNMENT = 8
-_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
+_BF16_BYTES = 2
+_EXTEND_PREWARM_DONE: set[
+    tuple[int | None, int, int, int, int, int, bool, str, int | None]
+] = set()
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -495,6 +499,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
     can_return_lse_for_decode: bool = True
     supports_dcp_project_before_merge: bool = True
+    supports_dcp_gather_query_in_workspace: bool = True
+    supports_dcp_project_before_merge_in_workspace: bool = True
+    supports_dcp_reduce_scatter_output_in_workspace: bool = True
 
     def __init__(
         self,
@@ -555,7 +562,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
+        self.dcp_workspace_non_dbo = not bool(parallel_config.enable_dbo)
         self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.tp_world_size = int(parallel_config.tensor_parallel_size)
         self.dcp_rank = 0
         if self.dcp_world_size > 1:
             from vllm.distributed.parallel_state import get_dcp_group
@@ -699,11 +708,226 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 )
             )
         workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
-        current_workspace_manager().get_simultaneous(*workspace_specs)
+        self._workspace_specs = tuple(workspace_specs)
+        self._borrow_workspaces()
         self._prewarm_extend_kernels_once(max_batched)
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
+
+    def _borrow_workspaces(self) -> list[torch.Tensor]:
+        return current_workspace_manager().get_simultaneous(*self._workspace_specs)
+
+    def _validate_dcp_prefill_workspace_contract(self, num_tokens: int) -> None:
+        if (
+            self._max_batched != 3072
+            or not 1025 <= num_tokens <= 3072
+            or not self.dcp_workspace_non_dbo
+            or self.tp_world_size != 4
+            or self.dcp_world_size != 4
+            or self.num_heads != 16
+            or self._input_num_heads != 64
+            or self._kernel_num_heads != 64
+            or self._pad_heads
+            or self.q_head_dim != 576
+            or self.kv_lora_rank != 512
+            or self.v_head_dim != 256
+        ):
+            raise RuntimeError(
+                "The DCP prefill workspace path requires TP4/DCP4, "
+                "MNBT=3072, 1025..3072 rows, "
+                "16/64 heads and MLA dimensions 576/512/256"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("The DCP prefill workspace path is eager-only")
+
+    def dcp_all_gather_query_in_workspace(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Gather local DCP query heads through the borrowed MLA workspaces."""
+        if isinstance(q, tuple):
+            ql_nope, q_pe = q
+            if ql_nope.ndim != 3 or q_pe.ndim != 3:
+                raise ValueError("DCP workspace tuple queries must be rank-3")
+            num_tokens, local_heads, nope_dim = ql_nope.shape
+            if tuple(q_pe.shape) != (num_tokens, local_heads, 64) or nope_dim != 512:
+                raise ValueError("DCP workspace requires noPE/RoPE dimensions 512/64")
+            if ql_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
+                raise TypeError("DCP workspace queries must be BF16")
+            tuple_input = True
+            query_device = ql_nope.device
+        else:
+            if q.ndim != 3:
+                raise ValueError("DCP workspace query must be rank-3")
+            num_tokens, local_heads, head_dim = q.shape
+            if head_dim != self.q_head_dim or not q.is_contiguous():
+                raise ValueError("DCP workspace tensor query has invalid layout")
+            tuple_input = False
+            query_device = q.device
+
+        self._validate_dcp_prefill_workspace_contract(int(num_tokens))
+        if local_heads != 16 or query_device != self.device:
+            raise ValueError(
+                "DCP workspace requires 16 local heads on the planned device"
+            )
+
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        dcp_group = get_dcp_group()
+        process_group = dcp_group.device_group
+        if dcp_group.world_size != 4 or dcp_group.rank_in_group != self.dcp_rank:
+            raise RuntimeError("DCP workspace group does not match the MLA plan")
+
+        q_workspace, scratch_storage = self._borrow_workspaces()
+        if (
+            tuple(q_workspace.shape) != (3072, 64, 576)
+            or q_workspace.dtype != torch.bfloat16
+            or tuple(scratch_storage.shape) != (self._scratch_nbytes,)
+            or scratch_storage.dtype != torch.uint8
+        ):
+            raise RuntimeError("DCP prefill borrowed an unexpected workspace layout")
+        q_begin = q_workspace.data_ptr()
+        q_end = q_begin + q_workspace.numel() * q_workspace.element_size()
+        scratch_begin = scratch_storage.data_ptr()
+        scratch_end = scratch_begin + scratch_storage.numel()
+        if q_begin < scratch_end and scratch_begin < q_end:
+            raise RuntimeError("DCP query and scratch workspaces overlap")
+
+        world_size = 4
+        head_dim = 576
+        gather_scratch_nbytes = 3072 * 64 * 512 * _BF16_BYTES
+        if gather_scratch_nbytes > scratch_storage.numel():
+            raise RuntimeError("DCP scratch cannot hold the gather staging area")
+        bytes_per_chunk_row = world_size * local_heads * head_dim * _BF16_BYTES
+        chunk_capacity = gather_scratch_nbytes // bytes_per_chunk_row
+        if chunk_capacity != 2730:
+            raise RuntimeError("Unexpected DCP workspace gather chunk capacity")
+
+        q_workspace_flat = q_workspace.view(-1)
+        chunk_start = 0
+        while chunk_start < num_tokens:
+            chunk_rows = min(chunk_capacity, num_tokens - chunk_start)
+            if tuple_input:
+                local_offset = chunk_start * 64 * head_dim
+                local_numel = chunk_rows * local_heads * head_dim
+                local_chunk = q_workspace_flat.narrow(
+                    0, local_offset, local_numel
+                ).view(chunk_rows, local_heads, head_dim)
+                ops.concat_mla_q(
+                    ql_nope.narrow(0, chunk_start, chunk_rows),
+                    q_pe.narrow(0, chunk_start, chunk_rows),
+                    local_chunk,
+                )
+            else:
+                local_chunk = q.narrow(0, chunk_start, chunk_rows)
+
+            gather_numel = world_size * chunk_rows * local_heads * head_dim
+            gathered = (
+                scratch_storage.narrow(0, 0, gather_numel * _BF16_BYTES)
+                .view(torch.bfloat16)
+                .view(world_size * chunk_rows, local_heads, head_dim)
+            )
+            dist.all_gather_into_tensor(
+                gathered,
+                local_chunk,
+                group=process_group,
+                async_op=False,
+            )
+            rank_major = gathered.view(world_size, chunk_rows, local_heads, head_dim)
+            destination = q_workspace.narrow(0, chunk_start, chunk_rows)
+            for source_rank in range(world_size):
+                destination.narrow(1, source_rank * local_heads, local_heads).copy_(
+                    rank_major[source_rank]
+                )
+            chunk_start += chunk_rows
+
+        global_query = q_workspace[:num_tokens]
+        if not global_query.is_contiguous():
+            raise RuntimeError("DCP workspace did not produce a contiguous query")
+        return global_query
+
+    def dcp_project_before_merge_in_workspace(
+        self,
+        attn_out: torch.Tensor,
+        lse: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project DCP partials from 512 to 256 in borrowed MLA storage."""
+        num_tokens = int(attn_out.shape[0])
+        self._validate_dcp_prefill_workspace_contract(num_tokens)
+        if (
+            tuple(attn_out.shape) != (num_tokens, 64, 512)
+            or not attn_out.is_contiguous()
+            or attn_out.dtype != torch.bfloat16
+            or tuple(w_uv.shape) != (64, 512, 256)
+            or not w_uv.is_contiguous()
+            or w_uv.dtype != torch.bfloat16
+            or tuple(lse.shape) != (num_tokens, 64)
+            or lse.dtype != torch.float32
+        ):
+            raise ValueError(
+                "DCP workspace projection received an invalid tensor layout"
+            )
+
+        q_workspace, scratch_storage = self._borrow_workspaces()
+        input_numel = 64 * num_tokens * 512
+        projected_numel = 64 * num_tokens * 256
+        projected_nbytes = projected_numel * _BF16_BYTES
+        if (
+            q_workspace.numel() < input_numel
+            or scratch_storage.numel() < projected_nbytes
+        ):
+            raise RuntimeError("DCP projection workspace is too small")
+        if (
+            attn_out.untyped_storage().data_ptr()
+            != scratch_storage.untyped_storage().data_ptr()
+        ):
+            raise RuntimeError(
+                "DCP attention output is not backed by the MLA scratch workspace"
+            )
+
+        projection_input = q_workspace.view(-1)[:input_numel].view(64, num_tokens, 512)
+        projected_head_major = (
+            scratch_storage[:projected_nbytes]
+            .view(torch.bfloat16)
+            .view(64, num_tokens, 256)
+        )
+        projection_input.copy_(attn_out.transpose(0, 1))
+        torch.bmm(projection_input, w_uv, out=projected_head_major)
+        return projected_head_major.transpose(0, 1)
+
+    def dcp_reduce_scatter_output_in_workspace(
+        self,
+        corrected_attn_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expose the dead query prefix as DCP4 reduce-scatter output."""
+        num_tokens = int(corrected_attn_out.shape[0])
+        self._validate_dcp_prefill_workspace_contract(num_tokens)
+        input_head_major = corrected_attn_out.movedim(0, 1)
+        if (
+            tuple(corrected_attn_out.shape) != (num_tokens, 64, 256)
+            or corrected_attn_out.dtype != torch.bfloat16
+            or not input_head_major.is_contiguous()
+        ):
+            raise ValueError("DCP reduce-scatter input has an invalid layout")
+
+        q_workspace, scratch_storage = self._borrow_workspaces()
+        if (
+            corrected_attn_out.untyped_storage().data_ptr()
+            != scratch_storage.untyped_storage().data_ptr()
+        ):
+            raise RuntimeError(
+                "DCP corrected input is not backed by the MLA scratch workspace"
+            )
+        output_numel = 16 * num_tokens * 256
+        output_head_major = q_workspace.view(-1)[:output_numel].view(
+            16, num_tokens, 256
+        )
+        output = output_head_major.transpose(0, 1)
+        if not output_head_major.is_contiguous():
+            raise RuntimeError("DCP reduce-scatter output is not contiguous")
+        return output
 
     def _sync_warmup(self) -> None:
         if self.device.type == "cuda":
@@ -812,26 +1036,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # the kernel reads q while writing the scratch (tmp_output/output), and the
         # manager packs every call from offset 0, so separate calls would alias q
         # with the scratch and corrupt the result.
-        manager = current_workspace_manager()
-        workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
-            (
-                (self._max_batched, self._kernel_num_heads, self.q_head_dim),
-                torch.bfloat16,
-            )
-        ]
-        if self._pad_heads:
-            workspace_specs.append(
-                (
-                    (
-                        self._max_batched,
-                        self._input_num_heads,
-                        self.kv_lora_rank,
-                    ),
-                    torch.bfloat16,
-                )
-            )
-        workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
-        workspace_tensors = manager.get_simultaneous(*workspace_specs)
+        workspace_tensors = self._borrow_workspaces()
         q_workspace = workspace_tensors[0]
         dense_out_workspace = workspace_tensors[1] if self._pad_heads else None
         scratch_storage = workspace_tensors[-1]
@@ -848,9 +1053,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             q_all = q_buffer[:, :num_input_heads]
             ops.concat_mla_q(ql_nope, q_pe, q_all)
         else:
-            q_input = q.contiguous()
-            num_actual_toks = q_input.shape[0]
-            num_input_heads = q_input.shape[1]
+            num_actual_toks = q.shape[0]
+            num_input_heads = q.shape[1]
             if num_input_heads != self._input_num_heads:
                 raise ValueError(
                     "B12X_MLA_SPARSE query heads do not match the planned "
@@ -858,7 +1062,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 )
             q_buffer = q_workspace[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
-            q_all.copy_(q_input)
+            exact_workspace_alias = (
+                tuple(q.shape) == tuple(q_all.shape)
+                and tuple(q.stride()) == tuple(q_all.stride())
+                and q.dtype == q_all.dtype
+                and q.device == q_all.device
+                and q.untyped_storage().data_ptr() == q_all.untyped_storage().data_ptr()
+                and q.storage_offset() == q_all.storage_offset()
+            )
+            if not exact_workspace_alias:
+                q_all.copy_(q.contiguous())
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
