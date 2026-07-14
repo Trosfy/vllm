@@ -415,6 +415,34 @@ def test_b12x_query_gather_dispatch_bypasses_group(monkeypatch: pytest.MonkeyPat
     }
 
 
+def test_b12x_pool_init_consensus_uses_exchange_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    device_group = object()
+    cpu_group = object()
+    group = _FakeCPGroup(4, device_group, cpu_group)  # type: ignore[arg-type]
+    device = torch.device("cuda:0")
+    captured: dict[str, Any] = {}
+    original_tensor = torch.tensor
+
+    def fake_tensor(data, *, dtype, device):
+        captured["tensor_device"] = device
+        return original_tensor(data, dtype=dtype)
+
+    def fake_all_reduce(tensor, *, op, group):
+        captured.update(tensor=tensor, op=op, group=group)
+
+    monkeypatch.setattr(dcp_alltoall.torch, "tensor", fake_tensor)
+    monkeypatch.setattr(dcp_alltoall.dist, "all_reduce", fake_all_reduce)
+
+    assert not dcp_alltoall._b12x_dcp_init_failed(group, device, None)
+    assert captured["tensor_device"] == device
+    assert captured["group"] is device_group
+    assert captured["op"] == dist.ReduceOp.MAX
+
+
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
