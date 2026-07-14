@@ -297,17 +297,18 @@ def _can_use_b12x_dcp_prefill_workspace(
     project_before_merge: bool,
     dcp_use_b12x: bool,
     num_tokens: int,
+    max_num_tokens: int,
     non_dbo_workspace: bool,
     is_sparse_impl: bool,
     backend_name: str,
     is_capturing: bool,
 ) -> bool:
-    """Gate the exact B12X TP4/DCP4 eager-prefill workspace contract."""
+    """Gate the B12X eager-prefill workspace contract."""
     return (
         enabled
         and project_before_merge
         and not dcp_use_b12x
-        and 1025 <= num_tokens <= 3072
+        and 1025 <= num_tokens <= max_num_tokens
         and non_dbo_workspace
         and is_sparse_impl
         and backend_name == "B12X_MLA_SPARSE"
@@ -952,6 +953,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     project_before_merge=project_before_merge,
                     dcp_use_b12x=dcp_use_b12x,
                     num_tokens=num_mqa_tokens,
+                    max_num_tokens=getattr(self.impl, "_max_batched", 0),
                     non_dbo_workspace=getattr(
                         self.impl, "dcp_workspace_non_dbo", False
                     ),
@@ -990,7 +992,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_q = workspace_gather(mqa_q)
                     workspace_gather_used = True
                     logger.info_once(
-                        "Using borrowed B12X workspaces for TP4/DCP4 sparse MLA prefill"
+                        "Using borrowed B12X workspaces for sparse MLA DCP prefill"
                     )
                 else:
                     mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)

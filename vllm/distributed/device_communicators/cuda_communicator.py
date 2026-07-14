@@ -383,16 +383,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         output: torch.Tensor,
         dim: int = -1,
     ) -> torch.Tensor:
-        """Run the validated eager DCP4 reduce-scatter without allocating."""
-        if self.world_size != 4 or dim != 1:
-            raise RuntimeError("reduce_scatter_into is restricted to DCP4 heads")
+        """Run eager DCP reduce-scatter without allocating."""
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError("reduce_scatter_into requires DCP heads on dim 1")
         if input_.ndim != 3 or output.ndim != 3:
             raise ValueError("reduce_scatter_into requires rank-3 tensors")
         num_tokens = int(input_.shape[0])
-        expected_input = (num_tokens, 64, 256)
-        expected_output = (num_tokens, 16, 256)
+        input_heads = int(input_.shape[1])
+        if input_heads % self.world_size != 0:
+            raise ValueError("reduce_scatter_into head count is not DCP-divisible")
+        output_heads = input_heads // self.world_size
+        expected_input = (num_tokens, input_heads, 256)
+        expected_output = (num_tokens, output_heads, 256)
         if (
-            not 1025 <= num_tokens <= 3072
+            num_tokens < 1025
             or tuple(input_.shape) != expected_input
             or tuple(output.shape) != expected_output
             or input_.dtype != torch.bfloat16
@@ -401,8 +405,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             or input_.device != self.device
         ):
             raise ValueError(
-                "reduce_scatter_into requires BF16 [T,64,256] -> "
-                "[T,16,256] on the communicator device"
+                "reduce_scatter_into requires DCP-divisible BF16 "
+                "[T,H,256] -> [T,H/DCP,256] on the communicator device"
             )
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("reduce_scatter_into is eager-only")

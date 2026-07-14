@@ -721,12 +721,18 @@ class GroupCoordinator:
         dim: int = -1,
     ) -> torch.Tensor:
         """Run eager reduce-scatter into caller-provided CUDA storage."""
-        if self.world_size != 4 or dim != 1:
-            raise RuntimeError("reduce_scatter_into is restricted to DCP4 heads")
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError("reduce_scatter_into requires DCP heads on dim 1")
         if input_.ndim != 3 or output.ndim != 3:
             raise ValueError("reduce_scatter_into requires rank-3 tensors")
         if input_.device != output.device or input_.device.type != "cuda":
             raise ValueError("reduce_scatter_into requires one CUDA device")
+        if (
+            input_.shape[0] != output.shape[0]
+            or input_.shape[1] != self.world_size * output.shape[1]
+            or input_.shape[2:] != output.shape[2:]
+        ):
+            raise ValueError("reduce_scatter_into shape mismatch")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("reduce_scatter_into is eager-only")
         if self.device_communicator is None:
