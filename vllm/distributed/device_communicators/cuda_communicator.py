@@ -384,6 +384,60 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
+    def reduce_scatter_into(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Run the validated eager DCP4 reduce-scatter without allocating."""
+        if self.world_size != 4 or dim != 1:
+            raise RuntimeError("reduce_scatter_into is restricted to DCP4 heads")
+        if input_.ndim != 3 or output.ndim != 3:
+            raise ValueError("reduce_scatter_into requires rank-3 tensors")
+        num_tokens = int(input_.shape[0])
+        expected_input = (num_tokens, 64, 256)
+        expected_output = (num_tokens, 16, 256)
+        if (
+            not 1025 <= num_tokens <= 3072
+            or tuple(input_.shape) != expected_input
+            or tuple(output.shape) != expected_output
+            or input_.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or input_.device != output.device
+            or input_.device != self.device
+        ):
+            raise ValueError(
+                "reduce_scatter_into requires BF16 [T,64,256] -> "
+                "[T,16,256] on the communicator device"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("reduce_scatter_into is eager-only")
+
+        input_tensor = input_.movedim(0, dim)
+        output_tensor = output.movedim(0, dim)
+        if not input_tensor.is_contiguous() or not output_tensor.is_contiguous():
+            raise ValueError("reduce_scatter_into requires head-major storage")
+        if input_tensor.numel() != self.world_size * output_tensor.numel():
+            raise ValueError("reduce_scatter_into element-count mismatch")
+
+        input_begin = input_tensor.data_ptr()
+        input_end = input_begin + input_tensor.numel() * input_tensor.element_size()
+        output_begin = output_tensor.data_ptr()
+        output_end = output_begin + output_tensor.numel() * output_tensor.element_size()
+        if input_begin < output_end and output_begin < input_end:
+            raise ValueError("reduce_scatter_into input and output overlap")
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            raise RuntimeError("reduce_scatter_into requires PyNccl")
+        pynccl_comm.reduce_scatter(
+            output_tensor,
+            input_tensor,
+            stream=torch.cuda.current_stream(self.device),
+        )
+        return output
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):

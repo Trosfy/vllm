@@ -269,7 +269,10 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.common import (
+    cp_lse_ag_out_rs,
+    cp_lse_ag_out_rs_into,
+)
 from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_a2a_lse_reduce,
     dcp_b12x_all_gather_heads,
@@ -286,6 +289,30 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _can_use_b12x_dcp_prefill_workspace(
+    *,
+    enabled: bool,
+    project_before_merge: bool,
+    dcp_use_b12x: bool,
+    num_tokens: int,
+    non_dbo_workspace: bool,
+    is_sparse_impl: bool,
+    backend_name: str,
+    is_capturing: bool,
+) -> bool:
+    """Gate the exact B12X TP4/DCP4 eager-prefill workspace contract."""
+    return (
+        enabled
+        and project_before_merge
+        and not dcp_use_b12x
+        and 1025 <= num_tokens <= 3072
+        and non_dbo_workspace
+        and is_sparse_impl
+        and backend_name == "B12X_MLA_SPARSE"
+        and not is_capturing
+    )
 
 
 def _match_merge_strides(
@@ -797,32 +824,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
         ondemand_w_uv_capable = (
-            self.dcp_project_before_merge
+            getattr(self, "dcp_project_before_merge", False)
             and self.impl.dcp_world_size > 1
             and is_sparse_impl
             and getattr(self.impl, "supports_dcp_project_before_merge", False)
             and hasattr(self, "W_UV")
             and self.W_UV.dtype == torch.bfloat16
-            and self.W_UV.is_contiguous()
         )
-        num_prefill_tokens = (
-            getattr(attn_metadata, "num_prefill_tokens", None)
-            if ondemand_w_uv_capable
-            else None
+        project_before_merge_min_tokens = getattr(
+            self,
+            "dcp_project_before_merge_min_prefill_tokens",
+            1024,
         )
-        if num_prefill_tokens is None:
-            if ondemand_w_uv_capable:
-                raise RuntimeError(
-                    f"{type(self.impl).__name__} enables DCP "
-                    "project-before-merge without num_prefill_tokens metadata."
-                )
-            num_prefill_tokens = 0
         use_ondemand_w_uv = (
             ondemand_w_uv_capable
             and attn_metadata.max_query_len > 1
-            and num_prefill_tokens > self.dcp_project_before_merge_min_prefill_tokens
+            and num_mqa_tokens > project_before_merge_min_tokens
         )
-
         mha_use_quant_output = (
             quant_key is not None
             and self.prefill_backend.supports_quant_output(quant_key)
@@ -916,10 +934,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             dcp_use_a2a = False
             project_before_merge = False
+            workspace_gather_used = False
             if self.impl.dcp_world_size > 1:
-                if isinstance(mqa_q, tuple):
-                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                    mqa_q = torch.cat(mqa_q, dim=-1)
                 # Hybrid dispatch on the per-step token count. This is
                 # CUDA-graph safe: under capture the branch sees the padded
                 # capture size, so every graph bakes in one path, and eager
@@ -936,6 +952,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # The project-before path currently targets eager AG/RS
                 # prefill. A2A retains its established merge-then-project path.
                 project_before_merge = use_ondemand_w_uv and not dcp_use_a2a
+                workspace_gather_eligible = _can_use_b12x_dcp_prefill_workspace(
+                    enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
+                    project_before_merge=project_before_merge,
+                    dcp_use_b12x=dcp_use_b12x,
+                    num_tokens=num_mqa_tokens,
+                    non_dbo_workspace=getattr(
+                        self.impl, "dcp_workspace_non_dbo", False
+                    ),
+                    is_sparse_impl=is_sparse_impl,
+                    backend_name=self.attn_backend.get_name(),
+                    is_capturing=torch.cuda.is_current_stream_capturing(),
+                )
+                if isinstance(mqa_q, tuple) and not workspace_gather_eligible:
+                    # Ordinary communicators require one contiguous query.
+                    mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
                 if dcp_use_b12x:
                     mqa_q = dcp_b12x_all_gather_heads(
@@ -947,6 +978,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             if project_before_merge
                             else self.kv_lora_rank
                         ),
+                    )
+                elif workspace_gather_eligible:
+                    workspace_gather = getattr(
+                        self.impl, "dcp_all_gather_query_in_workspace", None
+                    )
+                    if not getattr(
+                        self.impl,
+                        "supports_dcp_gather_query_in_workspace",
+                        False,
+                    ) or not callable(workspace_gather):
+                        raise RuntimeError(
+                            f"{type(self.impl).__name__} does not support the "
+                            "enabled workspace DCP query gather"
+                        )
+                    mqa_q = workspace_gather(mqa_q)
+                    workspace_gather_used = True
+                    logger.info_once(
+                        "Using borrowed B12X workspaces for TP4/DCP4 sparse MLA prefill"
                     )
                 else:
                     mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
@@ -985,7 +1034,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         raise RuntimeError(
                             "Projected DCP valid counts must be contiguous."
                         )
-                    local_w_uv = self.W_UV
+                    local_w_uv = self.W_UV.contiguous()
                     w_uv_dcp = get_dcp_group().all_gather(local_w_uv, dim=0)
                     expected_shape = (
                         self.num_heads * get_dcp_group().world_size,
@@ -1005,11 +1054,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             f"{tuple(w_uv_dcp.shape)} on "
                             f"{w_uv_dcp.device}/{w_uv_dcp.dtype}."
                         )
-                    projected = attn_out.new_empty(
-                        attn_out.shape[0], attn_out.shape[1], self.v_head_dim
-                    )
-                    self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
-                    attn_out = projected
+                    if workspace_gather_used:
+                        workspace_project = getattr(
+                            self.impl,
+                            "dcp_project_before_merge_in_workspace",
+                            None,
+                        )
+                        if not getattr(
+                            self.impl,
+                            "supports_dcp_project_before_merge_in_workspace",
+                            False,
+                        ) or not callable(workspace_project):
+                            raise RuntimeError(
+                                f"{type(self.impl).__name__} does not support "
+                                "workspace DCP projection"
+                            )
+                        attn_out = workspace_project(attn_out, lse, w_uv_dcp)
+                    else:
+                        projected = attn_out.new_empty(
+                            attn_out.shape[0], attn_out.shape[1], self.v_head_dim
+                        )
+                        self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
+                        attn_out = projected
                 if dcp_use_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
@@ -1023,15 +1089,61 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 else:
                     if project_before_merge:
                         sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
-                    attn_out = cp_lse_ag_out_rs(
-                        attn_out,
-                        lse,
-                        get_dcp_group(),
-                        is_lse_base_on_e=self.impl.lse_base_on_e,
-                    )
+                    if workspace_gather_used:
+                        workspace_output = getattr(
+                            self.impl,
+                            "dcp_reduce_scatter_output_in_workspace",
+                            None,
+                        )
+                        if not getattr(
+                            self.impl,
+                            "supports_dcp_reduce_scatter_output_in_workspace",
+                            False,
+                        ) or not callable(workspace_output):
+                            raise RuntimeError(
+                                f"{type(self.impl).__name__} does not support "
+                                "workspace DCP reduce-scatter output"
+                            )
+                        attn_out = cp_lse_ag_out_rs_into(
+                            attn_out,
+                            lse,
+                            get_dcp_group(),
+                            output_provider=workspace_output,
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                        )
+                    else:
+                        attn_out = cp_lse_ag_out_rs(
+                            attn_out,
+                            lse,
+                            get_dcp_group(),
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                        )
 
             if project_before_merge:
-                mqa_output_slice.copy_(attn_out.reshape(mqa_output_slice.shape))
+                if workspace_gather_used:
+                    expected_shape = (
+                        num_mqa_tokens,
+                        self.num_heads,
+                        self.v_head_dim,
+                    )
+                    expected_stride = (
+                        self.v_head_dim,
+                        num_mqa_tokens * self.v_head_dim,
+                        1,
+                    )
+                    if (
+                        tuple(attn_out.shape) != expected_shape
+                        or tuple(attn_out.stride()) != expected_stride
+                        or not attn_out.movedim(0, 1).is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "Workspace DCP reduce-scatter returned an invalid "
+                            f"layout: shape={tuple(attn_out.shape)}, "
+                            f"stride={tuple(attn_out.stride())}"
+                        )
+                    mqa_output_slice.view(expected_shape).copy_(attn_out)
+                else:
+                    mqa_output_slice.copy_(attn_out.reshape(mqa_output_slice.shape))
             else:
                 self._v_up_proj(attn_out, out=mqa_output_slice)
 
