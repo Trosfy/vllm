@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_MOE: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_USE_B12X_DCP_A2A: bool = False
+    VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
+    VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
@@ -1074,6 +1076,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use b12x PCIe collectives for DCP query gather and output reduction.
     "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    # Project rank-local sparse MLA partials before their DCP merge. This is
+    # opt-in until the guarded TP4 path has been benchmarked against baseline.
+    "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE", "0"))
+    ),
+    # Strict lower bound on actual prefill/extend rows. Keep it above every
+    # CUDA graph capture size so the weight gather remains eager-only.
+    "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", "1024")
+    ),
     # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
     # with more tokens than this bypass the one-shot A2A/B12X path, which is
     # latency-optimal for small decode batches but loses to pipelined NCCL
