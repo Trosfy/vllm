@@ -557,7 +557,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and envs.VLLM_DCP_PROJECT_BEFORE_MERGE
             and getattr(self.impl, "supports_dcp_project_before_merge", False)
         )
-        self.W_UV_dcp: torch.Tensor | None = None
         self.dcp_project_before_merge_min_prefill_tokens = (
             envs.VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS
         )
@@ -792,32 +791,29 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        persistent_w_uv_capable = (
+        ondemand_w_uv_capable = (
             self.dcp_project_before_merge
             and self.impl.dcp_world_size > 1
             and is_sparse_impl
             and getattr(self.impl, "supports_dcp_project_before_merge", False)
-            and self.W_UV_dcp is not None
-            and self.W_UV_dcp.dtype == torch.bfloat16
-            and self.W_UV_dcp.is_contiguous()
+            and hasattr(self, "W_UV")
             and self.W_UV.dtype == torch.bfloat16
             and self.W_UV.is_contiguous()
-            and self.W_UV.device == self.W_UV_dcp.device
         )
         num_prefill_tokens = (
             getattr(attn_metadata, "num_prefill_tokens", None)
-            if persistent_w_uv_capable
+            if ondemand_w_uv_capable
             else None
         )
         if num_prefill_tokens is None:
-            if persistent_w_uv_capable:
+            if ondemand_w_uv_capable:
                 raise RuntimeError(
                     f"{type(self.impl).__name__} enables DCP "
                     "project-before-merge without num_prefill_tokens metadata."
                 )
             num_prefill_tokens = 0
-        use_persistent_w_uv = (
-            persistent_w_uv_capable
+        use_ondemand_w_uv = (
+            ondemand_w_uv_capable
             and attn_metadata.max_query_len > 1
             and num_prefill_tokens > self.dcp_project_before_merge_min_prefill_tokens
         )
@@ -934,7 +930,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
                 # The project-before path currently targets eager AG/RS
                 # prefill. A2A retains its established merge-then-project path.
-                project_before_merge = use_persistent_w_uv and not dcp_use_a2a
+                project_before_merge = use_ondemand_w_uv and not dcp_use_a2a
                 # mqa_q do allgather in head dim.
                 if dcp_use_b12x:
                     mqa_q = dcp_b12x_all_gather_heads(
@@ -984,15 +980,30 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         raise RuntimeError(
                             "Projected DCP valid counts must be contiguous."
                         )
-                    w_uv_dcp = self.W_UV_dcp
-                    if w_uv_dcp is None:
+                    local_w_uv = self.W_UV
+                    w_uv_dcp = get_dcp_group().all_gather(local_w_uv, dim=0)
+                    expected_shape = (
+                        self.num_heads * get_dcp_group().world_size,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                    )
+                    if (
+                        w_uv_dcp.shape != expected_shape
+                        or w_uv_dcp.dtype != local_w_uv.dtype
+                        or w_uv_dcp.device != local_w_uv.device
+                        or not w_uv_dcp.is_contiguous()
+                    ):
                         raise RuntimeError(
-                            "Persistent DCP W_UV is unavailable for projection."
+                            "Invalid rank-major DCP W_UV gather: expected "
+                            f"contiguous {expected_shape} on "
+                            f"{local_w_uv.device}/{local_w_uv.dtype}, got "
+                            f"{tuple(w_uv_dcp.shape)} on "
+                            f"{w_uv_dcp.device}/{w_uv_dcp.dtype}."
                         )
                     projected = attn_out.new_empty(
                         attn_out.shape[0], attn_out.shape[1], self.v_head_dim
                     )
-                    self._v_up_proj_bmm(attn_out, projected, w_uv_dcp)
+                    self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
                     attn_out = projected
                 if dcp_use_a2a:
                     attn_out = dcp_a2a_lse_reduce(
@@ -1148,37 +1159,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
-            if self.dcp_project_before_merge and self.W_UV.dtype == torch.bfloat16:
-                dcp_group = get_dcp_group()
-                local_w_uv = self.W_UV.contiguous()
-                expected_shape = (
-                    dcp_group.world_size * self.num_heads,
-                    self.kv_lora_rank,
-                    self.v_head_dim,
-                )
-                w_uv_dcp = dcp_group.all_gather(local_w_uv, dim=0)
-                if (
-                    w_uv_dcp.shape != expected_shape
-                    or w_uv_dcp.dtype != torch.bfloat16
-                    or w_uv_dcp.device != local_w_uv.device
-                    or not w_uv_dcp.is_contiguous()
-                ):
-                    raise RuntimeError(
-                        "Invalid persistent rank-major DCP W_UV gather: expected "
-                        f"contiguous {expected_shape} on {local_w_uv.device}, got "
-                        f"{tuple(w_uv_dcp.shape)} on {w_uv_dcp.device}/"
-                        f"{w_uv_dcp.dtype}."
-                    )
-                rank_start = dcp_group.rank_in_group * self.num_heads
-                gathered_local_w_uv = w_uv_dcp.narrow(0, rank_start, self.num_heads)
-                if not torch.equal(
-                    gathered_local_w_uv.view(torch.int16),
-                    local_w_uv.view(torch.int16),
-                ):
-                    raise RuntimeError("Persistent DCP W_UV gather is not rank-major.")
-                self.W_UV_dcp = w_uv_dcp
-                self.W_UV = gathered_local_w_uv
-
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
         # for more details.
@@ -1297,6 +1277,35 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         torch.bmm(x_head_major, w_uv, out=projected_head_major)
         out.copy_(projected_head_major.transpose(0, 1))
+
+    def _v_up_proj_bmm_chunked(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Bound temporary BF16 DCP projection storage to 144 MiB."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError(
+                "DCP projection expects rank-three tensors: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        num_tokens, num_heads, latent_dim = x.shape
+        if latent_dim != self.kv_lora_rank or w_uv.shape[0] != num_heads:
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, w_uv={tuple(w_uv.shape)}."
+            )
+
+        temp_budget_bytes = 144 * 1024 * 1024
+        temp_bytes_per_token = (
+            num_heads * (self.kv_lora_rank + self.v_head_dim) * x.element_size()
+        )
+        max_chunk_tokens = max(1, temp_budget_bytes // temp_bytes_per_token)
+        for start in range(0, num_tokens, max_chunk_tokens):
+            end = min(start + max_chunk_tokens, num_tokens)
+            self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
 
 
 def unified_mla_kv_cache_update(
