@@ -145,6 +145,18 @@ def test_resolve_allows_mxfp4_dense_linear_mxfp8_overlay():
     assert args == QuantizationConfigArgs(linear={"weight": "mxfp8"})
 
 
+def test_resolve_allows_nvfp4_nf3_hybrid_dense_linear_mxfp8_overlay():
+    args = resolve_quantization_config(
+        "nvfp4_nf3_hybrid",
+        {
+            "linear": {"weight": "mxfp8"},
+            "ignore": ["re:.*kv_b_proj"],
+        },
+    )
+    assert args.linear == QuantSpec(weight=kMxfp8Dynamic)
+    assert args.ignore == ["re:.*kv_b_proj"]
+
+
 def test_resolve_allows_mxfp4_dense_linear_fp8_overlay():
     args = resolve_quantization_config(
         "mxfp4",

@@ -68,7 +68,9 @@ logger = init_logger(__name__)
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
 _HEAD_ALIGNMENT = 8
-_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
+_EXTEND_PREWARM_DONE: set[
+    tuple[int | None, int, int, int, int, int, bool, str, int | None]
+] = set()
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -572,9 +574,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # 432 B/token FP4 latent record in the unified SM120 decode/extend
         # kernels; None keeps the dtype-inferred format (ARBITRARY_FP32 for
         # the 656 B fp8_ds_mla record).
-        self._b12x_scale_format = (
-            2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
-        )
+        self._b12x_scale_format = 2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
         # Forwarded into every plan/decode/extend b12x
         # call ONLY for the FP4 record, so fp8_ds_mla serving keeps the stock
         # b12x call signature (works on a b12x tree without the nvfp4-ds-mla
@@ -734,6 +734,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     def _prewarm_extend_kernels_once(self, max_batched: int) -> None:
         if self.device.type != "cuda":
             return
+        record_bytes = 432 if self.kv_cache_dtype == "nvfp4_ds_mla" else 656
         key = (
             self.device.index,
             self.q_head_dim,
@@ -742,6 +743,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             int(self.topk_tokens),
             int(self.block_size),
             bool(self.need_to_return_lse_for_decode),
+            self.kv_cache_dtype,
+            self._b12x_scale_format,
         )
         if key in _EXTEND_PREWARM_DONE:
             return
@@ -762,7 +765,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # to reach here; verifier-only and eager-snap both skipped it).
         # One page is enough: prewarm top-k indices all point at slot zero.
         # Record width follows the cache dtype.
-        record_bytes = 432 if self.kv_cache_dtype == "nvfp4_ds_mla" else 656
         kv_cache = torch.zeros(
             (1, self.block_size, record_bytes),
             dtype=torch.uint8,
