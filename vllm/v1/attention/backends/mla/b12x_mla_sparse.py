@@ -25,6 +25,7 @@ drop-in with no kernel-signature change. q-concat and the scratch are borrowed i
 ONE ``get_simultaneous`` call so they never alias.
 """
 
+import inspect
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -692,11 +693,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         self.block_size = 64
-        # NVFP4 MLA record selection: ScaleFormat.NVFP4_E4M3 (2) rides the b12x
-        # scratch plan AND every decode/extend call so the CuTeDSL kernels
-        # specialize on the packed E2M1+E4M3 record instead of the 656 B
-        # fp8_ds_mla record. KV_FP8_ROPE only changes its RoPE tail; the latent
-        # format and outer-scale correction are deliberately untouched.
+        # NVFP4 MLA record selection: ScaleFormat.NVFP4_E4M3 (2) rides every
+        # decode/extend call so the CuTeDSL kernels specialize on the packed
+        # E2M1+E4M3 record instead of the 656 B fp8_ds_mla record. KV_FP8_ROPE
+        # only changes its RoPE tail; the latent format and outer-scale
+        # correction are deliberately untouched.
         self._b12x_scale_format = 2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
         self._kv_record_bytes = (
             (368 if self._kv_fp8_rope else 432)
@@ -762,6 +763,23 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self._sparse_mla_decode_forward = sparse_mla_decode_forward
         self._sparse_mla_extend_forward = sparse_mla_extend_forward
 
+        if self._b12x_scale_format is not None:
+            required_kwargs = {"latent_scale", "scale_format"}
+            unsupported_forwards = [
+                mode
+                for mode, forward in (
+                    ("decode", sparse_mla_decode_forward),
+                    ("extend", sparse_mla_extend_forward),
+                )
+                if not required_kwargs.issubset(inspect.signature(forward).parameters)
+            ]
+            if unsupported_forwards:
+                raise RuntimeError(
+                    "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla' "
+                    "requires a b12x build with NVFP4 sparse-MLA API support; "
+                    "unsupported forwards: " + ", ".join(unsupported_forwards)
+                )
+
         # Eager PLAN -> BIND -> KERNEL (no b12x workspace/arena, ever). We build a
         # caller-owned-scratch PLAN once per mode; each forward maps a vLLM
         # workspace-manager scratch tensor into a plain B12XSparseMLAScratch views
@@ -771,6 +789,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # graph and the merge specializes on that count, so no device-side control
         # scalar initialization is needed. final_lse is pre-materialized as a view
         # so the legacy lazy torch.empty(final_lse) never fires during capture.
+        scratch_format_kwargs: dict[str, Any] = (
+            {"kv_cache_dtype": self.kv_cache_dtype}
+            if self._b12x_scale_format is not None
+            else {}
+        )
+
         def _make_plan(
             mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
         ) -> Any:
@@ -788,8 +812,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     max_batch=int(max_batch),
                     max_chunks_per_row=self._num_splits_cap,
                     page_size=self.block_size,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale_format=self._b12x_scale_format,
+                    **scratch_format_kwargs,
                 )
             )
 
@@ -1181,6 +1204,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             if self.device.type == "cuda":
                 torch.accelerator.synchronize(self.device)
 
+    def _b12x_kernel_format_kwargs(self, latent_scale: float = 1.0) -> dict[str, Any]:
+        if self._b12x_scale_format is None:
+            return {}
+        return {
+            "latent_scale": float(latent_scale),
+            "scale_format": self._b12x_scale_format,
+        }
+
     def _prewarm_extend_kernels_once(self, max_batched: int) -> None:
         if self.device.type != "cuda":
             return
@@ -1198,6 +1229,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if key in _EXTEND_PREWARM_DONE:
             return
         _EXTEND_PREWARM_DONE.add(key)
+        kernel_format_kwargs = self._b12x_kernel_format_kwargs()
 
         rows_to_warm = (1, 2, 4, max(1, int(max_batched)))
         seen_rows: set[int] = set()
@@ -1253,7 +1285,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     v_head_dim=self.kv_lora_rank,
                     return_lse=True,
                     lse_scale="natural",
-                    scale_format=self._b12x_scale_format,
+                    **kernel_format_kwargs,
                 )
             else:
                 self._sparse_mla_extend_forward(
@@ -1261,7 +1293,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache=kv_cache,
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
-                    scale_format=self._b12x_scale_format,
+                    **kernel_format_kwargs,
                 )
             self._sync_warmup()
 
@@ -1276,6 +1308,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # reading device state or allocating per-call CUDA state; the CuTe
         # launch receives this as a runtime scalar.
         latent_scale = float(getattr(layer, "_nvfp4_mla_outer_scale", 1.0))
+        kernel_format_kwargs = self._b12x_kernel_format_kwargs(latent_scale)
         # q arrives as (mqa_ql_nope[T, H, kv_lora_rank], mqa_q_pe[T, H, rope]);
         # b12x's GLM_NSA contract wants a single contiguous [T, H, 576] tensor.
         # Co-allocate the q-concat buffer and the per-call attention scratch in ONE
@@ -1469,12 +1502,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         binding=binding,
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
-                        latent_scale=latent_scale,
                         v_head_dim=self.kv_lora_rank,
                         forced_num_splits=self._num_splits_cap,
                         return_lse=True,
                         lse_scale="natural",
-                        scale_format=self._b12x_scale_format,
+                        **kernel_format_kwargs,
                     ),
                 )
                 if self._pad_heads:
@@ -1490,10 +1522,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     binding=binding,
                     kv_cache=kv_cache,
                     sm_scale=self.scale,
-                    latent_scale=latent_scale,
                     v_head_dim=self.kv_lora_rank,
                     forced_num_splits=self._num_splits_cap,
-                    scale_format=self._b12x_scale_format,
+                    **kernel_format_kwargs,
                 ),
             )
             if self._pad_heads:
@@ -1529,11 +1560,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         binding=binding,
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
-                        latent_scale=latent_scale,
                         v_head_dim=self.kv_lora_rank,
                         return_lse=True,
                         lse_scale="natural",
-                        scale_format=self._b12x_scale_format,
+                        **kernel_format_kwargs,
                     ),
                 )
             else:
@@ -1543,9 +1573,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         binding=binding,
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
-                        latent_scale=latent_scale,
                         v_head_dim=self.kv_lora_rank,
-                        scale_format=self._b12x_scale_format,
+                        **kernel_format_kwargs,
                     ),
                 )
             if self._pad_heads:
