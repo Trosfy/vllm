@@ -396,21 +396,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Get compress_ratio for DeepseekV4 support
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
-        if self.dcp_world_size > 1 and self.compress_ratio > 1:
-            raise NotImplementedError(
-                "DCP is not supported with sparse indexer KV compression "
-                f"(compress_ratio={self.compress_ratio})."
-            )
 
-        # Pre-allocate buffers for CUDA graph compatibility when
-        if self.compress_ratio > 1:
-            # compress_ratio > 1 (DeepseekV4)
-            # Compressed slot mapping output buffer
+        # DCP writes the indexer cache through rank-local pages. DeepSeek V4
+        # additionally maps only the tokens retained by KV compression.
+        if self.compress_ratio > 1 or self.dcp_world_size > 1:
             self.compressed_slot_mapping_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
                 dtype=torch.int64,
                 device=self.device,
             )
+
+        # Pre-allocate buffers for CUDA graph compatibility when
+        if self.compress_ratio > 1:
+            # compress_ratio > 1 (DeepseekV4)
             # Buffer for compressed seq_lens in decode path
             self.expanded_seq_lens_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
@@ -682,6 +680,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        use_dcp_local_kv = self.dcp_world_size > 1 and dcp_local_seq_lens is not None
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -696,7 +695,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
-        if self.compress_ratio > 1:
+        if self.compress_ratio > 1 or use_dcp_local_kv:
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
                 query_start_loc,
@@ -705,6 +704,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.kv_cache_spec.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                dcp_world_size=self.dcp_world_size if use_dcp_local_kv else 1,
+                dcp_rank=self.dcp_rank if use_dcp_local_kv else 0,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
@@ -838,10 +840,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 not use_native and max_decode_len > 1
             )
 
-            # DCP: localize the now-expanded per-token global bounds to this
-            # rank's owned KV. Done here (after expansion) so each token's global
-            # causal length is localized individually; see the comment above.
-            if dcp_local_seq_lens is not None:
+            # Uncompressed DCP localizes after per-token expansion. Compressed
+            # DCP must first convert global logical lengths to compressed-token
+            # lengths and only then shard those retained tokens across ranks.
+            if dcp_local_seq_lens is not None and self.compress_ratio == 1:
                 seq_lens = self._dcp_localize_decode_seq_lens(
                     seq_lens, num_decodes, seq_lens_is_buffer_view
                 )
@@ -851,10 +853,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if self.compress_ratio > 1:
                 if seq_lens_is_buffer_view:
                     seq_lens //= self.compress_ratio
+                    if dcp_local_seq_lens is not None:
+                        seq_lens.copy_(
+                            get_dcp_local_seq_lens(
+                                seq_lens,
+                                self.dcp_world_size,
+                                self.dcp_rank,
+                                self.cp_kv_cache_interleave_size,
+                            )
+                        )
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
+                    compressed_decode_seq_lens = seq_lens // self.compress_ratio
+                    if dcp_local_seq_lens is not None:
+                        compressed_decode_seq_lens = get_dcp_local_seq_lens(
+                            compressed_decode_seq_lens,
+                            self.dcp_world_size,
+                            self.dcp_rank,
+                            self.cp_kv_cache_interleave_size,
+                        )
                     self.expanded_seq_lens_buffer[:num_decodes] = (
-                        seq_lens // self.compress_ratio
+                        compressed_decode_seq_lens
                     )
                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
@@ -877,9 +896,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # captured kernel reads.
                 active_width_tokens = int(common_attn_metadata.max_seq_len)
                 if self.compress_ratio > 1:
-                    active_width_tokens = -(
-                        -active_width_tokens // self.compress_ratio
-                    )
+                    active_width_tokens = -(-active_width_tokens // self.compress_ratio)
                 self.b12x_active_width_buffer.fill_(active_width_tokens)
                 active_width = self.b12x_active_width_buffer
                 if self.compress_ratio > 1:
@@ -900,8 +917,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         (
                             common_attn_metadata.dcp_local_seq_lens_cpu[:num_decodes]
                             if dcp_local_seq_lens is not None
-                            and common_attn_metadata.dcp_local_seq_lens_cpu
-                            is not None
+                            and common_attn_metadata.dcp_local_seq_lens_cpu is not None
                             else None
                         ),
                     )

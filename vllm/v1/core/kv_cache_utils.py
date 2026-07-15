@@ -1589,18 +1589,23 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int, bool], dict[str, KVCacheSpec]] = (
+    grouped_swa_mla_specs: dict[tuple[int, int, bool, bool], dict[str, KVCacheSpec]] = (
         defaultdict(dict)
     )
     # dcp_replicated non-MLA groups (e.g. the DFlash draft), keyed by block_size.
     grouped_repl_specs: dict[tuple[int], dict[str, KVCacheSpec]] = defaultdict(dict)
     # NOTE: Here we group SWA layers by (block_size, sliding_window,
-    # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
-    # layers into different groups.
+    # dcp_replicated, dcp_sharded), which separates SWA layers, C4I+C4A
+    # layers, C128A layers, and replicated compressor-state groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[
-                (spec.block_size, spec.sliding_window, spec.dcp_sharded)
+                (
+                    spec.block_size,
+                    spec.sliding_window,
+                    spec.dcp_replicated,
+                    spec.dcp_sharded,
+                )
             ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
