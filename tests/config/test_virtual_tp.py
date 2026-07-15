@@ -45,6 +45,7 @@ class FakeModelConfig:
 
 class FakeGlmDsaModelConfig:
     def __init__(self):
+        self.verified_attention_heads = None
         self.hf_text_config = SimpleNamespace(
             model_type="glm_moe_dsa",
             architectures=["GlmMoeDsaForCausalLM"],
@@ -66,6 +67,10 @@ class FakeGlmDsaModelConfig:
         return SimpleNamespace(
             total_num_attention_heads=self.hf_text_config.num_attention_heads,
         )
+
+    def verify_with_parallel_config(self, parallel_config):
+        self.verified_attention_heads = self.hf_text_config.num_attention_heads
+        assert self.verified_attention_heads % parallel_config.tensor_parallel_size == 0
 
 
 class FakeWrappedGlmDsaModelConfig(FakeGlmDsaModelConfig):
@@ -332,6 +337,23 @@ def test_b12x_virtual_tp_padding_glm_dsa_draft_tp6():
     assert text_config.num_attention_heads == 66
     assert text_config.moe_intermediate_size == 2112
     assert draft_model_config.model_arch_config.total_num_attention_heads == 66
+
+
+def test_b12x_virtual_tp_padding_glm_dsa_draft_precedes_validation():
+    target_model_config = FakeGlmDsaModelConfig()
+    draft_model_config = FakeGlmDsaModelConfig()
+    spec_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+    )
+    spec_config.method = "mtp"
+    spec_config.target_model_config = target_model_config
+    spec_config.draft_model_config = draft_model_config
+    spec_config.draft_parallel_config = ParallelConfig(tensor_parallel_size=6)
+
+    spec_config._verify_args()
+
+    assert draft_model_config.verified_attention_heads == 66
 
 
 def test_b12x_virtual_tp_padding_minimax_m3_tp3_only():
