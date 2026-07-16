@@ -10,7 +10,10 @@ import torch
 from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 
 
-def get_current_virtual_tp_plan() -> dict[str, Any] | None:
+def get_current_virtual_tp_plan(config: Any | None = None) -> dict[str, Any] | None:
+    if config is not None:
+        return getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+
     from vllm.config import get_current_vllm_config_or_none
 
     vllm_config = get_current_vllm_config_or_none()
@@ -38,6 +41,46 @@ def get_virtual_tp_axis_local_size(axis_name: str, default: int) -> int:
     if local_size is None:
         return default
     return int(local_size)
+
+
+def get_virtual_tp_axis_original_size(
+    axis_name: str,
+    default: int,
+    *,
+    config: Any | None = None,
+) -> int:
+    plan = get_current_virtual_tp_plan(config)
+    if plan is None:
+        return default
+
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        return default
+
+    original_size = axis.get("original_size")
+    if original_size is None:
+        return default
+    return int(original_size)
+
+
+def get_virtual_tp_axis_padded_size(
+    axis_name: str,
+    default: int,
+    *,
+    config: Any | None = None,
+) -> int:
+    plan = get_current_virtual_tp_plan(config)
+    if plan is None:
+        return default
+
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        return default
+
+    padded_size = axis.get("padded_size")
+    if padded_size is None:
+        return default
+    return int(padded_size)
 
 
 def get_virtual_tp_axis_shard_size(axis_name: str, param_axis_size: int) -> int:

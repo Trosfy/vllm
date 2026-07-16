@@ -607,6 +607,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, all weights matrix won't be sharded, this layer
                     will be treated as a "Replicated" MergedLinear.
+        loaded_output_sizes: Output dimensions of the logical matrices in the
+                             checkpoint. Defaults to ``output_sizes``. This can
+                             differ when the in-memory matrices are padded.
     """
 
     def __init__(
@@ -622,8 +625,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        loaded_output_sizes: list[int] | None = None,
     ):
         self.output_sizes = output_sizes
+        self.loaded_output_sizes = (
+            output_sizes if loaded_output_sizes is None else loaded_output_sizes
+        )
+        if len(self.loaded_output_sizes) != len(self.output_sizes):
+            raise ValueError(
+                "loaded_output_sizes must have the same length as output_sizes"
+            )
+        if any(output_size <= 0 for output_size in self.loaded_output_sizes):
+            raise ValueError("loaded_output_sizes must contain only positive sizes")
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
 
@@ -694,11 +707,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param_data.copy_(loaded_weight)
                 return
 
-            output_sizes = (
-                self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
+            shard_ids = (
+                list(loaded_shard_id)
                 if loaded_shard_id is not None
-                else self.output_sizes
+                else list(range(len(self.loaded_output_sizes)))
             )
+            output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
             current_shard_offset = 0
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
             if (
@@ -711,8 +725,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "for BNB quantization with TP yet."
                 )
             shard_offsets: list[tuple[int, int, int]] = []
-            for i, output_size in enumerate(output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
+            for shard_id, output_size in zip(shard_ids, output_sizes):
+                shard_offsets.append((shard_id, current_shard_offset, output_size))
                 current_shard_offset += output_size
             packed_dim = getattr(param, "packed_dim", None)
             for shard_id, shard_offset, shard_size in shard_offsets:
@@ -820,6 +834,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param: BasevLLMParameter,
         loaded_weight: torch.Tensor,
         output_sizes: list[int] | None = None,
+        shard_ids: list[int] | None = None,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -833,9 +848,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         current_shard_offset = 0
         shard_offsets: list[tuple[int, int, int]] = []
-        output_sizes = output_sizes or self.output_sizes
-        for i, output_size in enumerate(output_sizes):
-            shard_offsets.append((i, current_shard_offset, output_size))
+        output_sizes = output_sizes or self.loaded_output_sizes
+        shard_ids = shard_ids or list(range(len(output_sizes)))
+        if len(shard_ids) != len(output_sizes):
+            raise ValueError("shard_ids and output_sizes must have the same length")
+        for shard_id, output_size in zip(shard_ids, output_sizes):
+            shard_offsets.append((shard_id, current_shard_offset, output_size))
             current_shard_offset += output_size
 
         for shard_id, shard_offset, shard_size in shard_offsets:
@@ -883,20 +901,24 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
-            output_sizes = (
-                [self.output_sizes[idx] for idx in loaded_shard_id]
-                if loaded_shard_id
-                else None
+            shard_ids = (
+                list(loaded_shard_id)
+                if loaded_shard_id is not None
+                else list(range(len(self.loaded_output_sizes)))
             )
+            output_sizes = [self.loaded_output_sizes[idx] for idx in shard_ids]
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
                 output_sizes = [
                     adjust_block_scale_shard(weight_block_size, size, 0)[0]
-                    for size in (output_sizes or self.output_sizes)
+                    for size in output_sizes
                 ]
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(
-                param, loaded_weight, output_sizes=output_sizes
+                param,
+                loaded_weight,
+                output_sizes=output_sizes,
+                shard_ids=shard_ids,
             )
             return
 
@@ -973,6 +995,12 @@ class QKVParallelLinear(ColumnParallelLinear):
                         (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        loaded_total_num_heads: Query-head count represented by the checkpoint.
+                                Defaults to ``total_num_heads`` and may differ
+                                when the in-memory projection is padded.
+        loaded_total_num_kv_heads: KV-head count represented by the checkpoint.
+                                   Defaults to ``total_num_kv_heads`` and may
+                                   differ when the in-memory projection is padded.
     """
 
     def __init__(
@@ -990,6 +1018,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
         v_head_size: int | None = None,
+        loaded_total_num_heads: int | None = None,
+        loaded_total_num_kv_heads: int | None = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -998,6 +1028,18 @@ class QKVParallelLinear(ColumnParallelLinear):
         if total_num_kv_heads is None:
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
+        self.loaded_total_num_heads = (
+            total_num_heads
+            if loaded_total_num_heads is None
+            else loaded_total_num_heads
+        )
+        self.loaded_total_num_kv_heads = (
+            total_num_kv_heads
+            if loaded_total_num_kv_heads is None
+            else loaded_total_num_kv_heads
+        )
+        if self.loaded_total_num_heads <= 0 or self.loaded_total_num_kv_heads <= 0:
+            raise ValueError("Loaded QKV head counts must be positive")
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.num_heads = divide(self.total_num_heads, tp_size)
@@ -1068,16 +1110,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         """
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
-            ("q", 0, self.total_num_heads * self.head_size),
+            ("q", 0, self.loaded_total_num_heads * self.head_size),
             (
                 "k",
-                self.total_num_heads * self.head_size,
-                self.total_num_kv_heads * self.head_size,
+                self.loaded_total_num_heads * self.head_size,
+                self.loaded_total_num_kv_heads * self.head_size,
             ),
             (
                 "v",
-                (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                self.total_num_kv_heads * self.v_head_size,
+                (self.loaded_total_num_heads + self.loaded_total_num_kv_heads)
+                * self.head_size,
+                self.loaded_total_num_kv_heads * self.v_head_size,
             ),
         ]
 
@@ -1178,16 +1221,17 @@ class QKVParallelLinear(ColumnParallelLinear):
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
-                ("q", 0, self.total_num_heads * self.head_size),
+                ("q", 0, self.loaded_total_num_heads * self.head_size),
                 (
                     "k",
-                    self.total_num_heads * self.head_size,
-                    self.total_num_kv_heads * self.head_size,
+                    self.loaded_total_num_heads * self.head_size,
+                    self.loaded_total_num_kv_heads * self.head_size,
                 ),
                 (
                     "v",
-                    (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                    self.total_num_kv_heads * self.v_head_size,
+                    (self.loaded_total_num_heads + self.loaded_total_num_kv_heads)
+                    * self.head_size,
+                    self.loaded_total_num_kv_heads * self.v_head_size,
                 ),
             ]
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -1215,20 +1259,26 @@ class QKVParallelLinear(ColumnParallelLinear):
 
                 if use_bitsandbytes_4bit:
                     orig_qkv_offsets = {
-                        "q": (0, self.total_num_heads * self.head_size),
+                        "q": (0, self.loaded_total_num_heads * self.head_size),
                         "k": (
-                            self.total_num_heads * self.head_size,
-                            self.total_num_kv_heads * self.head_size,
+                            self.loaded_total_num_heads * self.head_size,
+                            self.loaded_total_num_kv_heads * self.head_size,
                         ),
                         "v": (
-                            (self.total_num_heads + self.total_num_kv_heads)
+                            (
+                                self.loaded_total_num_heads
+                                + self.loaded_total_num_kv_heads
+                            )
                             * self.head_size,
-                            self.total_num_kv_heads * self.v_head_size,
+                            self.loaded_total_num_kv_heads * self.v_head_size,
                         ),
                         "total": (
-                            (self.total_num_heads + self.total_num_kv_heads)
+                            (
+                                self.loaded_total_num_heads
+                                + self.loaded_total_num_kv_heads
+                            )
                             * self.head_size
-                            + self.total_num_kv_heads * self.v_head_size,
+                            + self.loaded_total_num_kv_heads * self.v_head_size,
                             0,
                         ),
                     }

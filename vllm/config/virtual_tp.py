@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -20,9 +21,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 VIRTUAL_TP_PLAN_ATTR = "vllm_virtual_tp_plan"
+VIRTUAL_TP_PROFILE_ATTR = "vllm_virtual_tp_profile"
 _VIRTUAL_TP_PLAN_KIND_B12X_PADDED = "b12x-padded"
+_GQA_GDN_MOE_PROFILE = "gqa-gdn-moe"
 _ATTENTION_HEAD_LOCAL_ALIGNMENT = 8
 _MOE_INTERMEDIATE_LOCAL_ALIGNMENT = 32
+_NVFP4_LOCAL_ALIGNMENT = 16
 _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT = 128
 _VOCAB_GLOBAL_ALIGNMENT = 64
 _MINIMAX_M3_VIRTUAL_TP_SIZE = 3
@@ -86,6 +90,8 @@ def _build_b12x_virtual_tp_plan(
 ) -> dict[str, dict[str, int] | str]:
     if _is_minimax_m3_config(model_config):
         return _build_minimax_m3_virtual_tp_plan(model_config, parallel_config)
+    if _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE:
+        return _build_gqa_gdn_moe_virtual_tp_plan(model_config, parallel_config)
 
     attention_tp_size = parallel_config.tensor_parallel_size
     moe_tp_size = (
@@ -102,10 +108,7 @@ def _build_b12x_virtual_tp_plan(
     # GLM/DSA only needs divisibility by TP at the model-config level. B12X
     # sparse MLA handles partial local head blocks by padding/slicing inside the
     # backend, so GLM TP6 can stay 64->66 instead of inflating to 96 heads.
-    if is_deepseek_v4:
-        attention_head_alignment = _ATTENTION_HEAD_LOCAL_ALIGNMENT
-    else:
-        attention_head_alignment = 1
+    attention_head_alignment = _ATTENTION_HEAD_LOCAL_ALIGNMENT if is_deepseek_v4 else 1
     attention_axis = _make_virtual_axis(
         original_attention_heads,
         attention_tp_size,
@@ -126,7 +129,7 @@ def _build_b12x_virtual_tp_plan(
     moe_axis = _make_virtual_axis(
         moe_original_size,
         moe_tp_size,
-        _MOE_INTERMEDIATE_LOCAL_ALIGNMENT,
+        _get_moe_intermediate_local_alignment(model_config),
     )
     shared_expert_axis = None
     n_shared_experts = getattr(text_config, "n_shared_experts", None)
@@ -151,6 +154,112 @@ def _build_b12x_virtual_tp_plan(
         plan["output_groups"] = output_group_axis
     if shared_expert_axis is not None:
         plan["shared_expert_intermediate_size"] = shared_expert_axis
+    return plan
+
+
+def _build_gqa_gdn_moe_virtual_tp_plan(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> dict[str, dict[str, int] | str]:
+    """Build a plan for models combining GQA, GDN, and routed experts.
+
+    Models opt into this reusable shape profile through
+    ``VIRTUAL_TP_PROFILE_ATTR``. The profile is expressed in terms of common
+    config attributes rather than architecture names, so compatible model
+    families can reuse the same planner and loading paths.
+    """
+    text_config = model_config.hf_text_config
+    tp_size = parallel_config.tensor_parallel_size
+    moe_tp_size = (
+        tp_size
+        * parallel_config.data_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
+
+    attention_axis, kv_axis = _make_coupled_virtual_axes(
+        _require_int_attr(text_config, "num_attention_heads"),
+        _require_int_attr(text_config, "num_key_value_heads"),
+        tp_size,
+        ratio_key="q_heads_per_kv",
+        allow_secondary_replication=True,
+    )
+    linear_value_axis, linear_key_axis = _make_coupled_virtual_axes(
+        _require_int_attr(text_config, "linear_num_value_heads"),
+        _require_int_attr(text_config, "linear_num_key_heads"),
+        tp_size,
+        ratio_key="value_heads_per_key",
+    )
+    moe_axis = _make_virtual_axis(
+        _require_int_attr(text_config, "moe_intermediate_size"),
+        moe_tp_size,
+        _get_moe_intermediate_local_alignment(model_config),
+    )
+    dense_linear_alignment = _get_dense_linear_local_alignment(model_config)
+    shared_expert_axis = _make_virtual_axis(
+        _require_int_attr(text_config, "shared_expert_intermediate_size"),
+        tp_size,
+        dense_linear_alignment,
+    )
+    dense_intermediate_axis = None
+    if _positive_int_attr(text_config, "intermediate_size"):
+        dense_intermediate_axis = _make_virtual_axis(
+            _require_int_attr(text_config, "intermediate_size"),
+            tp_size,
+            dense_linear_alignment,
+        )
+    mtp_projection_axis = _make_virtual_axis(
+        _require_int_attr(text_config, "hidden_size"),
+        tp_size,
+    )
+
+    plan: dict[str, dict[str, int] | str] = {
+        "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
+        "model_type": _GQA_GDN_MOE_PROFILE,
+        "attention_heads": attention_axis,
+        "kv_heads": kv_axis,
+        "linear_attention_key_heads": linear_key_axis,
+        "linear_attention_value_heads": linear_value_axis,
+        "moe_intermediate_size": moe_axis,
+        "shared_expert_intermediate_size": shared_expert_axis,
+        "mtp_projection_size": mtp_projection_axis,
+        "vocab_size": _make_virtual_vocab_axis(
+            _require_int_attr(text_config, "vocab_size"), tp_size
+        ),
+    }
+    if dense_intermediate_axis is not None:
+        plan["dense_intermediate_size"] = dense_intermediate_axis
+
+    vision_config = getattr(model_config.hf_config, "vision_config", None)
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    vision_tp_size = (
+        1
+        if multimodal_config is not None
+        and getattr(multimodal_config, "mm_encoder_tp_mode", None) == "data"
+        else tp_size
+    )
+    if vision_config is not None:
+        vision_heads = _require_int_attr(vision_config, "num_heads")
+        vision_hidden_size = _require_int_attr(vision_config, "hidden_size")
+        if vision_hidden_size % vision_heads != 0:
+            raise ValueError(
+                "B12X virtual TP padding requires the vision hidden size to "
+                "be divisible by its attention head count."
+            )
+        vision_head_axis = _make_virtual_axis(vision_heads, vision_tp_size)
+        vision_projection_axis = _make_scaled_virtual_axis(
+            vision_hidden_size,
+            vision_head_axis,
+            vision_hidden_size // vision_heads,
+            "head_size",
+        )
+        plan["vision_attention_heads"] = vision_head_axis
+        plan["vision_attention_projection_size"] = vision_projection_axis
+        plan["vision_intermediate_size"] = _make_virtual_axis(
+            _require_int_attr(vision_config, "intermediate_size"),
+            vision_tp_size,
+            dense_linear_alignment,
+        )
+
     return plan
 
 
@@ -210,11 +319,12 @@ def _build_minimax_m3_virtual_tp_plan(
             f"per KV head, got {q_heads_per_kv}."
         )
 
-    attention_axis = _make_minimax_m3_attention_axis(
-        original_attention_heads, original_kv_heads, tp_size
-    )
-    kv_axis = _make_minimax_m3_kv_axis(
-        original_kv_heads, attention_axis["local_size"], q_heads_per_kv, tp_size
+    attention_axis, kv_axis = _make_coupled_virtual_axes(
+        original_attention_heads,
+        original_kv_heads,
+        tp_size,
+        primary_local_alignment=_ATTENTION_HEAD_LOCAL_ALIGNMENT,
+        ratio_key="q_heads_per_kv",
     )
     index_axis = {
         "original_size": original_index_heads,
@@ -231,7 +341,7 @@ def _build_minimax_m3_virtual_tp_plan(
     moe_axis = _make_virtual_axis(
         intermediate_size,
         moe_tp_size,
-        _MOE_INTERMEDIATE_LOCAL_ALIGNMENT,
+        _get_moe_intermediate_local_alignment(model_config),
     )
     dense_axis = _make_virtual_axis(
         dense_intermediate_size,
@@ -282,6 +392,9 @@ def _apply_b12x_virtual_tp_plan(
 ) -> None:
     if plan.get("model_type") == "minimax_m3":
         _apply_minimax_m3_virtual_tp_plan(model_config, plan)
+        return
+    if plan.get("model_type") == _GQA_GDN_MOE_PROFILE:
+        _apply_gqa_gdn_moe_virtual_tp_plan(model_config, plan)
         return
 
     configs = tuple(_iter_virtual_tp_configs(model_config))
@@ -346,6 +459,65 @@ def _apply_b12x_virtual_tp_plan(
             shared_expert_axis["original_size"],
             shared_expert_axis["padded_size"],
         )
+
+
+def _apply_gqa_gdn_moe_virtual_tp_plan(
+    model_config: ModelConfig,
+    plan: dict[str, dict[str, int] | str],
+) -> None:
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    config_axes = (
+        ("attention_heads", "num_attention_heads"),
+        ("kv_heads", "num_key_value_heads"),
+        ("linear_attention_key_heads", "linear_num_key_heads"),
+        ("linear_attention_value_heads", "linear_num_value_heads"),
+        ("moe_intermediate_size", "moe_intermediate_size"),
+        ("shared_expert_intermediate_size", "shared_expert_intermediate_size"),
+    )
+    for axis_name, attr in config_axes:
+        _apply_virtual_axis_to_config_attr(configs, plan, axis_name, attr)
+    if _optional_axis(plan, "dense_intermediate_size") is not None:
+        _apply_virtual_axis_to_config_attr(
+            configs, plan, "dense_intermediate_size", "intermediate_size"
+        )
+
+    vision_config = getattr(model_config.hf_config, "vision_config", None)
+    if vision_config is not None:
+        _apply_virtual_axis_to_config_attr(
+            (vision_config,), plan, "vision_attention_heads", "num_heads"
+        )
+        _apply_virtual_axis_to_config_attr(
+            (vision_config,), plan, "vision_intermediate_size", "intermediate_size"
+        )
+        setattr(vision_config, VIRTUAL_TP_PLAN_ATTR, plan)
+
+    for config in configs:
+        setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
+
+    model_config.model_arch_config = model_config.get_model_arch_config()
+
+    changes = []
+    for axis_name, label in (
+        ("attention_heads", "attention heads"),
+        ("kv_heads", "KV heads"),
+        ("linear_attention_key_heads", "GDN key heads"),
+        ("linear_attention_value_heads", "GDN value heads"),
+        ("moe_intermediate_size", "MoE intermediate size"),
+        ("shared_expert_intermediate_size", "shared intermediate size"),
+        ("dense_intermediate_size", "dense intermediate size"),
+        ("mtp_projection_size", "MTP projection size"),
+        ("vocab_size", "vocab storage size"),
+        ("vision_attention_heads", "vision attention heads"),
+        ("vision_intermediate_size", "vision intermediate size"),
+    ):
+        axis = _optional_axis(plan, axis_name)
+        if axis is not None and axis["original_size"] != axis["padded_size"]:
+            changes.append(f"{label} {axis['original_size']} -> {axis['padded_size']}")
+    logger.warning(
+        "Automatically enabled B12X virtual TP padding for the %s profile: %s.",
+        _GQA_GDN_MOE_PROFILE,
+        ", ".join(changes),
+    )
 
 
 def _apply_minimax_m3_virtual_tp_plan(
@@ -436,7 +608,8 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
     if not _is_supported_b12x_virtual_tp_config(model_config):
         raise ValueError(
             "B12X virtual TP padding is currently supported only for "
-            "DeepSeek V4, sparse MLA/DSA models, and MiniMax M3 TP=3."
+            "declared shape profiles, DeepSeek V4, sparse MLA/DSA models, "
+            "and MiniMax M3 TP=3."
         )
 
     if parallel_config.enable_expert_parallel:
@@ -456,6 +629,9 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
             "backend. Pass --moe-backend b12x or set VLLM_USE_B12X_MOE=1."
         )
 
+    if _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE:
+        return
+
     if _is_minimax_m3_config(model_config):
         if not _uses_minimax_m3_b12x_attention(vllm_config):
             raise ValueError(
@@ -467,8 +643,7 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
 
     if not _uses_b12x_attention(vllm_config):
         raise ValueError(
-            "B12X virtual TP padding requires the B12X MLA sparse "
-            "attention backend."
+            "B12X virtual TP padding requires the B12X MLA sparse attention backend."
         )
 
 
@@ -480,6 +655,7 @@ def _is_deepseek_v4_config(model_config: ModelConfig) -> bool:
         if (
             "DeepseekV4ForCausalLM" in architectures
             or "DeepseekV4ForCausalLMNextN" in architectures
+            or "DeepSeekV4MTPModel" in architectures
         ):
             return True
 
@@ -521,9 +697,24 @@ def _is_minimax_m3_config(model_config: ModelConfig) -> bool:
     return False
 
 
+def _get_virtual_tp_profile(model_config: ModelConfig) -> str | None:
+    profiles = {
+        str(profile)
+        for config in _iter_virtual_tp_configs(model_config)
+        if (profile := getattr(config, VIRTUAL_TP_PROFILE_ATTR, None)) is not None
+    }
+    if len(profiles) > 1:
+        raise ValueError(
+            "B12X virtual TP padding found conflicting model shape profiles: "
+            f"{sorted(profiles)}."
+        )
+    return next(iter(profiles), None)
+
+
 def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
     return (
-        _is_deepseek_v4_config(model_config)
+        _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE
+        or _is_deepseek_v4_config(model_config)
         or _is_sparse_mla_config(model_config)
         or _is_minimax_m3_config(model_config)
     )
@@ -549,6 +740,7 @@ def _uses_b12x_attention(vllm_config: VllmConfig) -> bool:
     return (
         model_config is not None
         and _is_supported_b12x_virtual_tp_config(model_config)
+        and _get_virtual_tp_profile(model_config) is None
         and current_platform.is_cuda()
         and current_platform.has_device_capability(120)
     )
@@ -560,6 +752,34 @@ def _uses_minimax_m3_b12x_attention(vllm_config: VllmConfig) -> bool:
         vllm_config.model_config is not None
         and _is_minimax_m3_config(vllm_config.model_config)
         and envs.VLLM_USE_B12X_MINIMAX_M3_MSA
+    )
+
+
+def _get_moe_intermediate_local_alignment(model_config: ModelConfig) -> int:
+    force_a8 = _environment_flag("B12X_MOE_FORCE_A8") or _environment_flag(
+        "B12X_FORCE_MOE_A8"
+    )
+    is_nvfp4_quantized = getattr(model_config, "is_nvfp4_quantized", None)
+    if callable(is_nvfp4_quantized) and is_nvfp4_quantized() and not force_a8:
+        return _NVFP4_LOCAL_ALIGNMENT
+    return _MOE_INTERMEDIATE_LOCAL_ALIGNMENT
+
+
+def _get_dense_linear_local_alignment(model_config: ModelConfig) -> int:
+    is_nvfp4_quantized = getattr(model_config, "is_nvfp4_quantized", None)
+    if callable(is_nvfp4_quantized) and is_nvfp4_quantized():
+        return _NVFP4_LOCAL_ALIGNMENT
+    return 1
+
+
+def _environment_flag(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
@@ -578,13 +798,93 @@ def _make_virtual_axis(
     }
 
 
+def _make_coupled_virtual_axes(
+    primary_size: int,
+    secondary_size: int,
+    tp_size: int,
+    *,
+    primary_local_alignment: int = 1,
+    secondary_local_alignment: int = 1,
+    ratio_key: str | None = None,
+    allow_secondary_replication: bool = False,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Pad two axes while preserving their integer primary/secondary ratio."""
+    if secondary_size <= 0 or primary_size % secondary_size != 0:
+        raise ValueError(
+            "B12X virtual TP padding requires coupled dimensions to have an "
+            f"integer ratio, got {primary_size} and {secondary_size}."
+        )
+    ratio = primary_size // secondary_size
+    if (
+        allow_secondary_replication
+        and primary_size % tp_size == 0
+        and secondary_size < tp_size
+        and tp_size % secondary_size == 0
+    ):
+        primary_axis = _make_noop_axis(primary_size, tp_size)
+        secondary_axis = {
+            "original_size": secondary_size,
+            "padded_size": secondary_size,
+            "tp_size": tp_size,
+            "local_size": 1,
+        }
+        if ratio_key is not None:
+            secondary_axis[ratio_key] = ratio
+        return primary_axis, secondary_axis
+
+    secondary_local_size = math.ceil(secondary_size / tp_size)
+    while (
+        secondary_local_size % secondary_local_alignment != 0
+        or secondary_local_size * ratio % primary_local_alignment != 0
+    ):
+        secondary_local_size += 1
+
+    primary_local_size = secondary_local_size * ratio
+    primary_axis = {
+        "original_size": primary_size,
+        "padded_size": primary_local_size * tp_size,
+        "tp_size": tp_size,
+        "local_size": primary_local_size,
+    }
+    secondary_axis = {
+        "original_size": secondary_size,
+        "padded_size": secondary_local_size * tp_size,
+        "tp_size": tp_size,
+        "local_size": secondary_local_size,
+    }
+    if ratio_key is not None:
+        secondary_axis[ratio_key] = ratio
+    return primary_axis, secondary_axis
+
+
+def _make_scaled_virtual_axis(
+    original_size: int,
+    base_axis: dict[str, int],
+    scale: int,
+    scale_key: str,
+) -> dict[str, int]:
+    if base_axis["original_size"] * scale != original_size:
+        raise ValueError(
+            "B12X virtual TP padding cannot preserve a scaled dimension with "
+            f"sizes {base_axis['original_size']} and {original_size}."
+        )
+    return {
+        "original_size": original_size,
+        "padded_size": base_axis["padded_size"] * scale,
+        "tp_size": base_axis["tp_size"],
+        "local_size": base_axis["local_size"] * scale,
+        scale_key: scale,
+    }
+
+
 def _make_noop_axis(original_size: int, tp_size: int) -> dict[str, int]:
     return {
         "original_size": original_size,
         "padded_size": original_size,
         "tp_size": tp_size,
         "local_size": (
-            original_size // tp_size if tp_size > 0 and original_size % tp_size == 0
+            original_size // tp_size
+            if tp_size > 0 and original_size % tp_size == 0
             else 0
         ),
     }
@@ -609,48 +909,6 @@ def _make_virtual_vocab_axis(
         "tp_size": tp_size,
         "local_size": padded_size // tp_size,
         "padding_size": padding_size,
-    }
-
-
-def _make_minimax_m3_attention_axis(
-    original_size: int,
-    original_kv_heads: int,
-    tp_size: int,
-) -> dict[str, int]:
-    q_heads_per_kv = original_size // original_kv_heads
-    local_size = math.ceil(original_size / tp_size)
-    local_size = (
-        math.ceil(local_size / _ATTENTION_HEAD_LOCAL_ALIGNMENT)
-        * _ATTENTION_HEAD_LOCAL_ALIGNMENT
-    )
-    while local_size % q_heads_per_kv != 0:
-        local_size += _ATTENTION_HEAD_LOCAL_ALIGNMENT
-    return {
-        "original_size": original_size,
-        "padded_size": local_size * tp_size,
-        "tp_size": tp_size,
-        "local_size": local_size,
-    }
-
-
-def _make_minimax_m3_kv_axis(
-    original_size: int,
-    local_attention_heads: int,
-    q_heads_per_kv: int,
-    tp_size: int,
-) -> dict[str, int]:
-    if local_attention_heads % q_heads_per_kv != 0:
-        raise ValueError(
-            "MiniMax M3 virtual TP padding produced a local query-head count "
-            "that does not preserve the original GQA group size."
-        )
-    local_size = local_attention_heads // q_heads_per_kv
-    return {
-        "original_size": original_size,
-        "padded_size": local_size * tp_size,
-        "tp_size": tp_size,
-        "local_size": local_size,
-        "q_heads_per_kv": q_heads_per_kv,
     }
 
 
@@ -692,9 +950,7 @@ def _make_virtual_output_group_axis(
 def _require_int_attr(config: Any, attr: str) -> int:
     value = getattr(config, attr, None)
     if value is None:
-        raise ValueError(
-            f"B12X virtual TP padding requires config attribute {attr!r}."
-        )
+        raise ValueError(f"B12X virtual TP padding requires config attribute {attr!r}.")
     return int(value)
 
 
@@ -744,3 +1000,17 @@ def _set_existing_config_attr(configs: Iterable[Any], attr: str, value: int) -> 
 def _set_all_config_attr(configs: Iterable[Any], attr: str, value: int) -> None:
     for config in configs:
         setattr(config, attr, value)
+
+
+def _apply_virtual_axis_to_config_attr(
+    configs: Iterable[Any],
+    plan: dict[str, dict[str, int] | str],
+    axis_name: str,
+    attr: str,
+) -> None:
+    axis = _require_axis(plan, axis_name)
+    for config in configs:
+        if not hasattr(config, attr):
+            continue
+        setattr(config, f"original_{attr}", axis["original_size"])
+        setattr(config, attr, axis["padded_size"])

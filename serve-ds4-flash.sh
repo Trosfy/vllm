@@ -24,7 +24,7 @@ export B12X_MLA_SM120_UNIFIED=1
 export B12X_DENSE_SPLITK_TURBO=1
 export B12X_W4A16_TC_DECODE=1
 export B12X_MOE_FORCE_A8=1
-export CUDA_VISIBLE_DEVICES=8,9
+export CUDA_VISIBLE_DEVICES=7,8,9
 
 if [[ -z "${HF_HOME:-}" && -L "${HOME}/.cache/huggingface" && ! -e "${HOME}/.cache/huggingface" ]]; then
   if [[ -d /data && -w /data ]]; then
@@ -38,6 +38,21 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
 served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
+speculative_method="${SPECULATIVE_METHOD:-}"
+if [[ -z "${speculative_method}" ]]; then
+  if [[ "${model_path,,}" == *dspark* ]]; then
+    speculative_method="dspark"
+  else
+    speculative_method="mtp"
+  fi
+fi
+case "${speculative_method}" in
+  mtp | dspark) ;;
+  *)
+    echo "Unsupported SPECULATIVE_METHOD=${speculative_method}; expected mtp or dspark" >&2
+    exit 2
+    ;;
+esac
 tp_size="${TP_SIZE:-2}"
 dcp_size="${DCP_SIZE:-1}"
 dcp_comm_backend="${DCP_COMM_BACKEND:-a2a}"
@@ -74,7 +89,8 @@ fi
 
 spec_args=()
 if [[ "${VLLM_ENABLE_MTP:-1}" == "1" ]]; then
-  spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}')
+  printf -v speculative_config '{"method":"%s","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x"}' "${speculative_method}"
+  spec_args=(--speculative-config "${speculative_config}")
 fi
 
 autotune_args=()
