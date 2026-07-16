@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
+import pytest
+
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
-from vllm.v1.attention.backends.b12x_attn import B12XPagedAttentionBackend
+from vllm.v1.attention.backends import b12x_attn
+from vllm.v1.attention.backends.b12x_attn import (
+    B12XPagedAttentionBackend,
+    B12XPagedAttentionImpl,
+)
 from vllm.v1.worker.utils import select_common_block_size
 
 
 class _Page128OnlyBackend(AttentionBackend):
-
     @staticmethod
     def get_name() -> str:
         return "PAGE128_ONLY"
@@ -52,3 +59,45 @@ def test_b12x_dense_can_share_page128_group() -> None:
         )
         == 128
     )
+
+
+def test_b12x_lazily_prepares_missing_decode_capture_bucket(monkeypatch) -> None:
+    impl = object.__new__(B12XPagedAttentionImpl)
+    plan = SimpleNamespace(layout=SimpleNamespace(nbytes=64))
+    created: list[int] = []
+
+    def create_plan(size: int) -> SimpleNamespace:
+        created.append(size)
+        return plan
+
+    impl._decode_plans = {}
+    impl._create_decode_plan = create_plan
+    impl._scratch_nbytes = 64
+    impl._extend_plan = object()
+    metadata = SimpleNamespace(max_query_len=1)
+    monkeypatch.setattr(b12x_attn, "_capture_alloc_forbidden", lambda: False)
+
+    selected, fixed_split_size = impl._select_plan(metadata, 7, 7)
+
+    assert selected is plan
+    assert fixed_split_size is None
+    assert impl._decode_plans == {7: plan}
+    assert created == [7]
+
+    assert impl._select_plan(metadata, 7, 7) == (plan, None)
+    assert created == [7]
+
+
+def test_b12x_missing_decode_bucket_fails_closed_during_capture(monkeypatch) -> None:
+    impl = object.__new__(B12XPagedAttentionImpl)
+    impl._decode_plans = {}
+    impl._create_decode_plan = lambda size: pytest.fail(
+        f"created plan for batch {size} during capture"
+    )
+    impl._scratch_nbytes = 64
+    impl._extend_plan = object()
+    metadata = SimpleNamespace(max_query_len=1)
+    monkeypatch.setattr(b12x_attn, "_capture_alloc_forbidden", lambda: True)
+
+    with pytest.raises(RuntimeError, match="batch size 7"):
+        impl._select_plan(metadata, 7, 7)

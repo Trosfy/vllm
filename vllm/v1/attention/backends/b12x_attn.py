@@ -632,6 +632,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             (sm_count * 2) // max(self.num_kv_heads, 1),
             1,
         )
+
         def _decode_work_items(batch_size: int) -> int:
             default = max(
                 batch_size * gqa_tiles * self._decode_max_chunks_per_req,
@@ -694,9 +695,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
 
         capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
         decode_plan_sizes = {
-            int(size)
-            for size in capture_sizes
-            if 0 < int(size) <= max_num_seqs
+            int(size) for size in capture_sizes if 0 < int(size) <= max_num_seqs
         }
         decode_plan_sizes.add(max_num_seqs)
         decode_work_items_capacity = max(
@@ -705,8 +704,8 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         decode_partial_rows_capacity = max(
             _decode_partial_rows(batch_size) for batch_size in decode_plan_sizes
         )
-        self._decode_plans: dict[int, Any] = {}
-        for batch_size in sorted(decode_plan_sizes):
+
+        def _create_decode_plan(batch_size: int) -> Any:
             plan = _make_plan(
                 "decode",
                 batch_size,
@@ -726,7 +725,12 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             )
             if plan.plan.split_kv:
                 raise RuntimeError("B12X_ATTN decode plans must not use split-kv.")
-            self._decode_plans[batch_size] = plan
+            return plan
+
+        self._create_decode_plan = _create_decode_plan
+        self._decode_plans: dict[int, Any] = {}
+        for batch_size in sorted(decode_plan_sizes):
+            self._decode_plans[batch_size] = self._create_decode_plan(batch_size)
         self._extend_plan = _make_plan(
             "extend",
             max_batched,
@@ -1000,13 +1004,24 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         total_q: int,
         num_reqs: int,
     ) -> tuple[Any, int | None]:
-        if (
-            attn_metadata.max_query_len <= 1
-            and int(total_q) == int(num_reqs)
-        ):
-            plan = self._decode_plans.get(int(total_q))
-            if plan is not None:
-                return plan, None
+        if attn_metadata.max_query_len <= 1 and int(total_q) == int(num_reqs):
+            batch_size = int(total_q)
+            plan = self._decode_plans.get(batch_size)
+            if plan is None:
+                if _capture_alloc_forbidden():
+                    raise RuntimeError(
+                        "B12X_ATTN decode plan was not prepared before CUDA graph "
+                        f"capture for batch size {batch_size}."
+                    )
+                plan = self._create_decode_plan(batch_size)
+                if int(plan.layout.nbytes) > self._scratch_nbytes:
+                    raise RuntimeError(
+                        "B12X_ATTN lazily created decode plan exceeds reserved "
+                        f"scratch: {int(plan.layout.nbytes)} > "
+                        f"{self._scratch_nbytes} bytes."
+                    )
+                self._decode_plans[batch_size] = plan
+            return plan, None
         return self._extend_plan, None
 
     def _forward_noncausal_contiguous(
@@ -1226,10 +1241,9 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             num_reqs,
             q.device,
         )
-        is_single_token_decode = (
-            attn_metadata.max_query_len <= 1
-            and int(num_actual_tokens) == int(num_reqs)
-        )
+        is_single_token_decode = attn_metadata.max_query_len <= 1 and int(
+            num_actual_tokens
+        ) == int(num_reqs)
 
         plan, fixed_split_size = self._select_plan(
             attn_metadata,
