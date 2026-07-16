@@ -611,6 +611,11 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        dcp_rank = 0
+        if dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_rank = get_dcp_group().rank_in_group
 
         # Indexed (compressed) region global top-k.
         topk_indices = None
@@ -625,17 +630,25 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if compress_ratio == 4:
                 assert topk_indices_buffer is not None
-                # The C4 sparse indexer searches this rank's DCP-local cache and
-                # returns request-relative local K positions. Convert them through
-                # the ordinary local block table, matching the GLM non-compressed
-                # sparse MLA DCP contract.
-                topk_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
-                )
+                if dcp_world_size > 1:
+                    topk_indices, topk_lens = compute_dcp_global_topk_indices_and_lens(
+                        topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        is_valid,
+                        dcp_world_size,
+                        dcp_rank,
+                        vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                    )
+                else:
+                    topk_indices, topk_lens = compute_global_topk_indices_and_lens(
+                        topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        is_valid,
+                    )
             else:
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
@@ -744,7 +757,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
             block_size = attn_metadata.block_size // compress_ratio
-            if dcp_world_size > 1 and compress_ratio != 4:
+            if dcp_world_size > 1:
                 extra_topk_indices, extra_topk_lens = (
                     compute_dcp_global_topk_indices_and_lens(
                         local_topk_indices,
@@ -758,8 +771,6 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     )
                 )
             else:
-                # C4 top-k ids are already DCP-local because the sparse indexer
-                # gathers/searches only local compressed K rows under DCP.
                 extra_topk_indices, extra_topk_lens = (
                     compute_global_topk_indices_and_lens(
                         local_topk_indices,

@@ -676,9 +676,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and (self.model_version == "deepseek_v4" or is_deepseek_v4_model)
         ):
             max_model_len = vllm_config.model_config.max_model_len
-            max_num_batched_tokens = (
-                vllm_config.scheduler_config.max_num_batched_tokens
-            )
+            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             block_size = self.block_size
             if self.dcp_sharded:
                 block_size *= dcp_world_size
@@ -702,6 +700,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
         dcp_sharded_set = set(spec.dcp_sharded for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
@@ -711,6 +710,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(block_stride_set) == 1
+            and len(dcp_replicated_set) == 1
             and len(dcp_sharded_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
@@ -727,6 +727,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             sliding_window=sliding_window_set.pop(),
+            dcp_replicated=dcp_replicated_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
@@ -739,6 +740,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
             and spec.dcp_sharded == self.dcp_sharded
             for spec in kv_cache_specs.values()
         )

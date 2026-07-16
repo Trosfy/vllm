@@ -182,7 +182,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
-            dcp_sharded=True,
+            dcp_replicated=True,
         )
 
     def forward(self): ...
@@ -318,11 +318,6 @@ class DeepseekCompressor(nn.Module):
         block_size = state_metadata.block_size
         parallel_config = self.vllm_config.parallel_config
         dcp_world_size = parallel_config.decode_context_parallel_size
-        dcp_rank = 0
-        if dcp_world_size > 1:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            dcp_rank = get_dcp_group().rank_in_group
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -409,11 +404,12 @@ class DeepseekCompressor(nn.Module):
         if use_triton_compressor:
             extra_kwargs.update(
                 {
-                    "dcp_world_size": dcp_world_size,
-                    "dcp_rank": dcp_rank,
-                    "cp_kv_cache_interleave_size": (
-                        parallel_config.cp_kv_cache_interleave_size
-                    ),
+                    # Compressor state is replicated under DCP so every rank
+                    # can form a complete compressed window. The destination
+                    # KV slot mapping still selects the owning DCP rank.
+                    "dcp_world_size": 1,
+                    "dcp_rank": 0,
+                    "cp_kv_cache_interleave_size": 1,
                 }
             )
         compress_norm_rope_store_fn(
