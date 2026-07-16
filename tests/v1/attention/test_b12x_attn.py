@@ -10,6 +10,7 @@ from vllm.v1.attention.backends import b12x_attn
 from vllm.v1.attention.backends.b12x_attn import (
     B12XPagedAttentionBackend,
     B12XPagedAttentionImpl,
+    _max_page_table_width,
 )
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -59,6 +60,20 @@ def test_b12x_dense_can_share_page128_group() -> None:
         )
         == 128
     )
+
+
+def test_b12x_hybrid_align_reserves_expanded_page_table() -> None:
+    assert _max_page_table_width(4096, 128, 4096, "none") == 32
+    assert _max_page_table_width(4096, 128, 4096, "align") == 64
+
+    storage_block_size = 3200
+    expanded_width = (
+        (4096 + storage_block_size - 1)
+        // storage_block_size
+        * (storage_block_size // 128)
+    )
+    assert expanded_width == 50
+    assert expanded_width <= _max_page_table_width(4096, 128, 4096, "align")
 
 
 def test_b12x_lazily_prepares_missing_decode_capture_bucket(monkeypatch) -> None:

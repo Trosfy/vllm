@@ -231,6 +231,7 @@ class MambaHybridModelState(DefaultModelState):
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.max_query_len
+        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
             max_seq_len = self.max_model_len
         else:

@@ -67,6 +67,21 @@ _B12X_SUPPORTED_KV_CACHE_DTYPES = (
 )
 
 
+def _max_page_table_width(
+    max_model_len: int,
+    block_size: int,
+    max_num_batched_tokens: int,
+    mamba_cache_mode: str,
+) -> int:
+    width = max(cdiv(max(max_model_len, 1), block_size), 1)
+    if mamba_cache_mode == "align":
+        # Hybrid cache setup can enlarge the storage block after attention
+        # layers are initialized. Its expansion into kernel-sized blocks adds
+        # at most one storage block of trailing page-table capacity.
+        width += cdiv(max_num_batched_tokens, block_size)
+    return width
+
+
 @triton.jit(do_not_specialize=["num_reqs"])
 def _b12x_noncausal_cu_lens_kernel(
     seq_lens_ptr,
@@ -617,7 +632,12 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         max_model_len = int(model_config.max_model_len)
-        max_page_table_width = max(cdiv(max(max_model_len, 1), self.block_size), 1)
+        max_page_table_width = _max_page_table_width(
+            max_model_len,
+            self.block_size,
+            max_batched,
+            cache_config.mamba_cache_mode,
+        )
         gqa_tiles = max(cdiv(self.num_queries_per_kv, _MIN_PAGED_TILE_Q), 1)
         extend_q_tiles = cdiv(max_batched * self.num_queries_per_kv, _MIN_PAGED_TILE_Q)
 
