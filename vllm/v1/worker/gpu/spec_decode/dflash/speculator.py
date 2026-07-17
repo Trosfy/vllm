@@ -807,10 +807,21 @@ def _shift_draft_block_tables_kernel(
     # In-place left shift is safe: iterations run in ascending order and each
     # loads its chunk (from offset + shift) before storing (at offset), so no
     # store ever precedes a load of the same element.
-    for i in tl.range(0, num_remaining, BLOCK_SIZE):
+    # Keep iterations strictly ordered. Compiler software pipelining may start
+    # a store before a later overlapping source load has completed.
+    for i in tl.range(
+        0,
+        num_remaining,
+        BLOCK_SIZE,
+        num_stages=1,
+        loop_unroll_factor=1,
+    ):
         offset = i + tl.arange(0, BLOCK_SIZE)
         mask = offset < num_remaining
         block_ids = tl.load(row_ptr + offset + shift, mask=mask, other=0)
+        # Source and destination overlap for shifts smaller than BLOCK_SIZE.
+        # Ensure every lane has consumed its source before any lane stores.
+        tl.debug_barrier()
         tl.store(row_ptr + offset, block_ids, mask=mask)
 
 
