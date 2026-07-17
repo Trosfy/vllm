@@ -406,8 +406,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_query_per_req: int | None = None,
     ) -> None:
         if num_query_per_req is None:
-            num_query_per_req = self.num_query_per_req
-        num_speculative_steps = self._speculative_steps_for_query_len(num_query_per_req)
+            num_speculative_steps = self.num_speculative_steps
+        else:
+            num_speculative_steps = self._speculative_steps_for_query_len(
+                num_query_per_req
+            )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
