@@ -9,11 +9,15 @@ row by the restored whole blocks (seq_lens is shortened to match by
 _prepare_dflash_inputs_kernel).
 """
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
     shift_draft_block_tables,
 )
 
@@ -23,6 +27,25 @@ DEVICE = "cuda"
 BLOCK_SIZE = 16
 MAX_BLOCKS = 64
 MAX_NUM_REQS = 8
+
+
+def test_unaligned_cached_prefix_detection():
+    speculator = SimpleNamespace(
+        num_cached_tokens_np=np.array([32, 35, 64], dtype=np.int32),
+        block_tables=SimpleNamespace(kernel_block_sizes=[16]),
+    )
+
+    aligned = SimpleNamespace(
+        idx_mapping_np=np.array([0, 2], dtype=np.int32),
+        num_reqs=2,
+    )
+    unaligned = SimpleNamespace(
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        num_reqs=2,
+    )
+
+    assert not DFlashSpeculator._has_unaligned_cached_prefix(speculator, aligned)
+    assert DFlashSpeculator._has_unaligned_cached_prefix(speculator, unaligned)
 
 
 def _make_block_table(num_reqs: int) -> torch.Tensor:
