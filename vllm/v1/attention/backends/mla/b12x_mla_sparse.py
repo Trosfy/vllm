@@ -111,9 +111,7 @@ def _is_glm_moe_dsa_model() -> bool:
         _IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    target_model_config = getattr(
-        speculative_config, "target_model_config", None
-    )
+    target_model_config = getattr(speculative_config, "target_model_config", None)
     target_model_type = (
         getattr(target_model_config.hf_config, "model_type", None)
         if target_model_config is not None
@@ -134,9 +132,7 @@ def _load_fp8_rope_writer() -> None:
     global _FP8_ROPE_WRITER_LOADED
     if _FP8_ROPE_WRITER_LOADED:
         return
-    library = os.getenv(
-        "KV_FP8_ROPE_WRITER_LIB", "/opt/fp8rope/_C_fp8_rope.so"
-    )
+    library = os.getenv("KV_FP8_ROPE_WRITER_LIB", "/opt/fp8rope/_C_fp8_rope.so")
     if not os.path.isfile(library):
         raise RuntimeError(
             "KV_FP8_ROPE=1 requires the standalone writer library at "
@@ -490,49 +486,52 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 if num_query_tokens:
                     req_ids[:num_query_tokens] = req_id_per_token_np
 
-            # Avoid the blocking seq_lens device->host sync. cm.seq_lens_cpu is a
-            # lazy `.to("cpu")`; under --async-scheduling the runner keeps the GPU
-            # tensor authoritative (_seq_lens_cpu=None), so reading it here forces a
-            # full D2H copy every (MTP) decode step and serializes the pipeline that
-            # async scheduling exists to overlap. The indexer that selects the
-            # top-k for this same step already reads seq_lens_cpu_upper_bound; mirror
-            # it. The indexer writes -1 for invalid tail entries and MLA clamps the
-            # dynamic length to topk, so an optimistic (>=) bound remains safe.
-            seq_lens_cpu_src = (
-                cm.seq_lens_cpu_upper_bound
-                if cm.seq_lens_cpu_upper_bound is not None
-                else cm.seq_lens_cpu
-            )
-            seq_lens_cpu = seq_lens_cpu_src.numpy().astype(np.int32, copy=False)
-            per_token_lens = np.zeros((num_tokens,), dtype=np.int32)
-            for req_id, q_len in enumerate(query_lens):
-                if q_len <= 0:
-                    continue
-                start = int(starts[req_id])
-                end = int(starts[req_id + 1])
-                context_len = int(seq_lens_cpu[req_id]) - int(q_len)
-                if use_dcp:
-                    global_per_token_lens = torch.arange(
-                        context_len + 1,
-                        context_len + int(q_len) + 1,
-                        dtype=torch.int32,
-                    )
-                    per_token_lens[start:end] = get_dcp_local_seq_lens(
-                        global_per_token_lens,
-                        self.dcp_world_size,
-                        self.dcp_rank,
-                        self.cp_kv_cache_interleave_size,
-                    ).numpy()
-                else:
-                    per_token_lens[start:end] = np.arange(
-                        context_len + 1,
-                        context_len + int(q_len) + 1,
-                        dtype=np.int32,
-                    )
+            if not use_dcp and cm.positions is not None and cm.positions.ndim == 1:
+                # Async scheduling intentionally exposes only an optimistic CPU
+                # sequence-length bound. That bound can lag when a finished slot is
+                # recycled for a shorter request, so it is not a valid causal mask
+                # for multi-token verification. Positions are authoritative on the
+                # GPU and give the exact per-token KV length for DCP1.
+                per_token_lens_t = cm.positions[:num_tokens].to(torch.int32) + 1
+            else:
+                # DCP needs rank-local lengths rather than global positions. Avoid
+                # the blocking lazy seq_lens D2H copy and convert the scheduler's
+                # conservative CPU lengths to each rank's local interleaving.
+                seq_lens_cpu_src = (
+                    cm.seq_lens_cpu_upper_bound
+                    if cm.seq_lens_cpu_upper_bound is not None
+                    else cm.seq_lens_cpu
+                )
+                seq_lens_cpu = seq_lens_cpu_src.numpy().astype(np.int32, copy=False)
+                per_token_lens = np.zeros((num_tokens,), dtype=np.int32)
+                for req_id, q_len in enumerate(query_lens):
+                    if q_len <= 0:
+                        continue
+                    start = int(starts[req_id])
+                    end = int(starts[req_id + 1])
+                    context_len = int(seq_lens_cpu[req_id]) - int(q_len)
+                    if use_dcp:
+                        global_per_token_lens = torch.arange(
+                            context_len + 1,
+                            context_len + int(q_len) + 1,
+                            dtype=torch.int32,
+                        )
+                        per_token_lens[start:end] = get_dcp_local_seq_lens(
+                            global_per_token_lens,
+                            self.dcp_world_size,
+                            self.dcp_rank,
+                            self.cp_kv_cache_interleave_size,
+                        ).numpy()
+                    else:
+                        per_token_lens[start:end] = np.arange(
+                            context_len + 1,
+                            context_len + int(q_len) + 1,
+                            dtype=np.int32,
+                        )
 
-            per_token_lens_t = torch.from_numpy(per_token_lens)
-            if per_token_lens_t.device.type == "cpu":
-                per_token_lens_t = per_token_lens_t.pin_memory()
+                per_token_lens_t = torch.from_numpy(per_token_lens)
+                if per_token_lens_t.device.type == "cpu":
+                    per_token_lens_t = per_token_lens_t.pin_memory()
             if req_ids is not None:
                 assert self.req_id_per_token_buffer is not None
                 req_ids_t = torch.from_numpy(req_ids)
@@ -888,8 +887,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             return
         if kv_cache_dtype != "nvfp4_ds_mla":
             raise RuntimeError(
-                "KV_FP8_ROPE writer reached a non-NVFP4 cache: "
-                f"{kv_cache_dtype!r}"
+                f"KV_FP8_ROPE writer reached a non-NVFP4 cache: {kv_cache_dtype!r}"
             )
         k_pe_flat = k_pe.squeeze(1)
         if kv_c_normed.shape[-1] != 512 or k_pe_flat.shape[-1] != 64:
