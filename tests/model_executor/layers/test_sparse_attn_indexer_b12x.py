@@ -153,6 +153,44 @@ def _install_fake_b12x_indexer(
     monkeypatch.setitem(sys.modules, "b12x.integration", integration_mod)
 
 
+def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
+    tiled_topk_mod = types.ModuleType("b12x.attention.indexer.tiled_topk")
+    tiled_topk_mod.run_row_topk = run_row_topk
+    monkeypatch.setitem(
+        sys.modules,
+        "b12x.attention.indexer.tiled_topk",
+        tiled_topk_mod,
+    )
+
+    class FakeDCPGroup:
+        def __init__(self) -> None:
+            self.world_size = world_size
+
+        def all_gather(self, tensor, dim):
+            assert dim == 0
+            return torch.cat([tensor.clone() for _ in range(world_size)], dim=dim)
+
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.v1.attention.backends.mla.sparse_utils as sparse_utils
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
+    monkeypatch.setattr(
+        sparse_utils,
+        "triton_convert_dcp_local_topk_to_global",
+        lambda *args, **kwargs: None,
+    )
+
+    def gather_topk_ids_by_position(candidate_ids, positions, out):
+        gathered = torch.gather(candidate_ids, 1, positions.to(torch.int64))
+        out.copy_(gathered.to(out.dtype))
+
+    monkeypatch.setattr(
+        sparse_utils,
+        "triton_gather_topk_ids_by_position",
+        gather_topk_ids_by_position,
+    )
+
+
 @pytest.mark.parametrize(
     "page_stride0",
     [
@@ -560,9 +598,6 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
             schedule_metadata=None,
             active_width=None,
         ),
-        dcp_world_size=2,
-        dcp_rank=1,
-        cp_interleave_size=16,
     )
     layer_name = "layers.0.attn"
     metadata_key = indexer_mod._resolve_layer_name(layer_name)
@@ -599,6 +634,9 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
         topk_scores_buffer=topk_scores_buffer,
+        dcp_world_size=2,
+        dcp_rank=1,
+        cp_kv_cache_interleave_size=16,
     )
 
     assert result is topk_indices_buffer
@@ -625,7 +663,6 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
 
 
 def test_b12x_dcp_merge_passes_contiguous_scores_to_topk(monkeypatch):
-    tiled_topk_mod = types.ModuleType("b12x.attention.indexer.tiled_topk")
     run_row_topk_calls: list[tuple[bool, tuple[int, ...]]] = []
 
     def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
@@ -638,39 +675,7 @@ def test_b12x_dcp_merge_passes_contiguous_scores_to_topk(monkeypatch):
         output_indices.copy_(positions)
         output_values.copy_(row_logits[:, :topk])
 
-    tiled_topk_mod.run_row_topk = run_row_topk
-    monkeypatch.setitem(
-        sys.modules,
-        "b12x.attention.indexer.tiled_topk",
-        tiled_topk_mod,
-    )
-
-    class FakeDCPGroup:
-        world_size = 2
-
-        def all_gather(self, tensor, dim):
-            assert dim == 0
-            return torch.cat([tensor, tensor.clone()], dim=dim)
-
-    import vllm.distributed.parallel_state as parallel_state
-    import vllm.v1.attention.backends.mla.sparse_utils as sparse_utils
-
-    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
-    monkeypatch.setattr(
-        sparse_utils,
-        "triton_convert_dcp_local_topk_to_global",
-        lambda *args, **kwargs: None,
-    )
-
-    def gather_topk_ids_by_position(candidate_ids, positions, out):
-        gathered = torch.gather(candidate_ids, 1, positions.to(torch.int64))
-        out.copy_(gathered.to(out.dtype))
-
-    monkeypatch.setattr(
-        sparse_utils,
-        "triton_gather_topk_ids_by_position",
-        gather_topk_ids_by_position,
-    )
+    _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=2)
     workspace_manager = _FakeWorkspaceManager()
     monkeypatch.setattr(
         indexer_mod, "current_workspace_manager", lambda: workspace_manager
@@ -695,6 +700,14 @@ def test_b12x_dcp_merge_passes_contiguous_scores_to_topk(monkeypatch):
 
 
 def test_b12x_dcp_merge_warmup_reserves_workspace(monkeypatch):
+    def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
+        positions = torch.arange(topk, dtype=output_indices.dtype).expand_as(
+            output_indices
+        )
+        output_indices.copy_(positions)
+        output_values.copy_(row_logits[:, :topk])
+
+    _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=4)
     workspace_manager = _FakeWorkspaceManager()
     monkeypatch.setattr(
         indexer_mod, "current_workspace_manager", lambda: workspace_manager
@@ -1054,7 +1067,7 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
     )
     builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
     builder.scheduler_metadata_buffer = torch.zeros((5, 2), dtype=torch.int32)
-    builder.storage_block_size = 64
+    builder.kv_cache_spec = types.SimpleNamespace(storage_block_size=64)
     builder.num_sms = 4
 
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)
