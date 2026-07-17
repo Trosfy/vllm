@@ -372,12 +372,12 @@ class Scheduler(SchedulerInterface):
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
             # state is simply not cached, requiring no special handling.
-            # Additionally, when Eagle mode is enabled, FullAttn prunes the last
-            # matching block. To prevent this from causing a Mamba cache miss, the
-            # last chunk must be not smaller than `block_size`.
+            # Additionally, when Eagle-style cache drop is enabled, FullAttn
+            # prunes the last matching block. To prevent this from causing a
+            # Mamba cache miss, the last chunk must be not smaller than
+            # `block_size`.
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
             if self.use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
@@ -544,11 +544,14 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                effective_lookahead_tokens = (
+                    0 if request.is_prefill_chunk else self.num_lookahead_tokens
+                )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=effective_lookahead_tokens,
                     )
 
                     if new_blocks is not None:

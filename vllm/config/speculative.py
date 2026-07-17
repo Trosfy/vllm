@@ -10,6 +10,7 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -118,6 +119,12 @@ class SpeculativeConfig:
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
     backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
+    draft_kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype to use for the draft model. When `None`, the draft model
+    inherits the target model's `--kv-cache-dtype` setting."""
+    draft_attention_backend: AttentionBackendEnum | Literal["auto"] | None = None
+    """Attention backend to use for the draft model. When `None`, the draft
+    model attention backend is independently auto-selected."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -321,6 +328,17 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None:
+                # DFlash checkpoints declare 0-based target layer ids; the
+                # captured aux ids are shifted by one (hidden_states[0] is the
+                # embedding output), matching eagle3_utils.
+                dflash_config = (
+                    getattr(self.draft_model_config.hf_config, "dflash_config", None)
+                    or {}
+                )
+                target_layer_ids = dflash_config.get("target_layer_ids")
+                if target_layer_ids is not None:
+                    layer_ids = [int(i) + 1 for i in target_layer_ids]
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -1147,6 +1165,15 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    @field_validator("draft_attention_backend", mode="before")
+    @classmethod
+    def _parse_draft_attention_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return "auto"
+            return AttentionBackendEnum[value.upper()]
+        return value
+
     @field_validator("attention_backend", mode="before")
     @classmethod
     def _parse_attention_backend(cls, value: Any) -> Any:
@@ -1176,6 +1203,9 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+
+        if self.draft_attention_backend is None and self.attention_backend is not None:
+            self.draft_attention_backend = self.attention_backend
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
