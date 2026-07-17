@@ -74,9 +74,7 @@ def test_compressed_slot_mapping_uses_dcp_local_pages(
         num_actual_tokens=8,
         max_query_len=8,
         max_seq_len=516,
-        block_table_tensor=torch.tensor(
-            [[11, 17]], dtype=torch.int32, device=device
-        ),
+        block_table_tensor=torch.tensor([[11, 17]], dtype=torch.int32, device=device),
         slot_mapping=torch.full((8,), -123, dtype=torch.int64, device=device),
         causal=True,
         dcp_local_seq_lens=torch.tensor([258], dtype=torch.int32, device=device),

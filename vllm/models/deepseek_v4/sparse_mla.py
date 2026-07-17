@@ -148,9 +148,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
         parallel_config = vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
-        self.cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size
-        )
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_rank = 0
         if self.dcp_world_size > 1:
             assert self.pcp_world_size == 1, (
@@ -235,12 +233,9 @@ class DeepseekV4FlashMLAMetadataBuilder(
         else:
             actual_num_query_tokens = int(cm.query_start_loc_cpu[-1])
 
-        use_dcp_local_kv = (
-            self.dcp_world_size > 1 and cm.dcp_local_seq_lens is not None
-        )
-        if (
-            self.dcp_world_size > 1
-            and not getattr(self.kv_cache_spec, "dcp_replicated", False)
+        use_dcp_local_kv = self.dcp_world_size > 1 and cm.dcp_local_seq_lens is not None
+        if self.dcp_world_size > 1 and not getattr(
+            self.kv_cache_spec, "dcp_replicated", False
         ):
             assert use_dcp_local_kv, (
                 "DCP-sharded DeepSeek-V4 MLA metadata requires rank-local "
