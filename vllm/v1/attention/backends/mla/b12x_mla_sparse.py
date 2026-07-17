@@ -724,6 +724,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self._pad_heads = self._kernel_num_heads != self._input_num_heads
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
+        self.spec_capture_max_q = _env_int(
+            "VLLM_B12X_MLA_SPEC_CAPTURE_MAX_Q",
+            self.spec_decode_max_q,
+        )
         # The decode kernel handles independent one-token query rows. MTP
         # verification has multiple query rows per request, and later rows must
         # attend to earlier draft rows in the same verifier batch. Route those
@@ -1386,6 +1390,53 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             # directly into the shared top-k buffer.
             selected_indices = topk_indices
             nsa_cache_seqlens = per_token_cache
+
+        # Only the DCP path still has the indexer's logical token ids. The
+        # non-DCP B12X output has already been converted to physical cache
+        # slots, so exposing it as both forms would fail the live state's
+        # logical-index causality validation.
+        logical_topk_indices = topk_indices if self.dcp_world_size > 1 else None
+
+        is_spec_verify_capture = (
+            attn_metadata.max_query_len <= self.spec_capture_max_q
+            and num_actual_toks <= attn_metadata.num_reqs * self.spec_capture_max_q
+            and num_actual_toks <= self._max_batched
+        )
+        layer_name = getattr(layer, "layer_name", None)
+        if layer_name is None:
+            layer_index = getattr(layer, "layer_idx", None)
+            if layer_index is not None:
+                try:
+                    layer_name = f"layers.{int(layer_index)}"
+                except (TypeError, ValueError):
+                    layer_name = None
+        if layer_name is not None and (
+            attn_metadata.max_query_len <= 1 or is_spec_verify_capture
+        ):
+            from vllm.forward_context import get_forward_context
+            from vllm.v1.worker.gpu.spec_decode.causal_cascade import (
+                live_state as causal_cascade_live_state,
+            )
+
+            forward_context = get_forward_context()
+            dflash_input_ids = forward_context.additional_kwargs.get("dflash_input_ids")
+            if dflash_input_ids is not None:
+                dflash_input_ids = dflash_input_ids[:num_actual_toks]
+            req_id_per_token = attn_metadata.req_id_per_token
+            if req_id_per_token is not None:
+                req_id_per_token = req_id_per_token[:num_actual_toks]
+            if causal_cascade_live_state.get_causal_cascade_live_state() is not None:
+                causal_cascade_live_state.capture_causal_cascade_sparse_mla_layer(
+                    str(layer_name),
+                    kv_c_and_k_pe_cache,
+                    selected_indices,
+                    logical_topk_indices,
+                    nsa_cache_seqlens,
+                    per_token_cache,
+                    req_id_per_token,
+                    dflash_input_ids,
+                    num_actual_toks,
+                )
 
         # KV cache -> paged rank-3 uint8. B12X unified SM120 kernels consume
         # flat slot ids in selected_indices, but compute raw byte offsets as:

@@ -627,6 +627,14 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_causal_cascade():
+                from vllm.v1.worker.gpu.spec_decode import init_speculator
+
+                self.drafter = init_speculator(  # type: ignore[assignment]
+                    self.vllm_config,
+                    self.device,
+                )
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -4413,6 +4421,23 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_causal_cascade()
+                and cudagraph_mode != CUDAGraphMode.FULL
+                and isinstance(model_output, tuple)
+            ):
+                aux_hidden_states_for_capture = model_output[1]
+                if aux_hidden_states_for_capture:
+                    from vllm.v1.worker.gpu.spec_decode.causal_cascade import (
+                        live_state as causal_cascade_live_state,
+                    )
+
+                    anchor_hidden_state = aux_hidden_states_for_capture[-1]
+                    causal_cascade_live_state.capture_causal_cascade_anchor_hidden_state(
+                        anchor_hidden_state,
+                        num_rows=anchor_hidden_state.shape[0],
+                    )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5094,6 +5119,15 @@ class GPUModelRunner(
                     "aux_hidden_states are required when using `extract_hidden_states`"
                 )
             target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
+            expected_num_hidden_states = self.drafter.num_hidden_states
+            if len(target_hidden_states) + 1 == expected_num_hidden_states:
+                target_hidden_states.append(hidden_states[:num_scheduled_tokens])
+            elif len(target_hidden_states) != expected_num_hidden_states:
+                raise ValueError(
+                    "extract_hidden_states expected "
+                    f"{expected_num_hidden_states} hidden-state tensors, got "
+                    f"{len(target_hidden_states)} aux tensors"
+                )
 
             draft_token_ids = self.drafter.propose(
                 num_speculative_tokens=num_spec_tokens_to_schedule,
@@ -7702,6 +7736,15 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_causal_cascade()
+        ):
+            from vllm.v1.worker.gpu.spec_decode.causal_cascade import (
+                live_state as causal_cascade_live_state,
+            )
+
+            causal_cascade_live_state.register_causal_cascade_kv_caches(kv_caches)
 
         if (
             self.speculative_config

@@ -2155,15 +2155,17 @@ class VllmConfig:
                 "mtp",
                 "dflash",
                 "dspark",
+                "causal_cascade",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
-            # DFlash and DSpark use parallel drafting natively in V2 via their
-            # own speculators.
+            # DFlash, DSpark, and CausalCascade use parallel drafting in their
+            # speculators that draft the whole block in one pass.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method
+                not in ("dflash", "dspark", "causal_cascade")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
@@ -2173,6 +2175,10 @@ class VllmConfig:
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
 
+        # Reasoning parsers are an OpenAI serving-layer feature and are safe to
+        # use with ModelRunnerV2. The unsupported part is per-request reasoning
+        # budget enforcement, which is rejected in the V1 input processor when
+        # a request sets thinking_token_budget.
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 

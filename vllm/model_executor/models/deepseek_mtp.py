@@ -526,6 +526,29 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         return logits
 
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without all-gathering full logits.
+
+        Avoids the per-draft NCCL AllGather inside `compute_logits` by
+        running the local lm_head + argmax + tiny (max_value, max_index)
+        AllReduce. Selects the right MTP layer's shared head based on
+        `spec_step_idx`, mirroring `compute_logits`. Returns full-vocab
+        token ids (the MTP head spans the full target vocab, no remap
+        needed).
+        """
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        if mtp_layer.shared_head.head is None:
+            raise RuntimeError("MTP shared LM head has not been attached")
+        return self.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head,
+            mtp_layer.shared_head(hidden_states),
+        )
+
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
@@ -625,6 +648,19 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Delegate to the inner predictor's vocab-parallel argmax.
+
+        Used by the spec-decode proposer's `_greedy_sample` when
+        `use_local_argmax_reduction=True`, replacing the full-vocab
+        AllGather with an O(2 * tp_size) reduction.
+        """
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (
