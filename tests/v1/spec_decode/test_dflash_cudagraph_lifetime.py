@@ -44,8 +44,7 @@ def test_dflash_retains_backbone_output_during_cudagraph_capture(monkeypatch):
 
     assert len(speculator._captured_backbone_outputs) == 1
     assert (
-        speculator._captured_backbone_outputs[0]
-        is speculator._run_model.return_value
+        speculator._captured_backbone_outputs[0] is speculator._run_model.return_value
     )
 
 
