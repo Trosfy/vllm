@@ -101,6 +101,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.num_cached_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self.num_cached_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
         max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
@@ -303,12 +304,25 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         return model
 
-    def set_num_cached_tokens(self, num_cached_tokens: torch.Tensor) -> None:
+    def set_num_cached_tokens(
+        self,
+        num_cached_tokens: torch.Tensor,
+        num_cached_tokens_np: np.ndarray,
+    ) -> None:
         """Register the runner's per-request-slot cache-restored token counts.
 
         Indexed by req_state_idx; see the buffer comment in __init__.
         """
         self.num_cached_tokens = num_cached_tokens
+        self.num_cached_tokens_np = num_cached_tokens_np
+
+    def _has_unaligned_cached_prefix(self, input_batch: InputBatch) -> bool:
+        req_state_indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
+        cached = self.num_cached_tokens_np[req_state_indices]
+        return any(
+            np.any(cached % block_size != 0)
+            for block_size in self.block_tables.kernel_block_sizes
+        )
 
     def set_attn(
         self,
@@ -489,6 +503,14 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
+        if not dummy_run and self._has_unaligned_cached_prefix(input_batch):
+            logger.warning_once(
+                "DFlash/DSpark drafting is disabled for a batch containing a "
+                "block-unaligned cache-restored prefix because draft KV is "
+                "not available for the restored partial block."
+            )
+            self.draft_tokens[:num_reqs].fill_(-1)
+            return self.draft_tokens[:num_reqs]
         active_num_speculative_steps = self.num_speculative_steps
         if self.dynamic_physical_depth and num_speculative_tokens is not None:
             active_num_speculative_steps = num_speculative_tokens
@@ -584,9 +606,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # after prepare_dflash_inputs because the slot mappings index the
         # unshifted table; in-place is safe because input_block_tables are
         # regathered from the persistent block tables every step. Up to
-        # block_size - 1 restored slots may remain visible when the restored
-        # count is not block-aligned (e.g. a full-prompt cache hit). Skipped
-        # for dummy runs, whose idx_mapping does not reference live requests.
+        # Non-aligned restored prefixes fail closed before this path because a
+        # block-table shift cannot hide the residual partial block. Skipped for
+        # dummy runs, whose idx_mapping does not reference live requests.
         if not dummy_run:
             for gid in self.draft_kv_cache_group_ids:
                 shift_draft_block_tables(
