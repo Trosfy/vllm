@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SinkFullAttentionSpec,
@@ -1598,8 +1599,8 @@ def _make_dsv4_heterogeneous_kv_cache_specs():
         prefix = f"layers.{layer_idx}"
         kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
         kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
-        kv_cache_specs[f"{prefix}.compressor.state_cache"] = (
-            compressor_state_spec(ratio)
+        kv_cache_specs[f"{prefix}.compressor.state_cache"] = compressor_state_spec(
+            ratio
         )
         if ratio == 4:
             kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
@@ -2829,6 +2830,51 @@ def test_unify_kv_cache_spec_page_size_mamba():
         "attn_layer": new_kv_cache_spec(),
     }
     assert kv_cache_utils.unify_kv_cache_spec_page_size(specs) == specs
+
+
+def new_swa_mla_spec(
+    kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+    cache_dtype_str="fp8_ds_mla",
+    sliding_window=128,
+):
+    # DeepSeek-V4 SWA MLA layer: head_size stays semantic (512),
+    # fp8_ds_mla determines the real per-token byte layout.
+    return SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+        kv_quant_mode=kv_quant_mode,
+        cache_dtype_str=cache_dtype_str,
+        sliding_window=sliding_window,
+        model_version="deepseek_v4",
+    )
+
+
+def test_sliding_window_mla_spec_merge_preserves_kv_quant_mode():
+    # DeepSeek-V4 fp8_ds_mla layers must keep kv_quant_mode through merge(),
+    # otherwise the reshape path falls back to the "auto" (unquantized) shape.
+    specs = [new_swa_mla_spec(), new_swa_mla_spec()]
+    merged = SlidingWindowMLASpec.merge(specs)
+    assert merged.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert merged.cache_dtype_str == "fp8_ds_mla"
+
+
+def test_unify_hybrid_preserves_swa_mla_kv_quant_mode():
+    # When the hybrid KV cache manager is disabled, SlidingWindowMLASpec is
+    # converted to MLAAttentionSpec. kv_quant_mode must survive the conversion
+    # so DeepSeek-V4 fp8_ds_mla layers keep the 584-byte layout on reshape.
+    kv_cache_spec = {
+        "full": new_mla_spec(cache_dtype_str="fp8_ds_mla"),
+        "swa_mla": new_swa_mla_spec(),
+        "swa": new_sliding_window_spec(sliding_window=1024),
+    }
+    kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    converted = kv_cache_spec["swa_mla"]
+    assert isinstance(converted, MLAAttentionSpec)
+    assert converted.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert converted.cache_dtype_str == "fp8_ds_mla"
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
