@@ -55,6 +55,9 @@ class DSparkOnlineSTS:
         self.logits_by_state = torch.zeros(
             max_num_reqs, num_steps, dtype=torch.float32, device=device
         )
+        self.proposal_valid_by_state = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
         # EMA counters per (position, logit bin).
         self.bin_trials = torch.zeros(
             num_steps, self.NUM_BINS, dtype=torch.float32, device=device
@@ -86,12 +89,24 @@ class DSparkOnlineSTS:
         )
         self._record_count = 0
 
-    def stage_proposal(self, req_state_indices: torch.Tensor, logits: torch.Tensor):
+    def stage_proposal(
+        self,
+        req_state_indices: torch.Tensor,
+        logits: torch.Tensor,
+        *,
+        valid: bool = True,
+    ) -> None:
         """Remember the raw head logits of the current proposal."""
-        rows = self.logits_by_state[req_state_indices]
-        rows.zero_()
-        rows[:, : logits.shape[1]] = logits
-        self.logits_by_state[req_state_indices] = rows
+        if valid:
+            rows = self.logits_by_state[req_state_indices]
+            rows.zero_()
+            rows[:, : logits.shape[1]] = logits
+            self.logits_by_state[req_state_indices] = rows
+        self.proposal_valid_by_state[req_state_indices] = valid
+
+    def invalidate_all(self) -> None:
+        """Discard proposals whose confidence logits were bypassed or profiled."""
+        self.proposal_valid_by_state.zero_()
 
     def calibrate(
         self, logits: torch.Tensor, out: torch.Tensor | None = None
@@ -114,6 +129,7 @@ class DSparkOnlineSTS:
                 (post-capacity), zero for rows without drafts.
         """
         logits = self.logits_by_state[req_state_indices]
+        proposal_valid = self.proposal_valid_by_state[req_state_indices]
         bin_width = 2 * self.LOGIT_RANGE / self.NUM_BINS
         bin_idx = ((logits + self.LOGIT_RANGE) / bin_width).long()
         bin_idx.clamp_(0, self.NUM_BINS - 1)
@@ -122,16 +138,21 @@ class DSparkOnlineSTS:
         # Position k (0-based) is evaluated iff the k-token prefix before it
         # was accepted and it was inside the verified capacity.
         trial = k < torch.minimum(num_accepted + 1, num_verified).unsqueeze(1)
+        trial.logical_and_(proposal_valid.unsqueeze(1))
         hit = (k < num_accepted.unsqueeze(1)) & trial
 
         # One-hot reduction (deterministic; index_add_ atomics are not).
         onehot = bin_idx.unsqueeze(-1) == self._bins  # [reqs, steps, bins]
-        self.bin_trials.mul_(self.DECAY).add_(
+        # Do not age the calibration state when every row was invalid. Keeping
+        # this as a device scalar avoids a host synchronization on the hot path.
+        decay = 1.0 - trial.any().to(torch.float32) * (1.0 - self.DECAY)
+        self.bin_trials.mul_(decay).add_(
             (trial.unsqueeze(-1) & onehot).sum(0).to(torch.float32)
         )
-        self.bin_hits.mul_(self.DECAY).add_(
+        self.bin_hits.mul_(decay).add_(
             (hit.unsqueeze(-1) & onehot).sum(0).to(torch.float32)
         )
+        self.proposal_valid_by_state[req_state_indices] = False
 
         # Per-position 1D grid search: T_k minimizing trial-weighted ECE of
         # sigmoid(mid_b / T) against the empirical bin acceptance.

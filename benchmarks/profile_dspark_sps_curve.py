@@ -122,6 +122,12 @@ def main() -> None:
     )
     parser.add_argument("--output", help="Write the curve JSON to this file")
     args = parser.parse_args()
+    if args.iters <= 0:
+        parser.error("--iters must be greater than zero")
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.overhead_ms < 0:
+        parser.error("--overhead-ms must be non-negative")
 
     # The timing callable is shipped to the workers via collective_rpc, which
     # requires the pickle fallback. Local profiling tool, trusted input.

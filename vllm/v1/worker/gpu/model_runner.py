@@ -1147,6 +1147,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_req_tokens=max_req_tokens,
             valid_num_draft_tokens_per_req=valid_num_draft_tokens_per_req,
         )
+        # InputBuffers are reused across real, dummy, and captured batches.
+        # Clear stale padding before a capacity manager optionally marks a
+        # subset of active rows as intentionally skipped.
+        self.input_buffers.is_padding[:num_tokens].fill_(False)
         if self.verification_capacity_manager is not None:
             input_batch = self.verification_capacity_manager.trim_batch(input_batch)
         if self.use_dcp:
@@ -1168,10 +1172,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             f"Batch has {num_tokens} tokens after trimming but was dispatched "
             f"for {num_tokens_after_padding}"
         )
-        if self.verification_capacity_manager is None and (
-            envs.VLLM_MOE_SKIP_PADDING or input_batch.num_draft_tokens > 0
-        ):
-            self.input_buffers.is_padding[:num_tokens].fill_(False)
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
@@ -1351,12 +1351,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and verification_capacity_manager.varlen_spec_decode
             and not dummy_run
         ):
+            capacity_was_bypassed = verification_capacity_manager.capacity_bypassed
             apply_verification_capacity = (
                 verification_capacity_manager.should_apply_capacity(
                     num_reqs,
                     scheduler_output.has_structured_output_requests,
                 )
             )
+            if not apply_verification_capacity and not capacity_was_bypassed:
+                online_sts = self.speculator.online_sts if self.speculator else None
+                if online_sts is not None:
+                    # The next high-load verification must not join against a
+                    # proposal whose low-load graph bypassed confidence logits.
+                    online_sts.invalidate_all()
         use_varlen_capacity = (
             verification_capacity_manager is not None
             and verification_capacity_manager.varlen_spec_decode

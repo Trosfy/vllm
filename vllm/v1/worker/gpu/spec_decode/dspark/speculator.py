@@ -111,6 +111,7 @@ class DSparkSpeculator(DFlashSpeculator):
             device=device,
         )
         self._last_num_speculative_steps = self.num_speculative_steps
+        self._last_proposal_confidence_valid = False
         self.min_survival_probability = (
             self.speculative_config.dspark_confidence_threshold
         )
@@ -331,6 +332,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.online_sts.stage_proposal(
                 self.sample_idx_mapping[: num_reqs * n_spec : n_spec],
                 self.draft_token_confidence_logits[:num_reqs, :n_spec],
+                valid=self._last_proposal_confidence_valid,
             )
         return self.draft_token_capacity[:num_reqs]
 
@@ -369,6 +371,16 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> torch.Tensor:
         if self.use_draft_token_capacity:
             self._runtime_num_reqs_for_capacity.fill_(input_batch.num_reqs)
+        self._last_proposal_confidence_valid = bool(
+            self.use_draft_token_capacity
+            and not kwargs.get("is_profile", False)
+            and not kwargs.get("dummy_run", False)
+            and not self._has_unaligned_cached_prefix(input_batch)
+            and (
+                self.capacity_activation_batch_size <= 0
+                or input_batch.num_reqs >= self.capacity_activation_batch_size
+            )
+        )
         self._last_num_speculative_steps = (
             num_speculative_tokens
             if self.dynamic_physical_depth and num_speculative_tokens is not None

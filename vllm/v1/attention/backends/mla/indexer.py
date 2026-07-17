@@ -308,7 +308,17 @@ def _needs_varlen_decode(
     max_decode_len: int,
     max_query_len: int,
 ) -> bool:
-    """Use the compact scorer only when verification is actually ragged."""
+    """Use the compact scorer only when verification is actually ragged.
+
+    Args:
+        use_varlen_decode: Whether the active backend supports varlen decode.
+        all_uniform_width: Whether every request has the same query width.
+        max_decode_len: Largest decode width in the batch.
+        max_query_len: Largest query width in the batch.
+
+    Returns:
+        Whether this batch requires the varlen decode path.
+    """
     return (
         use_varlen_decode
         and not all_uniform_width
@@ -325,7 +335,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        if _supports_varlen_paged_mqa_logits():
+        if _supports_varlen_paged_mqa_logits() and _uses_varlen_dspark_capacity(
+            vllm_config
+        ):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
@@ -378,7 +390,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # SM100 supports the varlen paged MQA logits kernel (indices-selected,
         # next_n == 1 rows). Only compact spec-decode verification batches opt
         # into it; uniform DFlash draft proposal should keep the native path.
-        self.use_varlen = _supports_varlen_paged_mqa_logits()
+        self.use_varlen = (
+            _supports_varlen_paged_mqa_logits()
+            and _uses_varlen_dspark_capacity(self.vllm_config)
+        )
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s use_varlen=%s "
             "(next_n=%d, use_fp4_indexer_cache=%s)",
@@ -512,19 +527,38 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
         """Expand seq_lens/block_table/decode_lens for the decode kernels.
 
-        Flatten path (not use_native, max_decode_len > 1 or force_flatten):
+        The flatten path (not use_native, max_decode_len > 1 or force_flatten)
+        expands each multi-token decode request into individual single-token
+        entries so the kernel always sees next_n=1. ``force_flatten`` keeps the
+        varlen path on the flatten buffers even for all-single-token batches so
+        captured CUDA graphs always read the same tensors at replay.
+
+        The native path (use_native or max_decode_len == 1) preserves plain
+        decode or spec-decode with 2D per-token context lengths.
+
+        Args:
+            seq_lens: Per-request context lengths.
+            block_table: Per-request KV block table.
+            decode_lens: Device tensor with each request's decode width.
+            decode_lens_cpu: CPU mirror of ``decode_lens``.
+            query_start_loc: Cumulative query offsets.
+            num_decodes: Number of decode requests.
+            num_decode_tokens: Total active decode tokens.
+            use_native: Whether the backend accepts the native layout.
+            next_n: Native query width expected by the backend.
+            max_decode_len: Largest decode width in the batch.
+            force_flatten: Whether to preserve the flatten-buffer address even
+                for a uniform single-token batch.
+
+        Returns:
+            A tuple of prepared sequence lengths, block table, decode lengths,
+            effective batch size, and whether kernel-side padding is required.
+
+        Layout details:
           Each multi-token decode request is expanded into individual
           single-token entries so the kernel always sees next_n=1.
-          `force_flatten` keeps the varlen path on the flatten buffers even for
-          all-single-token batches so captured CUDA graphs always read the same
-          tensors at replay.
-
-        Native path (use_native or max_decode_len == 1):
-          Plain decode or spec-decode with 2D per-token context lengths.
-
-        Returns (seq_lens, block_table, decode_lens, batch_size, requires_padding).
-        seq_lens is 1D (batch_size,) for flatten/plain, 2D (B, max_decode_len)
-        for native MTP.
+          ``seq_lens`` is 1D ``(batch_size,)`` for flatten/plain and 2D
+          ``(B, max_decode_len)`` for native MTP.
         """
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native and (max_decode_len > 1 or force_flatten):
@@ -760,6 +794,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         (possibly cudagraph-padded) context_lens rows.
         ``decode_lens`` must be the original per-request counts, read before the
         expansion overwrites the buffer.
+
+        Args:
+            decode_lens: Device tensor with each request's decode width.
+            decode_lens_cpu: CPU mirror of ``decode_lens``.
+            num_decodes: Number of decode requests.
+            num_decode_tokens: Number of flattened decode rows.
+            max_decode_len: Largest decode width in the batch.
+
+        Returns:
+            A persistent tensor mapping each flattened row to its request id.
         """
         indices = self.decode_indices_buffer[:num_decode_tokens]
         if max_decode_len <= 1:

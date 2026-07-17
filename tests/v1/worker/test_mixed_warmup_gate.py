@@ -23,8 +23,8 @@ def test_sps_profile_median_rejects_single_stall():
 
 def test_dspark_dynamic_budget_uses_upper_load_sps_knee():
     curve = [
-        (6, 87.79),
-        (12, 71.18),
+        (6, 200.0),
+        (12, 80.0),
         (24, 67.71),
         (48, 58.52),
         (96, 51.29),

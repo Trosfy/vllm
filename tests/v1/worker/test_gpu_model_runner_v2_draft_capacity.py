@@ -13,7 +13,11 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required for draft capacity tests", allow_module_level=True)
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.models import qwen3_dspark
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.mla import indexer as indexer_module
 from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
     _needs_varlen_decode,
     _uses_varlen_dspark_capacity,
 )
@@ -58,6 +62,36 @@ def test_varlen_indexer_is_limited_to_active_dspark_capacity():
         config(dspark_capacity_verification_mode="mask")
     )
     assert not _uses_varlen_dspark_capacity(config(use_dspark=lambda: False))
+
+
+def test_varlen_indexer_cudagraph_support_requires_capacity_opt_in(monkeypatch):
+    monkeypatch.setattr(
+        indexer_module, "_supports_varlen_paged_mqa_logits", lambda: True
+    )
+
+    def config(*, threshold: float):
+        return SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                use_dspark=lambda: True,
+                dspark_capacity_verification_mode="varlen",
+                dspark_confidence_threshold=threshold,
+                dspark_budget_frac=1.0,
+                dspark_sps_curve=None,
+            )
+        )
+
+    assert (
+        DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(
+            config(threshold=0.0), None
+        )
+        is AttentionCGSupport.UNIFORM_BATCH
+    )
+    assert (
+        DeepseekV32IndexerMetadataBuilder.get_cudagraph_support(
+            config(threshold=0.5), None
+        )
+        is AttentionCGSupport.ALWAYS
+    )
 
 
 def test_varlen_indexer_skips_uniform_full_width_batches():
@@ -371,14 +405,15 @@ def test_online_sts_fits_order_preserving_temperatures():
     slots = torch.tensor([0, 1], dtype=torch.int32, device=device)
     # Head claims p~0.88 everywhere (logit 2.0).
     logits = torch.full((2, 3), 2.0, dtype=torch.float32, device=device)
-    sts.stage_proposal(slots, logits)
     # Alternate outcomes so pos0 accepts 50% (head over-confident there)
     # while pos1/pos2 always accept once reached (head under-confident).
     acc_hi = torch.tensor([3, 3], device=device)
     acc_lo = torch.tensor([0, 0], device=device)
     ver = torch.tensor([3, 3], device=device)
     for _ in range(1000):
+        sts.stage_proposal(slots, logits)
         sts.record(slots, acc_hi, ver)
+        sts.stage_proposal(slots, logits)
         sts.record(slots, acc_lo, ver)
 
     torch.accelerator.synchronize()
@@ -397,6 +432,71 @@ def test_online_sts_fits_order_preserving_temperatures():
     lo = torch.tensor([[0.5, 0.5, 0.5]], dtype=torch.float32, device=device)
     hi = torch.tensor([[3.0, 3.0, 3.0]], dtype=torch.float32, device=device)
     assert (sts.calibrate(hi) > sts.calibrate(lo)).all()
+
+
+def test_online_sts_ignores_invalid_or_consumed_proposals():
+    device = torch.device("cuda")
+    sts = DSparkOnlineSTS(max_num_reqs=2, num_steps=2, device=device)
+    slots = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    logits = torch.ones((2, 2), dtype=torch.float32, device=device)
+    accepted = torch.tensor([2, 1], dtype=torch.int32, device=device)
+    verified = torch.tensor([2, 2], dtype=torch.int32, device=device)
+
+    pristine_trials = sts.bin_trials.clone()
+    pristine_hits = sts.bin_hits.clone()
+    sts.stage_proposal(slots, logits)
+    sts.invalidate_all()
+    sts.record(slots, accepted, verified)
+    sts.stage_proposal(slots, logits, valid=False)
+    sts.record(slots, accepted, verified)
+    torch.accelerator.synchronize()
+    assert torch.equal(sts.bin_trials, pristine_trials)
+    assert torch.equal(sts.bin_hits, pristine_hits)
+
+    sts.stage_proposal(slots, logits)
+    sts.record(slots, accepted, verified)
+    recorded_trials = sts.bin_trials.clone()
+    recorded_hits = sts.bin_hits.clone()
+    sts.record(slots, accepted, verified)
+    torch.accelerator.synchronize()
+    assert torch.equal(sts.bin_trials, recorded_trials)
+    assert torch.equal(sts.bin_hits, recorded_hits)
+
+
+def test_qwen_dspark_confidence_head_honors_markov_mode(monkeypatch):
+    class CapturingLinear(torch.nn.Module):
+        def __init__(self, input_size: int, output_size: int, **_kwargs):
+            super().__init__()
+            self.input_size = input_size
+            self.output_size = output_size
+            self.last_input: torch.Tensor | None = None
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            assert value.shape[-1] == self.input_size
+            self.last_input = value
+            return value[..., : self.output_size]
+
+    monkeypatch.setattr(qwen3_dspark, "ReplicatedLinear", CapturingLinear)
+    hidden = torch.randn(2, 4)
+    markov = torch.randn(2, 3)
+
+    plain = qwen3_dspark.DSparkConfidenceHead(4, prefix="plain", include_markov=False)
+    plain(hidden, markov)
+    assert isinstance(plain.proj, CapturingLinear)
+    assert plain.proj.last_input is not None
+    assert plain.proj.last_input.shape == (2, 4)
+    assert torch.equal(plain.proj.last_input, hidden.float())
+
+    with_markov = qwen3_dspark.DSparkConfidenceHead(
+        7, prefix="markov", include_markov=True
+    )
+    with_markov(hidden, markov)
+    assert isinstance(with_markov.proj, CapturingLinear)
+    assert with_markov.proj.last_input is not None
+    assert with_markov.proj.last_input.shape == (2, 7)
+    assert torch.equal(
+        with_markov.proj.last_input, torch.cat([hidden, markov], dim=-1).float()
+    )
 
 
 def test_capacity_based_verification_manager_updates_cpu_capacities():

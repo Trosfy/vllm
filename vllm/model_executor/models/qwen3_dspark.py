@@ -78,8 +78,15 @@ class DSparkConfidenceHead(nn.Module):
     bias).
     """
 
-    def __init__(self, input_dim: int, prefix: str, bias: bool = False) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        prefix: str,
+        bias: bool = False,
+        include_markov: bool = True,
+    ) -> None:
         super().__init__()
+        self.include_markov = include_markov
         self.proj = ReplicatedLinear(
             input_dim,
             1,
@@ -90,7 +97,9 @@ class DSparkConfidenceHead(nn.Module):
         )
 
     def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([hidden, markov_embed], dim=-1).float()
+        x = (
+            torch.cat([hidden, markov_embed], dim=-1) if self.include_markov else hidden
+        ).float()
         return self.proj(x).squeeze(-1)
 
 
@@ -119,13 +128,15 @@ class Qwen3DSparkModel(DFlashQwen3Model):
         )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", False):
+            include_markov = getattr(config, "confidence_head_with_markov", False)
             input_dim = config.hidden_size
-            if getattr(config, "confidence_head_with_markov", False):
+            if include_markov:
                 input_dim += config.markov_rank
             self.confidence_head = DSparkConfidenceHead(
                 input_dim,
                 prefix=maybe_prefix(prefix, "confidence_head"),
                 bias=True,
+                include_markov=include_markov,
             )
 
 
