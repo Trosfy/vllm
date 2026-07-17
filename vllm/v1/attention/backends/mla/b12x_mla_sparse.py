@@ -2027,23 +2027,15 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             # which shows up as small-context-only garbage.
             assert attn_metadata.global_cache_seq_lens_per_req is not None
             g_num_reqs = attn_metadata.num_reqs
-            g_qsl = attn_metadata.query_start_loc[: g_num_reqs + 1].to(
-                torch.int32
-            )
-            g_req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(
-                torch.int64
-            )
+            g_qsl = attn_metadata.query_start_loc[: g_num_reqs + 1].to(torch.int32)
+            g_req_ids = attn_metadata.req_id_per_token[:num_actual_toks].to(torch.int64)
             g_chunk_start = g_qsl[:-1][g_req_ids]
             g_chunk_len = (g_qsl[1:] - g_qsl[:-1])[g_req_ids]
-            g_full_seq = attn_metadata.global_cache_seq_lens_per_req[
-                g_req_ids
-            ].to(torch.int32)
-            g_t = torch.arange(
-                num_actual_toks, device=self.device, dtype=torch.int32
+            g_full_seq = attn_metadata.global_cache_seq_lens_per_req[g_req_ids].to(
+                torch.int32
             )
-            global_causal_len = (
-                g_full_seq - g_chunk_len + (g_t - g_chunk_start) + 1
-            )
+            g_t = torch.arange(num_actual_toks, device=self.device, dtype=torch.int32)
+            global_causal_len = g_full_seq - g_chunk_len + (g_t - g_chunk_start) + 1
             torch.minimum(
                 nsa_cache_seqlens,
                 global_causal_len,
