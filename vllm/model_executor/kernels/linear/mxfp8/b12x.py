@@ -137,6 +137,7 @@ def _apply_b12x_mxfp8_packed_linear(
         bias=bias,
         expected_m=_b12x_mxfp8_expected_m(int(input_2d.shape[0])),
         stream=current_stream().cuda_stream,
+        tail_padding_bytes=int(getattr(layer, "output_tail_padding_bytes", 0)),
     )
     return output.view(*output_shape)
 

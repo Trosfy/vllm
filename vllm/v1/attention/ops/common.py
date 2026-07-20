@@ -231,6 +231,7 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    tail_pad_output: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -240,6 +241,10 @@ def cp_lse_ag_out_rs(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
     out = cp_group.reduce_scatter(out, dim=1)
+    if tail_pad_output:
+        from vllm.utils.cublas import ensure_cublas_tail_padding
+
+        out = ensure_cublas_tail_padding(out)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

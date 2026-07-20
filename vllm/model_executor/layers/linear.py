@@ -227,6 +227,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        tail_padding_bytes = int(getattr(layer, "output_tail_padding_bytes", 0))
+        if tail_padding_bytes > 0 and bias is None:
+            return torch.ops.vllm.tail_padded_unquantized_gemm(
+                x,
+                layer.weight,
+                tail_padding_bytes,
+            )
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)

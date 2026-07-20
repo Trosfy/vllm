@@ -304,9 +304,12 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
         stream: object = None,
+        tail_padding_bytes: int = 0,
     ) -> torch.Tensor:
         del stream
-        calls.append((source, packed_weight, bias, expected_m))
+        calls.append(
+            (source, packed_weight, bias, expected_m, tail_padding_bytes)
+        )
         return source.new_full((source.shape[0], packed_weight.out_features), 3.0)
 
     monkeypatch.setattr(
@@ -318,6 +321,7 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
     layer = torch.nn.Module()
     packed = types.SimpleNamespace(out_features=48)
     layer.b12x_mxfp8_packed_weight = packed
+    layer.output_tail_padding_bytes = 64 * 1024
     x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
     bias = torch.empty((48,), dtype=torch.bfloat16)
     kernel = object.__new__(B12xMxfp8LinearKernel)
@@ -327,11 +331,12 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
     assert output.shape == (2, 3, 48)
     assert output.dtype == x.dtype
     assert len(calls) == 1
-    source, called_packed, called_bias, expected_m = calls[0]
+    source, called_packed, called_bias, expected_m, tail_padding_bytes = calls[0]
     assert source.shape == (6, 128)
     assert called_packed is packed
     assert called_bias is bias
     assert expected_m == 6
+    assert tail_padding_bytes == 64 * 1024
 
 
 def test_b12x_mxfp8_compile_path_uses_forward_context_custom_op(
@@ -384,9 +389,12 @@ def test_b12x_mxfp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
         stream: object = None,
+        tail_padding_bytes: int = 0,
     ) -> torch.Tensor:
         del stream
-        calls.append((source, packed_weight, bias, expected_m))
+        calls.append(
+            (source, packed_weight, bias, expected_m, tail_padding_bytes)
+        )
         return source.new_full((source.shape[0], packed_weight.out_features), 11.0)
 
     monkeypatch.setattr(
@@ -399,6 +407,7 @@ def test_b12x_mxfp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
     layer.prefix = "model.layers.2.mlp.down_proj"
     packed = types.SimpleNamespace(out_features=16)
     layer.b12x_mxfp8_packed_weight = packed
+    layer.output_tail_padding_bytes = 64 * 1024
     x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
     bias = torch.empty((16,), dtype=torch.bfloat16)
     vllm_config = VllmConfig()
@@ -409,11 +418,12 @@ def test_b12x_mxfp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
 
     assert output.shape == (2, 3, 16)
     assert len(calls) == 1
-    source, called_packed, called_bias, expected_m = calls[0]
+    source, called_packed, called_bias, expected_m, tail_padding_bytes = calls[0]
     assert source.shape == (6, 128)
     assert called_packed is packed
     assert called_bias is bias
     assert expected_m == 6
+    assert tail_padding_bytes == 64 * 1024
     torch.testing.assert_close(output, torch.full_like(output, 11.0))
 
 

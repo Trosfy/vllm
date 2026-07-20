@@ -976,9 +976,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        self.force_contiguous_mla_bmm_input = True
-        self.force_contiguous_mla_bmm_weight = True
-        self.force_contiguous_mla_bmm_output = True
+        # SM120 cuBLAS strided BMM may read one tile beyond a logical operand.
+        # Producers use this contract to keep that bounded access mapped without
+        # adding per-step layout copies.
+        self.mla_bmm_tail_padding_bytes = 64 * 1024
 
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose

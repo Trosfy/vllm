@@ -11,6 +11,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.utils.cublas import tail_padded_empty
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -96,6 +97,43 @@ def default_unquantized_gemm(
     bias: torch.Tensor | None = None,
 ):
     return torch.nn.functional.linear(x, weight, bias)
+
+
+def tail_padded_unquantized_gemm_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    tail_padding_bytes: int,
+) -> torch.Tensor:
+    """Run an unbiased linear directly into storage with a mapped tail."""
+    output_shape = (*x.shape[:-1], weight.shape[0])
+    output = tail_padded_empty(
+        output_shape,
+        device=x.device,
+        dtype=x.dtype,
+        tail_padding_bytes=tail_padding_bytes,
+    )
+    torch.mm(
+        x.reshape(-1, x.shape[-1]),
+        weight.t(),
+        out=output.view(-1, weight.shape[0]),
+    )
+    return output
+
+
+def tail_padded_unquantized_gemm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    tail_padding_bytes: int,
+) -> torch.Tensor:
+    del tail_padding_bytes
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="tail_padded_unquantized_gemm",
+    op_func=tail_padded_unquantized_gemm_impl,
+    fake_impl=tail_padded_unquantized_gemm_fake,
+)
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):

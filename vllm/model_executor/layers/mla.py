@@ -217,6 +217,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
             topk_indices_buffer=mla_modules.topk_indices_buffer,
         )
+        q_projection = self.q_b_proj if self.q_b_proj is not None else self.q_proj
+        if q_projection is not None and self.mla_attn.mla_bmm_tail_padding_bytes:
+            q_projection.output_tail_padding_bytes = (
+                self.mla_attn.mla_bmm_tail_padding_bytes
+            )
 
         # The deployed NVFP4 writer accepts a scale tensor but discards it and
         # quantizes with outer scale 1.0.  Feeding x/s_l is exactly the missing

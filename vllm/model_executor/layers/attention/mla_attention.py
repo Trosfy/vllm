@@ -243,6 +243,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+from vllm.utils.cublas import ensure_cublas_tail_padding
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import (
@@ -604,6 +605,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.mla_bmm_tail_padding_bytes = int(
+            getattr(self.impl, "mla_bmm_tail_padding_bytes", 0)
+        )
+        if self.mla_bmm_tail_padding_bytes < 0:
+            raise ValueError("mla_bmm_tail_padding_bytes must be non-negative")
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -966,6 +972,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.impl.dcp_world_size = get_dcp_group().world_size
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
+        bmm_tail_padding_bytes = getattr(self, "mla_bmm_tail_padding_bytes", 0)
 
         num_actual_toks = attn_metadata.num_actual_tokens
 
@@ -1088,6 +1095,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
                 _, _, L = self.W_UK_T.shape
+
+                if bmm_tail_padding_bytes:
+                    mqa_q_nope = ensure_cublas_tail_padding(
+                        mqa_q_nope,
+                        bmm_tail_padding_bytes,
+                    )
 
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
@@ -1300,6 +1313,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         use_b12x=dcp_use_b12x,
                         b12x_max_batch_size=self.dcp_max_batch_size,
                         b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
+                        tail_pad_output=(
+                            bmm_tail_padding_bytes > 0 and not project_before_merge
+                        ),
                     )
                 else:
                     if project_before_merge:
@@ -1332,6 +1348,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             lse,
                             get_dcp_group(),
                             is_lse_base_on_e=self.impl.lse_base_on_e,
+                            tail_pad_output=(
+                                bmm_tail_padding_bytes > 0
+                                and not project_before_merge
+                            ),
                         )
 
             if project_before_merge:
@@ -1599,6 +1619,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
+            bmm_tail_padding_bytes = getattr(self, "mla_bmm_tail_padding_bytes", 0)
+            if bmm_tail_padding_bytes:
+                x = ensure_cublas_tail_padding(
+                    x,
+                    bmm_tail_padding_bytes,
+                )
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
     def _v_up_proj_bmm(

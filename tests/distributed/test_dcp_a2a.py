@@ -344,6 +344,7 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
         is_lse_base_on_e,
         max_batch_size,
         query_head_dim,
+        tail_pad_output,
     ):
         captured.update(
             output=cp_attn_out,
@@ -353,6 +354,7 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
             is_lse_base_on_e=is_lse_base_on_e,
             max_batch_size=max_batch_size,
             query_head_dim=query_head_dim,
+            tail_pad_output=tail_pad_output,
         )
         return expected
 
@@ -375,7 +377,57 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
         "is_lse_base_on_e": True,
         "max_batch_size": 8192,
         "query_head_dim": None,
+        "tail_pad_output": False,
     }
+
+
+def test_cublas_tail_padding_preserves_values_and_storage_contract():
+    from vllm.utils.cublas import ensure_cublas_tail_padding, storage_tail_bytes
+
+    source = torch.arange(6 * 8 * 16, dtype=torch.bfloat16).view(6, 8, 16)
+    padded = ensure_cublas_tail_padding(source)
+
+    assert padded.shape == source.shape
+    assert padded.stride() == source.stride()
+    assert padded.data_ptr() != source.data_ptr()
+    assert storage_tail_bytes(padded) >= 64 * 1024
+    torch.testing.assert_close(padded, source)
+
+    reused = ensure_cublas_tail_padding(padded)
+    assert reused.data_ptr() == padded.data_ptr()
+
+
+def test_ag_rs_can_tail_pad_output_for_mla_bmm(monkeypatch: pytest.MonkeyPatch):
+    from vllm.utils.cublas import storage_tail_bytes
+    from vllm.v1.attention.ops import common
+
+    partial = torch.arange(2 * 4 * 8, dtype=torch.bfloat16).view(2, 4, 8)
+    lse = torch.zeros(2, 4, dtype=torch.float32)
+    reduced = partial[:, :2].clone()
+
+    class _Group:
+        world_size = 2
+
+        @staticmethod
+        def reduce_scatter(value, dim):
+            assert dim == 1
+            return reduced
+
+    monkeypatch.setattr(
+        common,
+        "_cp_lse_common",
+        lambda *args, **kwargs: (partial, lse),
+    )
+    actual = common.cp_lse_ag_out_rs(
+        partial,
+        lse,
+        _Group(),  # type: ignore[arg-type]
+        tail_pad_output=True,
+    )
+
+    torch.testing.assert_close(actual, reduced)
+    assert actual.data_ptr() != reduced.data_ptr()
+    assert storage_tail_bytes(actual) >= 64 * 1024
 
 
 def test_packed_a2a_capture_buffers_stay_live_per_shape(
@@ -427,9 +479,7 @@ def test_packed_a2a_prewarm_buffers_are_retained_before_cuda_capture(
     dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
     monkeypatch.setattr(torch, "empty", fake_empty)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        dcp_alltoall, "is_vllm_cudagraph_capture_active", lambda: True
-    )
+    monkeypatch.setattr(dcp_alltoall, "is_vllm_cudagraph_capture_active", lambda: True)
     device = torch.device("cuda:0")
 
     prewarm = dcp_alltoall._dcp_a2a_send_recv_buffers(
@@ -460,9 +510,7 @@ def test_packed_a2a_eager_buffers_are_not_retained(
     dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
     monkeypatch.setattr(torch, "empty", fake_empty)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        dcp_alltoall, "is_vllm_cudagraph_capture_active", lambda: False
-    )
+    monkeypatch.setattr(dcp_alltoall, "is_vllm_cudagraph_capture_active", lambda: False)
     device = torch.device("cuda:0")
 
     first = dcp_alltoall._dcp_a2a_send_recv_buffers(
@@ -850,16 +898,16 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_lse_reduce_makes_views_contiguous(monkeypatch: pytest.MonkeyPatch):
     """Head-sliced attention views must reach the PCIe pool contiguous."""
+    from vllm.utils.cublas import storage_tail_bytes
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
     received: dict[str, Any] = {}
-    sentinel = torch.zeros(1)
 
     class _FakePool:
-        def lse_reduce_scatter(self, out, lse, *, is_lse_base_on_e):
-            received.update(out=out, lse=lse)
-            return sentinel
+        def lse_reduce_scatter(self, partial_out, lse, out=None, *, is_lse_base_on_e):
+            received.update(partial_out=partial_out, lse=lse, output=out)
+            return out
 
     monkeypatch.setattr(
         dcp_alltoall,
@@ -884,10 +932,13 @@ def test_b12x_lse_reduce_makes_views_contiguous(monkeypatch: pytest.MonkeyPatch)
         is_lse_base_on_e=True,
         max_batch_size=8192,
         query_head_dim=64,
+        tail_pad_output=True,
     )
-    assert result is sentinel
-    assert received["out"].is_contiguous()
+    assert result is received["output"]
+    assert received["partial_out"].is_contiguous()
     assert received["lse"].is_contiguous()
+    assert result is not None
+    assert storage_tail_bytes(result) >= 64 * 1024
 
 
 def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
@@ -946,12 +997,15 @@ class TestPackedA2AKernels:
     @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16", "float32"])
     @pytest.mark.parametrize("return_lse", [False, True])
     @pytest.mark.parametrize("is_lse_base_on_e", [False, True])
+    @pytest.mark.parametrize("tail_pad_output", [False, True])
     def test_pack_unpack_combine_matches_reference(
         self,
         dtype_name: str,
         return_lse: bool,
         is_lse_base_on_e: bool,
+        tail_pad_output: bool,
     ):
+        from vllm.utils.cublas import storage_tail_bytes
         from vllm.v1.attention.ops.dcp_alltoall import (
             _dcp_a2a_lse_pack_dim,
             _dcp_a2a_pack_send,
@@ -982,7 +1036,12 @@ class TestPackedA2AKernels:
             lse_pack_dim,
         )
         actual = _dcp_a2a_unpack_combine(
-            send_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
+            send_buffer,
+            D,
+            lse_pack_dim,
+            return_lse,
+            is_lse_base_on_e,
+            tail_pad_output,
         )
         expected_out, expected_lse = _packed_a2a_reference(
             cp_attn_out, cp_attn_lse, world_size, h_per_rank, is_lse_base_on_e
@@ -993,7 +1052,10 @@ class TestPackedA2AKernels:
             _assert_packed_a2a_close(actual_out, expected_out, dtype)
             torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
         else:
+            actual_out = actual
             _assert_packed_a2a_close(actual, expected_out, dtype)
+        if tail_pad_output:
+            assert storage_tail_bytes(actual_out) >= 64 * 1024
 
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
