@@ -1313,8 +1313,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         use_b12x=dcp_use_b12x,
                         b12x_max_batch_size=self.dcp_max_batch_size,
                         b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
-                        tail_pad_output=(
-                            bmm_tail_padding_bytes > 0 and not project_before_merge
+                        output_tail_padding_bytes=(
+                            bmm_tail_padding_bytes if not project_before_merge else 0
                         ),
                     )
                 else:
@@ -1348,9 +1348,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             lse,
                             get_dcp_group(),
                             is_lse_base_on_e=self.impl.lse_base_on_e,
-                            tail_pad_output=(
-                                bmm_tail_padding_bytes > 0
-                                and not project_before_merge
+                            output_tail_padding_bytes=(
+                                bmm_tail_padding_bytes
+                                if not project_before_merge
+                                else 0
                             ),
                         )
 

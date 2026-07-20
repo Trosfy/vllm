@@ -979,7 +979,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # SM120 cuBLAS strided BMM may read one tile beyond a logical operand.
         # Producers use this contract to keep that bounded access mapped without
         # adding per-step layout copies.
-        self.mla_bmm_tail_padding_bytes = 64 * 1024
+        from vllm.utils.cublas import CUBLAS_BMM_TAIL_PADDING_BYTES
+
+        self.mla_bmm_tail_padding_bytes = CUBLAS_BMM_TAIL_PADDING_BYTES
 
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose

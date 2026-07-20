@@ -30,10 +30,7 @@ import torch.distributed as dist
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.utils.cublas import (
-    CUBLAS_BMM_TAIL_PADDING_BYTES,
-    tail_padded_empty,
-)
+from vllm.utils.cublas import tail_padded_empty
 from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
 
 if TYPE_CHECKING:
@@ -224,7 +221,7 @@ def _try_b12x_dcp_lse_reduce(
     is_lse_base_on_e: bool,
     max_batch_size: int | None,
     query_head_dim: int | None,
-    tail_pad_output: bool = False,
+    output_tail_padding_bytes: int = 0,
 ) -> torch.Tensor | None:
     """Use the low-latency B12X PCIe path when its contract is satisfied."""
     world_size = cp_group.world_size
@@ -292,15 +289,15 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse = cp_attn_lse.contiguous()
 
     output = None
-    if tail_pad_output:
+    if output_tail_padding_bytes:
         # The GLM MLA V up-projection uses a strided cuBLAS BMM whose SM120
-        # kernel reads ahead by up to 64 KiB. Write the collective result
-        # directly into storage that keeps this bounded read mapped.
+        # kernel reads ahead beyond the logical operand. Write the collective
+        # result directly into storage that keeps this bounded read mapped.
         output = tail_padded_empty(
             (batch, total_heads // world_size, head_dim),
             device=cp_attn_out.device,
             dtype=cp_attn_out.dtype,
-            tail_padding_bytes=CUBLAS_BMM_TAIL_PADDING_BYTES,
+            tail_padding_bytes=output_tail_padding_bytes,
         )
     if output is None:
         return pool.lse_reduce_scatter(
@@ -873,16 +870,16 @@ def _dcp_a2a_unpack_combine(
     lse_pack_dim: int,
     return_lse: bool,
     is_lse_base_on_e: bool,
-    tail_pad_output: bool = False,
+    output_tail_padding_bytes: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     world_size, num_tokens, h_per_rank, _ = recv_buffer.shape
     output_shape = (num_tokens, h_per_rank, head_dim)
-    if tail_pad_output:
+    if output_tail_padding_bytes:
         out = tail_padded_empty(
             output_shape,
             device=recv_buffer.device,
             dtype=recv_buffer.dtype,
-            tail_padding_bytes=CUBLAS_BMM_TAIL_PADDING_BYTES,
+            tail_padding_bytes=output_tail_padding_bytes,
         )
     else:
         out = torch.empty(
@@ -930,7 +927,7 @@ def dcp_a2a_lse_reduce(
     use_b12x: bool = False,
     b12x_max_batch_size: int | None = None,
     b12x_query_head_dim: int | None = None,
-    tail_pad_output: bool = False,
+    output_tail_padding_bytes: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -948,7 +945,8 @@ def dcp_a2a_lse_reduce(
         use_b12x: Try the low-latency B12X PCIe path before NCCL A2A
         b12x_max_batch_size: Configured token capacity for B12X staging
         b12x_query_head_dim: Query width when it differs from output width
-        tail_pad_output: Keep a mapped 64 KiB tail for a following cuBLAS BMM
+        output_tail_padding_bytes: Mapped storage required after the result for
+            a following cuBLAS BMM
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -970,7 +968,7 @@ def dcp_a2a_lse_reduce(
             is_lse_base_on_e=is_lse_base_on_e,
             max_batch_size=b12x_max_batch_size,
             query_head_dim=b12x_query_head_dim,
-            tail_pad_output=tail_pad_output,
+            output_tail_padding_bytes=output_tail_padding_bytes,
         )
         if b12x_result is not None:
             return b12x_result
@@ -1015,5 +1013,5 @@ def dcp_a2a_lse_reduce(
         lse_pack_dim,
         return_lse,
         is_lse_base_on_e,
-        tail_pad_output,
+        output_tail_padding_bytes,
     )

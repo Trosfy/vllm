@@ -35,7 +35,8 @@ def storage_tail_bytes(tensor: torch.Tensor) -> int:
         if any(stride < 0 for stride in tensor.stride()):
             return 0
         last_item = tensor.storage_offset() + sum(
-            (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
         )
         end = (last_item + 1) * tensor.element_size()
     return max(0, tensor.untyped_storage().nbytes() - end)
