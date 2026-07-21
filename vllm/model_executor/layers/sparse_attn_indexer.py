@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import os
+from typing import cast
 
 import torch
 
@@ -11,6 +12,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import (
+    GroupCoordinator,
     get_indexer_dcp_group,
     get_indexer_query_split_group,
     get_tp_group,
@@ -1936,17 +1938,18 @@ def sparse_attn_indexer(
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
                 if qs_active and not used_owner_merge:
-                    gathered_indices = qs_group.all_gather(
+                    active_qs_group = cast(GroupCoordinator, qs_group)
+                    gathered_indices = active_qs_group.all_gather(
                         topk_indices.contiguous(), dim=0
                     )
                     topk_indices_buffer[
                         chunk.token_start : chunk.token_end, :topk_tokens
                     ].copy_(gathered_indices)
                     if topk_scores is not None:
-                        gathered_scores = qs_group.all_gather(
+                        gathered_scores = active_qs_group.all_gather(
                             topk_scores.contiguous(), dim=0
                         )
-                        topk_scores_buffer[
+                        cast(torch.Tensor, topk_scores_buffer)[
                             chunk.token_start : chunk.token_end, :topk_tokens
                         ].copy_(gathered_scores)
                 continue
