@@ -301,7 +301,16 @@ def _materialize_kv_b_proj_weight(
     out_dtype: torch.dtype,
     fallback_device: torch.device | None,
 ) -> torch.Tensor:
-    """Return kv_b_proj weights, including after source storage was released."""
+    """Materialize ``kv_b_proj`` after initial loading or a reload.
+
+    Args:
+        layer: The projection layer whose weight is needed.
+        out_dtype: Data type for the materialized weight.
+        fallback_device: Device used when only a regenerated pack remains.
+
+    Returns:
+        The projection weight in ``[out_features, in_features]`` layout.
+    """
     source_names = ("weight", "qweight", "weight_packed")
     if any(
         isinstance(getattr(layer, name, None), torch.Tensor) for name in source_names
@@ -322,7 +331,14 @@ def _materialize_kv_b_proj_weight(
 
 
 def _release_b12x_mxfp8_kv_b_proj(layer: torch.nn.Module) -> bool:
-    """Drop source tensors after B12X has produced the absorbed MLA pair."""
+    """Release B12X MXFP8 source storage after MLA absorption.
+
+    Args:
+        layer: The absorbed ``kv_b_proj`` layer.
+
+    Returns:
+        Whether B12X-owned source storage was released.
+    """
     if getattr(layer, "b12x_mxfp8_packed_weight", None) is None:
         return False
 
