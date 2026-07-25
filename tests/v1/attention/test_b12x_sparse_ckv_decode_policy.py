@@ -44,9 +44,18 @@ def _layout(
     )
 
 
-@pytest.mark.parametrize(("record_bytes", "kv_fp8_rope"), [(368, True), (432, False)])
-def test_sparse_decode_supports_native_nvfp4_record_formats(record_bytes, kv_fp8_rope):
-    assert _sparse_decode_supports_format("nvfp4_ds_mla", record_bytes, kv_fp8_rope)
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "record_bytes", "kv_fp8_rope"),
+    [
+        ("nvfp4_ds_mla", 368, True),
+        ("nvfp4_ds_mla", 432, False),
+        ("fp8_ds_mla", 656, False),
+    ],
+)
+def test_sparse_decode_supports_native_record_formats(
+    kv_cache_dtype, record_bytes, kv_fp8_rope
+):
+    assert _sparse_decode_supports_format(kv_cache_dtype, record_bytes, kv_fp8_rope)
 
 
 @pytest.mark.parametrize(
@@ -56,7 +65,8 @@ def test_sparse_decode_supports_native_nvfp4_record_formats(record_bytes, kv_fp8
         ("nvfp4_ds_mla", 432, True),
         ("nvfp4_ds_mla", 304, False),
         ("nvfp4_ds_mla", 656, False),
-        ("fp8_ds_mla", 656, False),
+        ("fp8_ds_mla", 656, True),
+        ("fp8_ds_mla", 432, False),
     ],
 )
 def test_sparse_decode_rejects_unsupported_record_formats(
@@ -585,7 +595,7 @@ def test_selected_record_transport_rejects_unknown_mode(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("record_bytes", [368, 432])
+@pytest.mark.parametrize("record_bytes", [368, 432, 656])
 @pytest.mark.parametrize("dcp", [2, 3, 4, 5, 6, 7, 8])
 def test_sparse_decode_layout_supports_dcp_two_through_eight(dcp, record_bytes):
     layout = _layout(dcp=dcp, record_bytes=record_bytes)

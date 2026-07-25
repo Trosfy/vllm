@@ -296,8 +296,14 @@ def test_sparse_decode_current_token_patch_uses_compact_writer(
     assert actual_scale is k_scale
 
 
-def test_sparse_decode_current_token_patch_preserves_stock_432_writer(
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "record_bytes"),
+    [("nvfp4_ds_mla", 432), ("fp8_ds_mla", 656)],
+)
+def test_sparse_decode_current_token_patch_preserves_stock_writer(
     monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str,
+    record_bytes: int,
 ):
     stock_calls = []
 
@@ -316,11 +322,11 @@ def test_sparse_decode_current_token_patch_preserves_stock_432_writer(
     monkeypatch.setattr(ops, "concat_and_cache_mla", stock_writer)
     impl = object.__new__(B12xMLASparseImpl)
     impl._kv_fp8_rope = False
-    impl.kv_cache_dtype = "nvfp4_ds_mla"
+    impl.kv_cache_dtype = kv_cache_dtype
     impl._ckv_current_chunk_kv_c = torch.zeros((1, 512), dtype=torch.bfloat16)
     impl._ckv_current_chunk_kpe = torch.zeros((1, 1, 64), dtype=torch.bfloat16)
 
-    gathered_cache = torch.empty((1, 1, 432), dtype=torch.uint8)
+    gathered_cache = torch.empty((1, 1, record_bytes), dtype=torch.uint8)
     patch_slots = torch.empty(1, dtype=torch.int64)
     k_scale = torch.tensor(0.25)
     impl._append_current_token_to_sparse_decode_gathered(
@@ -340,7 +346,7 @@ def test_sparse_decode_current_token_patch_preserves_stock_432_writer(
     assert actual_k_pe.shape == (1, 64)
     assert actual_cache is gathered_cache
     assert torch.equal(actual_slots, torch.tensor([7]))
-    assert actual_dtype == "nvfp4_ds_mla"
+    assert actual_dtype == kv_cache_dtype
     assert actual_scale is k_scale
 
 

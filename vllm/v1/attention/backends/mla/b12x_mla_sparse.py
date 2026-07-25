@@ -153,10 +153,12 @@ def _ckv_prefetch_supports_format(kv_cache_dtype: str) -> bool:
 def _sparse_decode_supports_format(
     kv_cache_dtype: str, record_bytes: int, kv_fp8_rope: bool
 ) -> bool:
-    if kv_cache_dtype != "nvfp4_ds_mla":
-        return False
-    expected_record_bytes = 368 if kv_fp8_rope else 432
-    return int(record_bytes) == expected_record_bytes
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        expected_record_bytes = 368 if kv_fp8_rope else 432
+        return int(record_bytes) == expected_record_bytes
+    if kv_cache_dtype == "fp8_ds_mla":
+        return not kv_fp8_rope and int(record_bytes) == 656
+    return False
 
 
 def _ckv_prefetch_ring_slots(depth: int) -> int:
