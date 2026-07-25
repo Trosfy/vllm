@@ -344,7 +344,7 @@ class _CKVPrefetchState:
         self,
         workspace_identity: _CKVWorkspaceIdentity,
         workspace: torch.Tensor,
-        workspace_pool: _CKVPrefetchWorkspacePool,
+        workspace_pool: _CKVPrefetchWorkspacePool | None,
     ) -> None:
         self.workspace_identity = workspace_identity
         self.workspace_storage_ref = weakref.ref(workspace.untyped_storage())
@@ -444,6 +444,8 @@ class _CKVPrefetchState:
         return self.gather_stream
 
     def get_ckv_workspace(self, nbytes: int) -> torch.Tensor:
+        if self.workspace_pool is None:
+            raise RuntimeError("CKV prefill gather has no persistent workspace pool")
         if nbytes != self.workspace_pool.slot_nbytes:
             raise ValueError(
                 "CKV workspace size changed after the persistent pool was "
@@ -469,6 +471,8 @@ class _CKVPrefetchState:
         self.pending_layers.clear()
         self.last_layer_idx = None
         if self.ckv_workspace_slot is not None:
+            if self.workspace_pool is None:
+                raise RuntimeError("leased CKV workspace lost its owning pool")
             self.workspace_pool.release(self.ckv_workspace_slot)
             self.ckv_workspace_slot = None
             self.ckv_workspace = None
@@ -522,8 +526,6 @@ class _CKVPrefetchStateRegistry:
         self._prune_released_workspaces()
         if workspace_pool is not None:
             self._bind_workspace_pool(workspace_pool)
-        if self.workspace_pool is None:
-            raise RuntimeError("CKV prefetch registry has no persistent workspace pool")
         identity = _ckv_workspace_identity(workspace)
         state = self.states.get(identity)
         if state is None:
@@ -547,6 +549,14 @@ class _CKVPrefetchStateRegistry:
             self._retire(stale_identities)
             state = _CKVPrefetchState(identity, workspace, self.workspace_pool)
             self.states[identity] = state
+        elif state.workspace_pool is None and self.workspace_pool is not None:
+            state.workspace_pool = self.workspace_pool
+        elif (
+            state.workspace_pool is not None
+            and self.workspace_pool is not None
+            and state.workspace_pool is not self.workspace_pool
+        ):
+            raise RuntimeError("CKV prefetch state cannot switch workspace pools")
         return state
 
 

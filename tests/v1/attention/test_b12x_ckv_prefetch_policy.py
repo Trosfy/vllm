@@ -31,6 +31,23 @@ def _make_registry(
     )
 
 
+def test_sparse_only_state_can_bind_prefill_pool_later():
+    registry = _CKVPrefetchStateRegistry()
+    workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    state = registry.for_workspace(workspace_buffer)
+
+    assert state.workspace_pool is None
+    with pytest.raises(RuntimeError, match="no persistent workspace pool"):
+        state.get_ckv_workspace(64)
+
+    pool = _CKVPrefetchWorkspacePool(torch.device("cpu"), 64, 1)
+    rebound = registry.for_workspace(workspace_buffer, workspace_pool=pool)
+
+    assert rebound is state
+    assert rebound.workspace_pool is pool
+    assert rebound.get_ckv_workspace(64).numel() == 64
+
+
 @pytest.mark.parametrize(
     ("depth", "expected_slots", "expected_targets"),
     [
