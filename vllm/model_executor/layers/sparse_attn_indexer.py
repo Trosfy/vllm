@@ -446,8 +446,11 @@ def _unpack_b12x_dcp_gathered_candidates(
         candidate_score_bits[:, start:end].copy_(gathered_view[rank, :, 1, :])
 
 
-def _get_dcp_warmup_params() -> tuple[int, int, int]:
-    dcp_world_size = 1
+def _get_dcp_warmup_params(
+    expected_dcp_world_size: int | None = None,
+) -> tuple[int, int, int]:
+    dcp_world_size = int(expected_dcp_world_size or 1)
+    group_world_size = expected_dcp_world_size
     dcp_rank = 0
     cp_kv_cache_interleave_size = 1
     try:
@@ -456,7 +459,9 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is not None:
             parallel_config = vllm_config.parallel_config
-            dcp_world_size = int(parallel_config.decode_context_parallel_size)
+            if expected_dcp_world_size is None:
+                dcp_world_size = int(parallel_config.decode_context_parallel_size)
+                group_world_size = dcp_world_size
             cp_kv_cache_interleave_size = int(
                 parallel_config.cp_kv_cache_interleave_size
             )
@@ -466,7 +471,7 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
     try:
         from vllm.distributed.parallel_state import get_indexer_dcp_group
 
-        dcp_group = get_indexer_dcp_group()
+        dcp_group = get_indexer_dcp_group(group_world_size)
         if int(dcp_group.world_size) > 1:
             dcp_world_size = int(dcp_group.world_size)
             dcp_rank = int(dcp_group.rank_in_group)
@@ -476,7 +481,7 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
     return dcp_world_size, dcp_rank, cp_kv_cache_interleave_size
 
 
-def _sync_dcp_warmup() -> None:
+def _sync_dcp_warmup(dcp_world_size: int) -> None:
     """Finish one-time DCP warmup on every rank before graph warmup proceeds."""
     if current_platform.is_cuda():
         torch.accelerator.synchronize()
@@ -484,7 +489,7 @@ def _sync_dcp_warmup() -> None:
     try:
         from vllm.distributed.parallel_state import get_indexer_dcp_group
 
-        dcp_group = get_indexer_dcp_group()
+        dcp_group = get_indexer_dcp_group(dcp_world_size)
         if int(dcp_group.world_size) <= 1:
             return
         dcp_group.barrier()
@@ -530,7 +535,7 @@ def _prewarm_b12x_dcp_topk_merge(
             dcp_rank=int(dcp_rank),
             cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
         )
-        _sync_dcp_warmup()
+        _sync_dcp_warmup(dcp_world_size)
 
 
 def _dcp_global_topk_remap(
@@ -557,7 +562,9 @@ def _dcp_global_topk_remap(
         interleave,
         row_starts=row_starts,
     )
-    all_candidates = get_indexer_dcp_group().all_gather(candidates.contiguous(), dim=2)
+    all_candidates = get_indexer_dcp_group(world_size).all_gather(
+        candidates.contiguous(), dim=2
+    )
     all_scores = all_candidates[:, 1, :].view(torch.float32)
     _, selected = torch.topk(all_scores, topk_tokens, dim=1)
     _dcp_finalize_topk_remap(
@@ -773,7 +780,7 @@ def _merge_dcp_topk_global(
         cp_interleave,
         row_starts,
     )
-    gathered = get_indexer_dcp_group().all_gather(packed, dim=1)
+    gathered = get_indexer_dcp_group(dcp_world_size).all_gather(packed, dim=1)
     stable_topk_from_gathered_candidates_cutedsl(
         gathered, topk_tokens, out=topk_indices
     )
@@ -1117,7 +1124,7 @@ def _merge_b12x_dcp_topk(
     candidates[:, 0, :].copy_(topk_indices)
     candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
 
-    dcp_group = get_indexer_dcp_group()
+    dcp_group = get_indexer_dcp_group(dcp_world_size)
     _dcp_all_gather_first_dim_into(
         dcp_group,
         candidates,
@@ -1241,7 +1248,7 @@ def _merge_b12x_dcp_topk_by_owner(
     candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
 
     _dcp_all_to_all_first_dim_into(
-        get_indexer_dcp_group(),
+        get_indexer_dcp_group(dcp_world_size),
         candidates,
         received_candidates,
     )
@@ -1650,7 +1657,7 @@ def sparse_attn_indexer(
                 dcp_world_size,
                 dcp_rank,
                 cp_kv_cache_interleave_size,
-            ) = _get_dcp_warmup_params()
+            ) = _get_dcp_warmup_params(dcp_world_size)
             _prewarm_b12x_paged_indexer_prefill(
                 q_quant=q_quant,
                 weights=weights,
@@ -1729,7 +1736,7 @@ def sparse_attn_indexer(
     qs_rank = 0
     if envs.VLLM_DCP_QUERY_SPLIT and dcp_world_size > 1:
         try:
-            _qs = get_indexer_query_split_group()
+            _qs = get_indexer_query_split_group(dcp_world_size)
             if int(_qs.world_size) > 1:
                 qs_group = _qs
                 qs_world_size = int(_qs.world_size)
@@ -2391,7 +2398,7 @@ class SparseAttnIndexer(CustomOp):
             else int(dcp_kv_shard_count or configured_dcp_world_size)
         )
         if self.dcp_world_size > 1:
-            indexer_group = get_indexer_dcp_group()
+            indexer_group = get_indexer_dcp_group(self.dcp_world_size)
             if int(indexer_group.world_size) != self.dcp_world_size:
                 raise RuntimeError(
                     "Sparse-indexer DCP group does not match its KV shard count: "
