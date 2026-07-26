@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER: bool = False
     VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT: str = "direct"
+    VLLM_B12X_MLA_SPARSE_DECODE_REMOTE_RECORDS: str = "off"
     VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH: bool = False
     VLLM_B12X_MLA_SPARSE_DECODE_MAX_SEQS: int = 8
     VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS: int = 0
@@ -1229,6 +1230,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT",
         "direct",
         ["auto", "ce", "direct"],
+    ),
+    # POC: let sparse attention consume an int64 address table instead of
+    # materializing one dense CKV workspace. ``storage`` sends only compact
+    # source ordinals and points directly into model-owned peer KV storage.
+    "VLLM_B12X_MLA_SPARSE_DECODE_REMOTE_RECORDS": env_with_choices(
+        "VLLM_B12X_MLA_SPARSE_DECODE_REMOTE_RECORDS",
+        "off",
+        ["off", "ce", "peer", "storage"],
     ),
     # Combine exactly three eligible Shared-layer selected-record prefetches
     # into one CE exchange. Sparse decode must also be enabled. This is

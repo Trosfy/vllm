@@ -320,6 +320,7 @@ class _CKVPrefetchTicket:
 class _CKVPrefetchPendingLayer:
     ticket: _CKVPrefetchTicket
     buf_idx: int
+    pointer_exchange: Any | None = None
 
 
 def _ckv_workspace_identity(workspace: torch.Tensor) -> _CKVWorkspaceIdentity:
@@ -376,11 +377,20 @@ class _CKVPrefetchState:
             # Preserve ring ordering without blocking the host indefinitely.
             # The next main-stream gather is enqueued after these dependencies.
             ticket.wait_once()
+        released_exchanges: set[int] = set()
+        for pending in self.pending_layers.values():
+            exchange = pending.pointer_exchange
+            if exchange is None or id(exchange) in released_exchanges:
+                continue
+            if bool(getattr(exchange, "record_ptrs_require_release", True)):
+                exchange.release_record_ptrs()
+            released_exchanges.add(id(exchange))
 
     def register_pending_group(
         self,
         layer_slots: dict[int, int],
         event: Any,
+        pointer_exchanges: dict[int, Any] | None = None,
     ) -> _CKVPrefetchTicket:
         if not layer_slots:
             raise ValueError("prefetch group must contain at least one layer")
@@ -392,7 +402,13 @@ class _CKVPrefetchState:
         ticket = _CKVPrefetchTicket(event)
         self.pending_layers.update(
             {
-                layer_idx: _CKVPrefetchPendingLayer(ticket, int(buf_idx))
+                layer_idx: _CKVPrefetchPendingLayer(
+                    ticket,
+                    int(buf_idx),
+                    None
+                    if pointer_exchanges is None
+                    else pointer_exchanges.get(layer_idx),
+                )
                 for layer_idx, buf_idx in layer_slots.items()
             }
         )
@@ -421,7 +437,13 @@ class _CKVPrefetchState:
             self.layer_impls.append(None)
         self.layer_impls[layer_idx] = impl
 
-    def get_sparse_decode_state(self, layout, exchange):
+    def get_sparse_decode_state(
+        self,
+        layout,
+        exchanges: tuple[object, ...],
+        *,
+        materialize_payload: bool,
+    ):
         if self.sparse_decode_state is None:
             from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
                 SparseCKVDecodeState,
@@ -430,12 +452,15 @@ class _CKVPrefetchState:
             self.sparse_decode_state = SparseCKVDecodeState(
                 layout=layout,
                 device=self.workspace_identity.device,
-                exchange=exchange,
+                exchanges=exchanges,
+                materialize_payload=materialize_payload,
             )
         elif self.sparse_decode_state.layout != layout:
             raise RuntimeError("sparse CKV layout changed within one execution lane")
-        elif self.sparse_decode_state.exchange is not exchange:
+        elif self.sparse_decode_state.exchanges != exchanges:
             raise RuntimeError("sparse CKV exchange changed within one execution lane")
+        elif self.sparse_decode_state.materialize_payload != materialize_payload:
+            raise RuntimeError("sparse CKV workspace mode changed within one lane")
         return self.sparse_decode_state
 
     def get_gather_stream(self) -> torch.cuda.Stream:
@@ -1687,9 +1712,14 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             get_selected_record_exchange,
             plan_sparse_ckv_decode,
             preload_dense_union_extension_consistently,
+            resolve_remote_record_prefetch_policy,
+            share_selected_record_stream,
         )
 
         sparse_decode_requested = envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_CKV_GATHER
+        self._sparse_decode_remote_records = (
+            envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_REMOTE_RECORDS
+        )
         self._sparse_decode_enabled = sparse_decode_requested and (
             2 <= self.dcp_world_size <= 8
             and self.num_heads % _HEAD_ALIGNMENT == 0
@@ -1706,8 +1736,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         )
         self._sparse_decode_layout = None
         self._sparse_decode_exchange = None
-        self._sparse_decode_bulk_prefetch = bool(
-            envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH
+        self._sparse_decode_exchanges: tuple[object, ...] = ()
+        sparse_prefetch_depth, self._sparse_decode_bulk_prefetch = (
+            resolve_remote_record_prefetch_policy(
+                remote_mode=self._sparse_decode_remote_records,
+                prefetch_depth=max(
+                    0,
+                    int(envs_mod.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH),
+                ),
+                bulk_prefetch=bool(envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_BULK_PREFETCH),
+            )
         )
         if self._sparse_decode_enabled:
             self._sparse_decode_layout = plan_sparse_ckv_decode(
@@ -1717,7 +1755,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 max_requests=sparse_max_requests,
                 pool_records=int(envs_mod.VLLM_B12X_MLA_SPARSE_DECODE_POOL_RECORDS),
                 record_bytes=self._kv_record_bytes,
-                prefetch_depth=max(0, int(envs_mod.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH)),
+                prefetch_depth=sparse_prefetch_depth,
+                preserve_pool_slack=(
+                    self._sparse_decode_bulk_prefetch
+                    and self._sparse_decode_remote_records == "off"
+                ),
             )
             graph_rows = int(
                 vllm_config.compilation_config.max_cudagraph_capture_size or 0
@@ -1741,12 +1783,31 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             model_type = str(
                 getattr(vllm_config.model_config.hf_config, "model_type", "target")
             )
-            self._sparse_decode_exchange = get_selected_record_exchange(
-                process_group=process_group,
-                device=self.device,
-                layout=self._sparse_decode_layout,
-                lane_key=(model_type, id(vllm_config)),
+            packet_pointer_ring = self._sparse_decode_remote_records in {"ce", "peer"}
+            exchange_slots = (
+                self._sparse_decode_layout.workspace_slots if packet_pointer_ring else 1
             )
+            self._sparse_decode_exchanges = tuple(
+                get_selected_record_exchange(
+                    process_group=process_group,
+                    device=self.device,
+                    layout=self._sparse_decode_layout,
+                    lane_key=(model_type, id(vllm_config)),
+                    slot_index=slot_index,
+                )
+                for slot_index in range(exchange_slots)
+            )
+            if exchange_slots > 1:
+                share_selected_record_stream(self._sparse_decode_exchanges)
+            self._sparse_decode_exchange = self._sparse_decode_exchanges[0]
+            if self._sparse_decode_remote_records != "off" and any(
+                not hasattr(exchange, "prepare_record_ptrs")
+                for exchange in self._sparse_decode_exchanges
+            ):
+                raise RuntimeError(
+                    "remote selected-record decode requires copy-engine "
+                    "transport (set transport=ce or auto)"
+                )
         elif sparse_decode_requested:
             logger.warning_once(
                 "Ignoring selected-record CKV decode for unsupported "
@@ -1961,6 +2022,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         cls._shared_gather_buf_idx = 0
         for registry in tuple(_CKV_PREFETCH_STATE_REGISTRIES):
             registry.clear()
+        from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
+            reset_selected_record_storage_mappings,
+        )
+
+        reset_selected_record_storage_mappings()
 
     def do_kv_cache_update(
         self,
@@ -2466,8 +2532,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     ]:
         """Exchange one dense per-sequence MTP union through generic B12X P2P."""
         layout = self._sparse_decode_layout
-        exchange = self._sparse_decode_exchange
-        if layout is None or exchange is None:
+        exchanges = self._sparse_decode_exchanges
+        if layout is None or not exchanges:
             raise RuntimeError("selected-record CKV decode was not initialized")
         num_rows = int(topk_indices.shape[0])
         num_requests = int(attn_metadata.num_reqs)
@@ -2496,8 +2562,26 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         assert attn_metadata.page_table_1 is not None
         assert attn_metadata.nsa_cache_seqlens is not None
         assert attn_metadata.global_cache_seq_lens_per_req is not None
-        state = prefetch_state.get_sparse_decode_state(layout, exchange)
-        output = state.payload_workspace[buf_idx, :active_records]
+        remote_records = self._sparse_decode_remote_records != "off"
+        state = prefetch_state.get_sparse_decode_state(
+            layout,
+            exchanges,
+            materialize_payload=not remote_records,
+        )
+        packet_pointer_ring = self._sparse_decode_remote_records in {"ce", "peer"}
+        exchange = exchanges[buf_idx] if packet_pointer_ring else exchanges[0]
+        if remote_records:
+            if state.record_ptr_workspace is None:
+                raise RuntimeError(
+                    "remote selected-record pointer workspace is missing"
+                )
+            record_ptrs = state.record_ptr_workspace[buf_idx, :active_records]
+            output = None
+        else:
+            if state.payload_workspace is None:
+                raise RuntimeError("materialized selected-record workspace is missing")
+            output = state.payload_workspace[buf_idx, :active_records]
+            record_ptrs = None
         caller_stream = torch.cuda.current_stream()
 
         from vllm.distributed.parallel_state import get_dcp_ckv_prefetch_group
@@ -2508,7 +2592,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         gather_stream = get_selected_record_stream(exchange)
         gather_stream.wait_stream(caller_stream)
-        output.record_stream(gather_stream)
+        if remote_records:
+            assert record_ptrs is not None
+            record_ptrs.record_stream(gather_stream)
+        else:
+            assert output is not None
+            output.record_stream(gather_stream)
 
         with torch.cuda.stream(gather_stream):
             if build_union:
@@ -2573,11 +2662,21 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 transport_indices[destination].copy_(
                     destination_slots.reshape(-1), non_blocking=True
                 )
-            exchange.exchange(
-                kv_cache.reshape(-1, layout.record_bytes),
-                transport_indices,
-                output,
-            )
+            if remote_records:
+                assert record_ptrs is not None
+                exchange.prepare_record_ptrs(
+                    kv_cache.reshape(-1, layout.record_bytes),
+                    transport_indices,
+                    record_ptrs,
+                    primary_mode=self._sparse_decode_remote_records,
+                )
+            else:
+                assert output is not None
+                exchange.exchange(
+                    kv_cache.reshape(-1, layout.record_bytes),
+                    transport_indices,
+                    output,
+                )
             complete = state.complete_events[buf_idx]
             complete.record(gather_stream)
 
@@ -2595,7 +2694,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             nsa_cache_seqlens.copy_(global_causal_lens, non_blocking=True)
             nsa_cache_seqlens.clamp_(max=layout.topk)
             _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
-        gathered_cache = output.view(-1, self.block_size, layout.record_bytes)
+        gathered_cache = (
+            kv_cache
+            if remote_records
+            else cast(torch.Tensor, output).view(
+                -1, self.block_size, layout.record_bytes
+            )
+        )
         return gathered_cache, selected_indices, nsa_cache_seqlens, complete
 
     def _dcp_gather_sparse_decode_shared_layers(
@@ -2617,7 +2722,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         num_requests = int(attn_metadata.num_reqs)
         active_records = layout.active_records(num_requests)
-        state = prefetch_state.get_sparse_decode_state(layout, exchange)
+        state = prefetch_state.get_sparse_decode_state(
+            layout,
+            self._sparse_decode_exchanges,
+            materialize_payload=True,
+        )
+        if state.payload_workspace is None:
+            raise RuntimeError("bulk selected-record prefetch requires payload storage")
         layer_slots: dict[int, int] = {}
         records_by_layer: list[torch.Tensor] = []
         outputs_by_layer: list[torch.Tensor] = []
@@ -3047,6 +3158,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         use_sparse_decode_ckv_gather = self.dcp_sparse_decode_ckv_gather_eligible(
             attn_metadata, int(query_rows)
         )
+        sparse_decode_record_ptrs = None
+        sparse_decode_active_exchange = None
         use_local_query_heads = use_ckv_gather or use_sparse_decode_ckv_gather
         workspace_tensors = self._borrow_workspaces()
         q_workspace = workspace_tensors[0]
@@ -3228,7 +3341,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         if use_sparse_decode_ckv_gather:
             layout = self._sparse_decode_layout
             exchange = self._sparse_decode_exchange
-            if layout is None or exchange is None:
+            exchanges = self._sparse_decode_exchanges
+            if layout is None or exchange is None or not exchanges:
                 raise RuntimeError("selected-record CKV decode was not initialized")
             if sparse_decode_global_causal_lens is None:
                 raise RuntimeError(
@@ -3245,25 +3359,56 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 prefetch_state.enter_layer(layer_idx)
                 prefetch_state.register_cache(layer_idx, kv_cache)
                 prefetch_state.register_impl(layer_idx, self)
-            sparse_state = prefetch_state.get_sparse_decode_state(layout, exchange)
+            remote_records = self._sparse_decode_remote_records != "off"
+            sparse_state = prefetch_state.get_sparse_decode_state(
+                layout,
+                exchanges,
+                materialize_payload=not remote_records,
+            )
             pending = prefetch_state.pop_pending_layer(layer_idx)
             if pending is not None:
                 pending.ticket.wait_on_stream_once(torch.cuda.current_stream())
                 current_buf_idx = pending.buf_idx
                 active_records = layout.active_records(int(attn_metadata.num_reqs))
-                kv_cache = sparse_state.payload_workspace[
-                    current_buf_idx, :active_records
-                ].view(-1, self.block_size, layout.record_bytes)
-                self._append_current_token_to_sparse_decode_gathered(
-                    kv_cache,
-                    attn_metadata,
-                    sparse_state.union_indices[
-                        self.dcp_rank, : int(attn_metadata.num_reqs)
-                    ],
-                    sparse_decode_global_causal_lens,
-                    sparse_state.patch_slots,
-                    layer,
-                )
+                if remote_records:
+                    packet_pointer_ring = self._sparse_decode_remote_records in {
+                        "ce",
+                        "peer",
+                    }
+                    if packet_pointer_ring and pending.pointer_exchange is None:
+                        raise RuntimeError(
+                            "remote selected-record prefetch lost its exchange slot"
+                        )
+                    if sparse_state.record_ptr_workspace is None:
+                        raise RuntimeError(
+                            "remote selected-record pointer workspace is missing"
+                        )
+                    sparse_decode_record_ptrs = sparse_state.record_ptr_workspace[
+                        current_buf_idx, :active_records
+                    ]
+                    sparse_decode_active_exchange = (
+                        pending.pointer_exchange
+                        if packet_pointer_ring
+                        else exchanges[0]
+                    )
+                else:
+                    if sparse_state.payload_workspace is None:
+                        raise RuntimeError(
+                            "materialized selected-record workspace is missing"
+                        )
+                    kv_cache = sparse_state.payload_workspace[
+                        current_buf_idx, :active_records
+                    ].view(-1, self.block_size, layout.record_bytes)
+                    self._append_current_token_to_sparse_decode_gathered(
+                        kv_cache,
+                        attn_metadata,
+                        sparse_state.union_indices[
+                            self.dcp_rank, : int(attn_metadata.num_reqs)
+                        ],
+                        sparse_decode_global_causal_lens,
+                        sparse_state.patch_slots,
+                        layer,
+                    )
                 selected_indices = sparse_state.selected_indices[
                     :num_actual_toks, : layout.topk
                 ]
@@ -3293,10 +3438,24 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     build_union=True,
                     wait_for_completion=True,
                 )
+                if remote_records:
+                    active_records = layout.active_records(int(attn_metadata.num_reqs))
+                    if sparse_state.record_ptr_workspace is None:
+                        raise RuntimeError(
+                            "remote selected-record pointer workspace is missing"
+                        )
+                    sparse_decode_record_ptrs = sparse_state.record_ptr_workspace[
+                        current_buf_idx, :active_records
+                    ]
+                    sparse_decode_active_exchange = (
+                        exchanges[current_buf_idx]
+                        if self._sparse_decode_remote_records in {"ce", "peer"}
+                        else exchanges[0]
+                    )
 
             logger.info_once(
                 "Using selected-record CKV decode for C<=%d/MTP%d "
-                "(DCP%d topk=%d pool=%d record_bytes=%d depth=%d)",
+                "(DCP%d topk=%d pool=%d record_bytes=%d depth=%d remote=%s)",
                 layout.max_fast_requests,
                 layout.rows_per_request - 1,
                 layout.dcp_world_size,
@@ -3304,6 +3463,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 layout.pool_records,
                 layout.record_bytes,
                 layout.prefetch_depth,
+                self._sparse_decode_remote_records,
             )
             if (
                 self._sparse_decode_emits_topk
@@ -3361,6 +3521,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                         prefetch_state.register_pending_group(
                             {target_idx: target_buf_idx},
                             target_event,
+                            pointer_exchanges=(
+                                {
+                                    target_idx: target_impl._sparse_decode_exchanges[
+                                        target_buf_idx
+                                    ]
+                                }
+                                if remote_records
+                                and self._sparse_decode_remote_records in {"ce", "peer"}
+                                else None
+                            ),
                         )
         if use_ckv_gather:
             layer_idx = self._resolve_layer_index(layer)
@@ -3523,17 +3693,33 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     out = dense_out
                     lse = lse[:, : self._input_num_heads]
                 return out, lse
-            out = cast(
-                torch.Tensor,
-                self._sparse_mla_decode_forward(
-                    binding=binding,
-                    kv_cache=kv_cache,
-                    sm_scale=self.scale,
-                    v_head_dim=self.kv_lora_rank,
-                    forced_num_splits=self._num_splits_cap,
-                    **kernel_format_kwargs,
-                ),
-            )
+            try:
+                out = cast(
+                    torch.Tensor,
+                    self._sparse_mla_decode_forward(
+                        binding=binding,
+                        kv_cache=kv_cache,
+                        record_ptrs=sparse_decode_record_ptrs,
+                        sm_scale=self.scale,
+                        v_head_dim=self.kv_lora_rank,
+                        forced_num_splits=self._num_splits_cap,
+                        **kernel_format_kwargs,
+                    ),
+                )
+            finally:
+                if sparse_decode_record_ptrs is not None:
+                    if sparse_decode_active_exchange is None:
+                        raise RuntimeError(
+                            "remote selected-record exchange disappeared"
+                        )
+                    if bool(
+                        getattr(
+                            sparse_decode_active_exchange,
+                            "record_ptrs_require_release",
+                            True,
+                        )
+                    ):
+                        sparse_decode_active_exchange.release_record_ptrs()
             if self._pad_heads and not use_sparse_decode_ckv_gather:
                 assert dense_out_workspace is not None
                 dense_out = dense_out_workspace[:num_actual_toks]

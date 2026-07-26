@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.workspace as workspace
+from vllm.v1.attention.backends.mla import b12x_sparse_ckv_decode
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     _ckv_prefetch_depth_within_budget,
@@ -450,7 +451,7 @@ def test_ckv_prefetch_registry_retires_released_profile_workspace():
     assert replacement.get_ckv_workspace(64).data_ptr() == first_ring_ptr
 
 
-def test_reset_kv_cache_binding_state_clears_builder_owned_registries():
+def test_reset_kv_cache_binding_state_clears_builder_owned_registries(monkeypatch):
     registry = _make_registry(max_slots=1)
     workspace_buffer = torch.empty(16, dtype=torch.uint8)
     state = registry.for_workspace(workspace_buffer)
@@ -459,11 +460,18 @@ def test_reset_kv_cache_binding_state_clears_builder_owned_registries():
     event = _FakeEvent()
     state.register_cache(0, cache)
     state.register_pending_group({1: 0}, event)
+    mapping_resets = []
+    monkeypatch.setattr(
+        b12x_sparse_ckv_decode,
+        "reset_selected_record_storage_mappings",
+        lambda: mapping_resets.append(True),
+    )
 
     B12xMLASparseImpl.reset_kv_cache_binding_state()
 
     assert registry.states == {}
     assert event.synchronize_calls == 1
+    assert mapping_resets == [True]
     replacement = registry.for_workspace(torch.empty(32, dtype=torch.uint8))
     assert replacement.get_ckv_workspace(64).data_ptr() == ring_ptr
 

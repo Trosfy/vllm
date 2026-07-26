@@ -61,6 +61,7 @@ def plan_sparse_ckv_decode(
     pool_records: int,
     record_bytes: int,
     prefetch_depth: int,
+    preserve_pool_slack: bool = False,
 ) -> SparseCKVDecodeLayout:
     """Return the static pooled-workspace layout for selected-record decode."""
     if not 2 <= dcp_world_size <= 8:
@@ -79,10 +80,14 @@ def plan_sparse_ckv_decode(
         raise ValueError(
             "selected-record pool cannot hold one request's worst-case MTP union"
         )
-    # Capacity beyond the largest schedulable batch only wastes VRAM.
-    effective_pool = min(
-        requested_pool,
-        max_requests * per_request_capacity,
+    # The ordinary per-layer path cannot use capacity beyond the largest
+    # schedulable batch. The three-layer bulk transport can: its wider packet
+    # reuses the same slab and needs spare single-record capacity even when the
+    # logical batch itself is only C1.
+    effective_pool = (
+        requested_pool
+        if preserve_pool_slack
+        else min(requested_pool, max_requests * per_request_capacity)
     )
     return SparseCKVDecodeLayout(
         dcp_world_size=dcp_world_size,
@@ -138,6 +143,27 @@ def sparse_decode_prefetch_targets(
             break
         targets.append(target)
     return targets
+
+
+def resolve_remote_record_prefetch_policy(
+    *,
+    remote_mode: str,
+    prefetch_depth: int,
+    bulk_prefetch: bool,
+) -> tuple[int, bool]:
+    """Keep per-layer lookahead but disable the materialized bulk packet.
+
+    Remote pointer consumers need one independently retired transport slot per
+    lookahead layer.  The caller provides that ring; the three-layer bulk path
+    remains materialized and therefore cannot be mixed with remote pointers.
+    """
+    if remote_mode not in {"off", "ce", "peer", "storage"}:
+        raise ValueError(f"unknown remote selected-record mode: {remote_mode}")
+    if prefetch_depth < 0:
+        raise ValueError("prefetch depth cannot be negative")
+    if remote_mode == "off":
+        return prefetch_depth, bulk_prefetch
+    return prefetch_depth, False
 
 
 def try_exchange_sparse_decode_shared_layers(
@@ -257,10 +283,28 @@ class SparseCKVDecodeState:
         *,
         layout: SparseCKVDecodeLayout,
         device: torch.device,
-        exchange,
+        exchanges: tuple[object, ...],
+        materialize_payload: bool,
     ) -> None:
+        if not exchanges:
+            raise ValueError("selected-record decode requires an exchange")
+        stable_storage_pointers = not materialize_payload and all(
+            not bool(getattr(exchange, "record_ptrs_require_release", True))
+            for exchange in exchanges
+        )
+        expected_exchanges = (
+            1
+            if materialize_payload or stable_storage_pointers
+            else layout.workspace_slots
+        )
+        if len(exchanges) != expected_exchanges:
+            raise ValueError(
+                "selected-record exchange count does not match workspace mode: "
+                f"got {len(exchanges)}, expected {expected_exchanges}"
+            )
         self.layout = layout
-        self.exchange = exchange
+        self.exchanges = exchanges
+        self.materialize_payload = materialize_payload
         capacity = layout.per_request_capacity
         hash_capacity = 1 << (2 * capacity - 1).bit_length()
         max_rows = layout.max_requests * layout.rows_per_request
@@ -311,14 +355,27 @@ class SparseCKVDecodeState:
         # Cross-layer prefetch outlives a WorkspaceManager borrow. Keep the
         # payload in lane-owned storage so unrelated scratch users cannot
         # overwrite S1/S2/S3 records before attention consumes them.
-        self.payload_workspace = torch.empty(
-            (
-                layout.workspace_slots,
-                layout.pool_records,
-                layout.record_bytes,
-            ),
-            dtype=torch.uint8,
-            device=device,
+        self.payload_workspace = (
+            torch.empty(
+                (
+                    layout.workspace_slots,
+                    layout.pool_records,
+                    layout.record_bytes,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            if materialize_payload
+            else None
+        )
+        self.record_ptr_workspace = (
+            None
+            if materialize_payload
+            else torch.empty(
+                (layout.workspace_slots, layout.pool_records),
+                dtype=torch.int64,
+                device=device,
+            )
         )
         self.request_ids = torch.arange(
             layout.max_requests, dtype=torch.int32, device=device
@@ -362,6 +419,27 @@ def close_selected_record_exchanges() -> None:
         ) from first_error
 
 
+def reset_selected_record_storage_mappings() -> None:
+    """Release stable pointers belonging to a replaced model KV cache."""
+    exchanges = {
+        id(value): value for value in _SELECTED_RECORD_EXCHANGES.values()
+    }.values()
+    first_error: Exception | None = None
+    for exchange in exchanges:
+        reset = getattr(exchange, "reset_storage_mappings", None)
+        if reset is None:
+            continue
+        try:
+            reset()
+        except Exception as exc:  # pragma: no cover - defensive cleanup path
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise RuntimeError(
+            "failed to reset selected-record storage mappings"
+        ) from first_error
+
+
 register_model_parallel_cleanup_hook(close_selected_record_exchanges)
 
 
@@ -371,14 +449,18 @@ def get_selected_record_exchange(
     device: torch.device,
     layout: SparseCKVDecodeLayout,
     lane_key: tuple[str, int],
+    slot_index: int = 0,
 ):
-    """Return one generic B12X exchange per target/draft execution lane."""
+    """Return one generic B12X exchange per lane and lookahead slot."""
+    if slot_index < 0:
+        raise ValueError("selected-record exchange slot cannot be negative")
     transport = envs.VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT
     if transport not in {"auto", "ce", "direct"}:
         raise ValueError(
             "VLLM_B12X_MLA_SPARSE_DECODE_TRANSPORT must be auto, ce, or "
             f"direct; got {transport!r}"
         )
+    remote_mode = envs.VLLM_B12X_MLA_SPARSE_DECODE_REMOTE_RECORDS
     key = (
         id(process_group),
         device.type,
@@ -387,7 +469,9 @@ def get_selected_record_exchange(
         layout.pool_records,
         layout.record_bytes,
         transport,
+        remote_mode,
         lane_key,
+        slot_index,
     )
     exchange = _SELECTED_RECORD_EXCHANGES.get(key)
     if exchange is None:
@@ -397,7 +481,24 @@ def get_selected_record_exchange(
         )
 
         ce_error: Exception | None = None
-        if transport in {"auto", "ce"}:
+        if remote_mode == "storage":
+            try:
+                from sparkinfer.comm.pcie import SelectedStoragePointerExchange
+
+                exchange = SelectedStoragePointerExchange.from_process_group(
+                    process_group=process_group,
+                    device=device,
+                    max_records=layout.pool_records,
+                    source_record_bytes=layout.record_bytes,
+                )
+            except (
+                ImportError,
+                SelectedRecordExchangeInitializationError,
+            ) as exc:
+                raise RuntimeError(
+                    "model-storage selected-record transport failed to initialize"
+                ) from exc
+        elif transport in {"auto", "ce"}:
             try:
                 from sparkinfer.comm.pcie import SelectedRecordCopyExchange
 
@@ -446,6 +547,23 @@ def get_selected_record_stream(exchange) -> torch.cuda.Stream:
     if stream is None:
         raise RuntimeError("selected-record exchange has no execution stream")
     return stream
+
+
+def share_selected_record_stream(exchanges: tuple[object, ...]) -> None:
+    """Serialize one pointer ring's transports on a graph-stable side stream.
+
+    Each slot still owns independent IPC staging and retirement state.  A
+    shared stream prevents concurrently captured channels from advancing their
+    barrier generations in different orders while preserving overlap with the
+    main attention stream.
+    """
+    if not exchanges:
+        raise ValueError("selected-record pointer ring cannot be empty")
+    stream = get_selected_record_stream(exchanges[0])
+    for exchange in exchanges[1:]:
+        if id(exchange) not in _SELECTED_RECORD_STREAMS:
+            raise RuntimeError("selected-record exchange has no execution stream")
+        _SELECTED_RECORD_STREAMS[id(exchange)] = stream
 
 
 @lru_cache(maxsize=1)

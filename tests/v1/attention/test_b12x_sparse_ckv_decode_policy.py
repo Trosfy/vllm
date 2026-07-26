@@ -13,6 +13,9 @@ from vllm.distributed import parallel_state
 from vllm.v1.attention.backends.mla import b12x_sparse_ckv_decode
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
+    _CKVPrefetchPendingLayer,
+    _CKVPrefetchState,
+    _CKVPrefetchTicket,
     _sparse_decode_supports_format,
 )
 from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
@@ -20,10 +23,102 @@ from vllm.v1.attention.backends.mla.b12x_sparse_ckv_decode import (
     dense_union_remap_reference,
     owner_and_local_ordinal,
     plan_sparse_ckv_decode,
+    resolve_remote_record_prefetch_policy,
+    share_selected_record_stream,
     sparse_decode_batch_eligible,
     sparse_decode_prefetch_targets,
     try_exchange_sparse_decode_shared_layers,
 )
+
+
+def test_pointer_ring_shares_one_graph_stable_stream(monkeypatch):
+    exchanges = (object(), object(), object())
+    streams = {id(exchange): object() for exchange in exchanges}
+    monkeypatch.setattr(
+        b12x_sparse_ckv_decode,
+        "_SELECTED_RECORD_STREAMS",
+        streams,
+    )
+
+    share_selected_record_stream(exchanges)
+
+    assert len({id(streams[id(exchange)]) for exchange in exchanges}) == 1
+
+
+def test_abandoned_pointer_prefetch_retires_each_exchange_once():
+    class Event:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self):
+            self.waits += 1
+
+    class Exchange:
+        def __init__(self):
+            self.releases = 0
+
+        def release_record_ptrs(self):
+            self.releases += 1
+
+    event = Event()
+    ticket = _CKVPrefetchTicket(event)
+    exchange = Exchange()
+    state = object.__new__(_CKVPrefetchState)
+    state.pending_layers = {
+        1: _CKVPrefetchPendingLayer(ticket, 1, exchange),
+        2: _CKVPrefetchPendingLayer(ticket, 2, exchange),
+    }
+
+    state.wait_for_pending_writes()
+
+    assert event.waits == 1
+    assert exchange.releases == 1
+
+
+def test_abandoned_stable_storage_pointer_prefetch_needs_no_release():
+    class Event:
+        def wait(self):
+            pass
+
+    class Exchange:
+        record_ptrs_require_release = False
+
+        def release_record_ptrs(self):
+            raise AssertionError("stable model-storage pointers cannot be retired")
+
+    state = object.__new__(_CKVPrefetchState)
+    state.pending_layers = {
+        1: _CKVPrefetchPendingLayer(_CKVPrefetchTicket(Event()), 1, Exchange())
+    }
+
+    state.wait_for_pending_writes()
+
+
+@pytest.mark.parametrize("remote_mode", ["ce", "peer", "storage"])
+def test_remote_records_keep_ring_prefetch_but_disable_bulk(remote_mode):
+    assert resolve_remote_record_prefetch_policy(
+        remote_mode=remote_mode,
+        prefetch_depth=3,
+        bulk_prefetch=True,
+    ) == (3, False)
+
+
+def test_materialized_records_preserve_prefetch_policy():
+    assert resolve_remote_record_prefetch_policy(
+        remote_mode="off",
+        prefetch_depth=3,
+        bulk_prefetch=True,
+    ) == (3, True)
+
+
+@pytest.mark.parametrize("remote_mode", ["unknown", ""])
+def test_remote_records_reject_unknown_mode(remote_mode):
+    with pytest.raises(ValueError, match="unknown remote selected-record mode"):
+        resolve_remote_record_prefetch_policy(
+            remote_mode=remote_mode,
+            prefetch_depth=0,
+            bulk_prefetch=False,
+        )
 
 
 def _layout(
@@ -42,6 +137,33 @@ def _layout(
         record_bytes=record_bytes,
         prefetch_depth=3,
     )
+
+
+def test_sparse_decode_layout_preserves_explicit_slack_for_bulk_transport():
+    regular = plan_sparse_ckv_decode(
+        dcp_world_size=4,
+        topk=2,
+        rows_per_request=2,
+        max_requests=1,
+        pool_records=12,
+        record_bytes=8,
+        prefetch_depth=3,
+    )
+    bulk = plan_sparse_ckv_decode(
+        dcp_world_size=4,
+        topk=2,
+        rows_per_request=2,
+        max_requests=1,
+        pool_records=12,
+        record_bytes=8,
+        prefetch_depth=3,
+        preserve_pool_slack=True,
+    )
+
+    assert regular.pool_records == 4
+    assert bulk.pool_records == 12
+    assert regular.max_fast_requests == bulk.max_fast_requests == 1
+    assert regular.active_records(1) == bulk.active_records(1) == 4
 
 
 @pytest.mark.parametrize(
@@ -293,9 +415,16 @@ def test_bulk_shared_prefetch_reuses_existing_sparse_state(monkeypatch):
         complete_events = [Event() for _ in range(layout.workspace_slots)]
 
     class PrefetchState:
-        def get_sparse_decode_state(self, actual_layout, actual_exchange):
+        def get_sparse_decode_state(
+            self,
+            actual_layout,
+            actual_exchanges,
+            *,
+            materialize_payload,
+        ):
             assert actual_layout is layout
-            assert actual_exchange is exchange
+            assert actual_exchanges == (exchange,)
+            assert materialize_payload
             return state
 
     class Metadata:
@@ -322,6 +451,7 @@ def test_bulk_shared_prefetch_reuses_existing_sparse_state(monkeypatch):
     impl._sparse_decode_bulk_prefetch = True
     impl._sparse_decode_layout = layout
     impl._sparse_decode_exchange = exchange
+    impl._sparse_decode_exchanges = (exchange,)
     impl.block_size = 1
     impl.cp_kv_cache_interleave_size = 1
     targets = []
@@ -330,6 +460,7 @@ def test_bulk_shared_prefetch_reuses_existing_sparse_state(monkeypatch):
         target_impl = object.__new__(B12xMLASparseImpl)
         target_impl._sparse_decode_layout = layout
         target_impl._sparse_decode_exchange = exchange
+        target_impl._sparse_decode_exchanges = (exchange,)
         target_impl.block_size = 1
         target_impl.cp_kv_cache_interleave_size = 1
         target_kv = torch.zeros((1, 1, layout.record_bytes), dtype=torch.uint8)
@@ -830,6 +961,33 @@ def test_selected_record_cleanup_closes_once_and_clears_registries(monkeypatch):
     assert b12x_sparse_ckv_decode._SELECTED_RECORD_EXCHANGES == {}
     assert b12x_sparse_ckv_decode._SELECTED_RECORD_STREAMS == {}
     assert b12x_sparse_ckv_decode._UNION_PREFLIGHT_RESULTS == {}
+
+
+def test_selected_record_storage_reset_calls_capable_unique_exchanges(monkeypatch):
+    class StorageExchange:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset_storage_mappings(self):
+            self.reset_calls += 1
+
+    storage = StorageExchange()
+    ordinary = object()
+    exchanges = {
+        ("target",): storage,
+        ("target-alias",): storage,
+        ("ordinary",): ordinary,
+    }
+    monkeypatch.setattr(
+        b12x_sparse_ckv_decode,
+        "_SELECTED_RECORD_EXCHANGES",
+        exchanges,
+    )
+
+    b12x_sparse_ckv_decode.reset_selected_record_storage_mappings()
+
+    assert storage.reset_calls == 1
+    assert exchanges == b12x_sparse_ckv_decode._SELECTED_RECORD_EXCHANGES
 
 
 def test_model_parallel_cleanup_runs_before_group_destroy(monkeypatch):
