@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.4
+ARG BASE_IMAGE=voipmonitor/vllm:gilded-gnosis-v20-vllm5517197-sibe0edca-fi801d57a-cu132-20260725
+FROM ${BASE_IMAGE}
+
+# Replace every runtime file changed by the vLLM research branch. This keeps
+# the reconstruction independent of local source mounts.
+COPY --from=vllm_src vllm/envs.py /opt/venv/lib/python3.12/site-packages/vllm/envs.py
+COPY --from=vllm_src vllm/distributed/parallel_state.py /opt/venv/lib/python3.12/site-packages/vllm/distributed/parallel_state.py
+COPY --from=vllm_src vllm/model_executor/layers/attention/mla_attention.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/attention/mla_attention.py
+COPY --from=vllm_src vllm/model_executor/layers/sparse_attn_indexer.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/sparse_attn_indexer.py
+COPY --from=vllm_src vllm/model_executor/models/deepseek_v2.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v2.py
+COPY --from=vllm_src vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+COPY --from=vllm_src vllm/v1/attention/backends/mla/b12x_sparse_ckv_decode.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_sparse_ckv_decode.py
+COPY --from=vllm_src vllm/v1/attention/backends/mla/b12x_sparse_ckv_union.cu /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_sparse_ckv_union.cu
+COPY --from=vllm_src vllm/v1/attention/backends/mla/indexer.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/indexer.py
+COPY --from=vllm_src vllm/v1/core/block_pool.py /opt/venv/lib/python3.12/site-packages/vllm/v1/core/block_pool.py
+COPY --from=vllm_src vllm/v1/core/kv_cache_coordinator.py /opt/venv/lib/python3.12/site-packages/vllm/v1/core/kv_cache_coordinator.py
+COPY --from=vllm_src vllm/v1/core/kv_cache_utils.py /opt/venv/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py
+COPY --from=vllm_src vllm/v1/core/single_type_kv_cache_manager.py /opt/venv/lib/python3.12/site-packages/vllm/v1/core/single_type_kv_cache_manager.py
+COPY --from=vllm_src vllm/v1/kv_cache_interface.py /opt/venv/lib/python3.12/site-packages/vllm/v1/kv_cache_interface.py
+COPY --from=vllm_src vllm/v1/worker/gpu/block_table.py /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/block_table.py
+COPY --from=vllm_src vllm/v1/worker/gpu/model_runner.py /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py
+
+# Replace every SparkInfer runtime file changed by the companion branch.
+COPY --from=sparkinfer_src sparkinfer/attention/_shared/mla/api.py /opt/venv/lib/python3.12/site-packages/sparkinfer/attention/_shared/mla/api.py
+COPY --from=sparkinfer_src sparkinfer/attention/_shared/mla/io.py /opt/venv/lib/python3.12/site-packages/sparkinfer/attention/_shared/mla/io.py
+COPY --from=sparkinfer_src sparkinfer/attention/_shared/mla/kernel.py /opt/venv/lib/python3.12/site-packages/sparkinfer/attention/_shared/mla/kernel.py
+COPY --from=sparkinfer_src sparkinfer/comm/pcie/pcie_selected_records.cu /opt/venv/lib/python3.12/site-packages/sparkinfer/comm/pcie/pcie_selected_records.cu
+COPY --from=sparkinfer_src sparkinfer/comm/pcie/pcie_selected_records.py /opt/venv/lib/python3.12/site-packages/sparkinfer/comm/pcie/pcie_selected_records.py
+COPY --from=sparkinfer_src sparkinfer/comm/pcie/pcie_selected_records_ce.cu /opt/venv/lib/python3.12/site-packages/sparkinfer/comm/pcie/pcie_selected_records_ce.cu
+COPY --from=sparkinfer_src sparkinfer/comm/pcie/pcie_selected_records_ce.py /opt/venv/lib/python3.12/site-packages/sparkinfer/comm/pcie/pcie_selected_records_ce.py
+COPY --from=sparkinfer_src sparkinfer/comm/pcie/api.py /opt/venv/lib/python3.12/site-packages/sparkinfer/comm/pcie/api.py
+COPY --from=sparkinfer_src sparkinfer/comm/pcie/__init__.py /opt/venv/lib/python3.12/site-packages/sparkinfer/comm/pcie/__init__.py
+
+RUN find /opt/venv/lib/python3.12/site-packages/vllm \
+        /opt/venv/lib/python3.12/site-packages/sparkinfer \
+        -type f -name '*.pyc' -delete
+
+LABEL local-inference.research="glm52-dcp-post35-selected-record"
+LABEL local-inference.release-candidate="false"

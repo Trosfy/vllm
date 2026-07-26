@@ -1,0 +1,41 @@
+experiment,topology,checkpoint,mtp,path,context_tokens,metric,value,unit,baseline_value,delta_percent,notes
+query_shard_through_attention,TP8_DCP8,NVFP4_A16,0,replicated_indexer_reference,65536,prefill_throughput,5810.0,tok_s,,,exact reference
+query_shard_through_attention,TP8_DCP8,NVFP4_A16,0,sparkinfer_row_head_transpose,65536,prefill_throughput,4328.0,tok_s,5810.0,-25.51,exact but rejected
+query_shard_through_attention,TP8_DCP8,NVFP4_A16,0,skip_final_topk_gather,65536,prefill_throughput,4325.0,tok_s,5810.0,-25.56,no measurable benefit
+query_shard_through_attention,TP8_DCP8,NVFP4_A16,0,replicated_indexer_reference,409600,prefill_throughput,5006.3,tok_s,,,exact reference
+query_shard_through_attention,TP8_DCP8,NVFP4_A16,0,sparkinfer_row_head_transpose,409600,prefill_throughput,3798.3,tok_s,5006.3,-24.13,exact but rejected
+query_shard_through_attention,TP8_DCP8,NVFP4_A16,0,skip_final_topk_gather,409600,prefill_throughput,3798.7,tok_s,5006.3,-24.12,no measurable benefit
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,stock_local_ckv,0,active_decode_throughput,57.723,tok_s,,,reference
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,packet_copy_engine,0,active_decode_throughput,51.524,tok_s,57.723,-10.74,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,packet_peer,0,active_decode_throughput,28.9,tok_s,57.723,-49.93,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,direct_storage_pointer,0,active_decode_throughput,29.5,tok_s,57.723,-48.90,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,materialized_per_layer,0,active_decode_throughput,51.2,tok_s,57.723,-11.30,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,materialized_bulk,0,active_decode_throughput,51.163,tok_s,57.723,-11.36,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,stock_local_ckv,65536,active_decode_throughput,56.337,tok_s,,,reference
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,packet_copy_engine,65536,active_decode_throughput,44.233,tok_s,56.337,-21.48,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,packet_peer,65536,active_decode_throughput,17.7,tok_s,56.337,-68.58,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,direct_storage_pointer,65536,active_decode_throughput,18.2,tok_s,56.337,-67.69,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,materialized_per_layer,65536,active_decode_throughput,48.8,tok_s,56.337,-13.38,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,materialized_bulk,65536,active_decode_throughput,48.5,tok_s,56.337,-13.91,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,stock_local_ckv,262144,active_decode_throughput,55.612,tok_s,,,reference
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,packet_copy_engine,262144,active_decode_throughput,29.386,tok_s,55.612,-47.16,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,packet_peer,262144,active_decode_throughput,16.6,tok_s,55.612,-70.15,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,direct_storage_pointer,262144,active_decode_throughput,17.1,tok_s,55.612,-69.25,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,materialized_per_layer,262144,active_decode_throughput,46.5,tok_s,55.612,-16.39,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,0,materialized_bulk,262144,active_decode_throughput,46.9,tok_s,55.612,-15.66,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,3,stock_local_ckv,0,active_decode_throughput,107.44,tok_s,,,reference
+selected_record_decode,TP4_DCP4,NF3_hybrid,3,materialized_per_layer,0,active_decode_throughput,87.84,tok_s,107.44,-18.24,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,3,materialized_bulk,0,active_decode_throughput,92.105,tok_s,107.44,-14.27,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,3,stock_local_ckv,65536,active_decode_throughput,102.75,tok_s,,,reference
+selected_record_decode,TP4_DCP4,NF3_hybrid,3,materialized_per_layer,65536,active_decode_throughput,86.07,tok_s,102.75,-16.23,rejected
+selected_record_decode,TP4_DCP4,NF3_hybrid,3,materialized_bulk,65536,active_decode_throughput,88.093,tok_s,102.75,-14.27,rejected
+selected_record_decode,TP8_DCP4,NVFP4_A16,0,stock_partial_2x2,0,active_decode_throughput,73.08,tok_s,,,reference
+selected_record_decode,TP8_DCP4,NVFP4_A16,0,selected_record_copy_engine,0,active_decode_throughput,50.71,tok_s,73.08,-30.61,rejected
+selected_record_decode,TP8_DCP4,NVFP4_A16,0,stock_partial_2x2,65536,active_decode_throughput,71.35,tok_s,,,reference
+selected_record_decode,TP8_DCP4,NVFP4_A16,0,selected_record_copy_engine,65536,active_decode_throughput,46.46,tok_s,71.35,-34.88,rejected
+selected_record_decode,TP8_DCP8,NVFP4_A16,0,stock_partial_2x4,0,active_decode_throughput,68.5,tok_s,,,reference
+selected_record_decode,TP8_DCP8,NVFP4_A16,0,selected_record_copy_engine,0,active_decode_throughput,44.5,tok_s,68.5,-35.04,rejected
+selected_record_decode,TP8_DCP8,NVFP4_A16,0,stock_partial_2x4,65536,active_decode_throughput,66.6,tok_s,,,reference
+selected_record_decode,TP8_DCP8,NVFP4_A16,0,selected_record_copy_engine,65536,active_decode_throughput,40.8,tok_s,66.6,-38.74,rejected
+selected_record_transport,TP4_DCP4,NF3_hybrid,0,stock_local_ckv,0,observed_pcie_bandwidth,13.5,GB_s,,,approximate 13-14 GB/s
+selected_record_transport,TP4_DCP4,NF3_hybrid,0,selected_record_copy_engine,0,observed_pcie_bandwidth,32.0,GB_s,13.5,137.04,approximate 31-33 GB/s
