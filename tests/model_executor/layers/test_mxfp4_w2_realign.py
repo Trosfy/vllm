@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    Mxfp4MoeBackend,
+    convert_weight_to_mxfp4_moe_kernel_format,
+    mxfp4_round_up_hidden_size_and_intermediate_size,
+)
 from vllm.model_executor.layers.quantization.mxfp4 import (
     _ceil_div,
     _e8m0_bytes_to_float,
@@ -10,6 +16,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
     _mxfp4_decode_packed,
     _mxfp4_encode_values,
     _mxfp4_realign_w2_fp4_e8m0_to_local_k32,
+    _mxfp4_require_native_w2_k32,
     _mxfp4_w2_scale_cols_for_rank,
 )
 
@@ -39,8 +46,7 @@ def _dequant_w2(
 
 def test_mxfp4_w2_scale_cols_cover_virtual_tp_alignment_8() -> None:
     assert [
-        _mxfp4_w2_scale_cols_for_rank(logical_k=312, tp_rank=rank)
-        for rank in range(10)
+        _mxfp4_w2_scale_cols_for_rank(logical_k=312, tp_rank=rank) for rank in range(10)
     ] == [10, 11, 11, 10, 10, 11, 11, 10, 10, 11]
 
 
@@ -105,3 +111,73 @@ def test_mxfp4_w2_realign_requantizes_crossing_scale_groups() -> None:
         source_k_offset=0,
     )
     assert torch.isfinite(dequant_after).all()
+
+
+def test_b12x_native_w2_k32_keeps_kimi_k3_tp8_storage() -> None:
+    # Kimi K3 has N=3072; TP8 produces a local K=384 W2 shard.
+    w2 = torch.empty((2, 3584, 384 // 2), dtype=torch.uint8)
+    scale = torch.empty((2, 3584, 384 // 32), dtype=torch.uint8)
+
+    result_w2, result_scale = _mxfp4_require_native_w2_k32(
+        w2,
+        scale,
+        logical_k=384,
+        source_k_offset=0,
+    )
+
+    assert result_w2 is w2
+    assert result_scale is scale
+    assert result_w2.untyped_storage().data_ptr() == w2.untyped_storage().data_ptr()
+    assert (
+        result_scale.untyped_storage().data_ptr() == scale.untyped_storage().data_ptr()
+    )
+
+
+def test_b12x_native_w2_k32_refuses_full_shard_requantization() -> None:
+    w2 = torch.empty((1, 8, 20), dtype=torch.uint8)
+    scale = torch.empty((1, 8, 2), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="refusing full-shard"):
+        _mxfp4_require_native_w2_k32(
+            w2,
+            scale,
+            logical_k=40,
+            source_k_offset=24,
+        )
+
+
+def test_b12x_kimi_k3_shapes_and_checkpoint_tensors_are_not_generic_repacked() -> None:
+    assert mxfp4_round_up_hidden_size_and_intermediate_size(
+        Mxfp4MoeBackend.B12X,
+        hidden_size=3584,
+        intermediate_size=3072 // 8,
+    ) == (3584, 384)
+
+    source = (
+        torch.nn.Parameter(
+            torch.empty((2, 768, 1792), dtype=torch.uint8), requires_grad=False
+        ),
+        torch.nn.Parameter(
+            torch.empty((2, 3584, 192), dtype=torch.uint8), requires_grad=False
+        ),
+        torch.nn.Parameter(
+            torch.empty((2, 768, 112), dtype=torch.uint8), requires_grad=False
+        ),
+        torch.nn.Parameter(
+            torch.empty((2, 3584, 12), dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    converted = convert_weight_to_mxfp4_moe_kernel_format(
+        mxfp4_backend=Mxfp4MoeBackend.B12X,
+        layer=torch.nn.Module(),
+        w13_weight=source[0],
+        w2_weight=source[1],
+        w13_weight_scale=source[2],
+        w2_weight_scale=source[3],
+    )
+
+    for original, result in zip(source, converted[:4]):
+        assert isinstance(result, torch.Tensor)
+        assert (
+            result.untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
+        )
