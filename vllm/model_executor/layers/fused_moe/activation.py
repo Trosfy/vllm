@@ -24,6 +24,11 @@ class MoEActivation(Enum):
     SWIGLUOAI = "swigluoai"
     SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
     SWIGLUSTEP = "swiglustep"
+    # Kimi K3 SiTU:
+    #   (beta * tanh(gate / beta) * sigmoid(gate))
+    #   * (linear_beta * tanh(up / linear_beta))
+    # This is currently implemented by the b12x fused-MoE backend.
+    SITU = "situ"
 
     # Non-gated activations (no mul with gate) expect input of shape [..., d]
     # and produce output of shape [..., d].

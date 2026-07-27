@@ -530,18 +530,19 @@ def test_b12x_activation_amax_save_every_writes_main_and_mtp_files(
     assert payloads["mtp"]["layers"][0]["external_layer_idx"] == 60
 
 
-def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
+def test_b12x_mxfp4_defaults_to_a8_and_prepares_situ_w31(monkeypatch) -> None:
     sparkinfer_fused_moe = pytest.importorskip("sparkinfer.moe.fused_moe")
 
-    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
-    monkeypatch.setenv("B12X_FORCE_MOE_A8", "1")
+    monkeypatch.delenv("B12X_MOE_FORCE_A16", raising=False)
+    monkeypatch.delenv("B12X_MOE_FORCE_A8", raising=False)
+    monkeypatch.delenv("B12X_FORCE_MOE_A8", raising=False)
 
     plan_calls = []
     prepare_calls = []
     weight_plan = SimpleNamespace(
         quant_modes=frozenset({"w4a8_mx"}),
         io_dtype="bfloat16",
-        activation="silu",
+        activation="situ",
         discards_source_parameters=True,
     )
 
@@ -553,7 +554,7 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
         prepare_calls.append(kwargs)
         return _make_fake_prepared_experts(
             quant_mode="w4a8_mx",
-            activation="silu",
+            activation="situ",
             num_experts=8,
             hidden_size=256,
             intermediate_size=128,
@@ -572,6 +573,9 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
     )
 
     experts = _make_fake_b12x_experts()
+    experts.moe_config.activation = MoEActivation.SITU
+    experts.moe_config.hidden_dim = 3584
+    experts.moe_config.intermediate_size_per_partition = 384
     experts._prepared_experts = None
     experts.quant_config.quant_dtype = "mxfp4"
     experts.quant_config.weight_quant_dtype = "mxfp4"
@@ -587,7 +591,7 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
     prepared = experts._get_or_prepare_experts(
         w1=w1,
         w2=w2,
-        activation=MoEActivation.SILU,
+        activation=MoEActivation.SITU,
         params_dtype=torch.bfloat16,
     )
 
@@ -596,6 +600,7 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
     assert len(plan_calls) == 1
     assert plan_calls[0]["quant_modes"] == "w4a8_mx"
     assert plan_calls[0]["source_format"] == "fp4_e8m0_k32"
+    assert plan_calls[0]["activation"] == "situ"
     assert plan_calls[0]["w13_layout"] == "w31"
     assert len(prepare_calls) == 1
     assert prepare_calls[0]["plan"] is weight_plan
@@ -603,6 +608,55 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
     assert prepare_calls[0]["w2_fp4"] is w2
     assert torch.equal(prepare_calls[0]["w1_global_scale"], torch.ones(8))
     assert torch.equal(prepare_calls[0]["w2_global_scale"], torch.ones(8))
+
+
+def test_b12x_force_a16_overrides_mxfp4_default(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.delenv("B12X_MOE_FORCE_A8", raising=False)
+    monkeypatch.delenv("B12X_FORCE_MOE_A8", raising=False)
+
+    experts = _make_fake_b12x_experts()
+    experts.moe_config.activation = MoEActivation.SITU
+    experts.moe_config.hidden_dim = 3584
+    experts.moe_config.intermediate_size_per_partition = 384
+    experts.quant_config.quant_dtype = "mxfp4"
+    experts.quant_config.weight_quant_dtype = "mxfp4"
+
+    assert experts._quant_mode() == "w4a16"
+
+
+def test_b12x_non_situ_mxfp4_keeps_a16_default(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_MOE_FORCE_A16", raising=False)
+    monkeypatch.delenv("B12X_MOE_FORCE_A8", raising=False)
+    monkeypatch.delenv("B12X_FORCE_MOE_A8", raising=False)
+
+    experts = _make_fake_b12x_experts()
+    experts.quant_config.quant_dtype = "mxfp4"
+    experts.quant_config.weight_quant_dtype = "mxfp4"
+
+    assert experts._quant_mode() == "w4a16"
+
+
+def test_b12x_situ_mxfp4_tail_shape_avoids_second_weight_allocation(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("B12X_MOE_FORCE_A16", raising=False)
+    monkeypatch.delenv("B12X_MOE_FORCE_A8", raising=False)
+    monkeypatch.delenv("B12X_FORCE_MOE_A8", raising=False)
+
+    experts = _make_fake_b12x_experts()
+    experts.moe_config.activation = MoEActivation.SITU
+    experts.moe_config.hidden_dim = 3584
+    experts.moe_config.intermediate_size_per_partition = 192
+    experts.quant_config.quant_dtype = "mxfp4"
+    experts.quant_config.weight_quant_dtype = "mxfp4"
+
+    assert experts._quant_mode() == "w4a16"
+
+
+def test_b12x_supports_situ_activation() -> None:
+    assert MoEActivation.from_str("situ") is MoEActivation.SITU
+    assert b12x_moe.B12xExperts._supports_activation(MoEActivation.SITU)
 
 
 def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:

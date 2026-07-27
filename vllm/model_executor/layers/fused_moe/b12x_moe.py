@@ -824,7 +824,36 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if _moe_force_a16_enabled():
             logger.warning_once("B12X MoE force-A16 enabled: using quant_mode=w4a16.")
             return "w4a16"
-        return "nvfp4" if self.quant_config.quant_dtype == "nvfp4" else "w4a16"
+        # Kimi K3's MXFP4 checkpoint already provides the FP4 E2M1 values and
+        # E8M0 K/32 scales required by the b12x SiTU W4A8-MX path. Preserve
+        # the existing W4A16 default for other MXFP4 activation contracts.
+        activation = getattr(self.moe_config, "activation", None)
+        if isinstance(activation, str):
+            activation = MoEActivation.from_str(activation)
+        hidden_size = int(getattr(self.moe_config, "hidden_dim", 0))
+        intermediate_size = int(
+            getattr(self.moe_config, "intermediate_size_per_partition", 0)
+        )
+        reuses_source_storage = (
+            hidden_size % 256 == 0
+            and intermediate_size > 0
+            and intermediate_size % 128 == 0
+        )
+        if (
+            source_format == "fp4_e8m0_k32"
+            and activation is MoEActivation.SITU
+            and reuses_source_storage
+        ):
+            return "w4a8_mx"
+        if source_format == "fp4_e8m0_k32" and activation is MoEActivation.SITU:
+            logger.warning_once(
+                "B12X SiTU MXFP4 shape hidden=%d, local intermediate=%d "
+                "does not fit the in-place W4A8-MX layout; using W4A16 to "
+                "avoid a second model-sized weight allocation.",
+                hidden_size,
+                intermediate_size,
+            )
+        return "nvfp4" if source_format == "modelopt_nvfp4" else "w4a16"
 
     def _source_format(self) -> str:
         if self.quant_config.weight_quant_dtype == "nvfp4":
@@ -1029,6 +1058,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def _supports_activation(activation: MoEActivation) -> bool:
         return activation in (
             MoEActivation.SILU,
+            MoEActivation.SITU,
             MoEActivation.SWIGLUOAI,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         )

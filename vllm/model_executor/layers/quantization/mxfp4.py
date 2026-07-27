@@ -214,6 +214,34 @@ def _mxfp4_realign_w2_fp4_e8m0_to_local_k32(
     return w2, local_scale_flat.view(*raw_scale.shape[:-1], final_scale_cols)
 
 
+def _mxfp4_require_native_w2_k32(
+    w2: torch.Tensor,
+    raw_scale: torch.Tensor,
+    *,
+    logical_k: int,
+    source_k_offset: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Require a B12X W2 shard that already matches the local K/32 grid.
+
+    The generic realignment path dequantizes and requantizes the complete W2
+    shard when a TP boundary cuts an E8M0 group. B12X requires K/32-aligned
+    expert shards anyway, so doing that expensive and lossy conversion during
+    model loading would hide an unsupported deployment shape.
+    """
+    logical_k = int(logical_k)
+    source_k_offset = int(source_k_offset) % _MXFP4_GROUP_SIZE
+    expected_scale_cols = _ceil_div(logical_k, _MXFP4_GROUP_SIZE)
+    if source_k_offset != 0 or int(raw_scale.shape[-1]) != expected_scale_cols:
+        raise ValueError(
+            "B12X MXFP4 requires TP-local W2 shards to preserve the checkpoint "
+            "K/32 scale grid; refusing full-shard dequantize/requantize "
+            f"(logical_k={logical_k}, source_k_offset={source_k_offset}, "
+            f"scale_cols={int(raw_scale.shape[-1])}, "
+            f"expected_scale_cols={expected_scale_cols})."
+        )
+    return w2, raw_scale
+
+
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -517,7 +545,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w2_scale_cols = intermediate_size // sf_block_size
 
         if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
-            w2, w2_scale = _mxfp4_realign_w2_fp4_e8m0_to_local_k32(
+            w2, w2_scale = _mxfp4_require_native_w2_k32(
                 w2,
                 w2_scale,
                 logical_k=intermediate_size,
@@ -892,7 +920,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_scale_cols = intermediate_size // sf_block_size
 
         if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
-            w2, w2_scale = _mxfp4_realign_w2_fp4_e8m0_to_local_k32(
+            w2, w2_scale = _mxfp4_require_native_w2_k32(
                 w2,
                 w2_scale,
                 logical_k=intermediate_size,
