@@ -49,6 +49,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HYV3Config": "vllm.transformers_utils.configs.hy_v3",
     "HyperCLOVAXConfig": "vllm.transformers_utils.configs.hyperclovax",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
+    "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
+    "KimiK3Config": "vllm.transformers_utils.configs.kimi_k3",
+    "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
+    "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
     # `FalconConfig` class from the official HuggingFace transformers library.
@@ -69,9 +73,6 @@ _CLASS_TO_MODULE: dict[str, str] = {
         "vllm.transformers_utils.configs.moss_transcribe_diarize"
     ),
     "MoonViTConfig": "vllm.transformers_utils.configs.moonvit",
-    "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
-    "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
-    "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
     "NemotronConfig": "vllm.transformers_utils.configs.nemotron",
     "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
     "OlmoHybridConfig": "vllm.transformers_utils.configs.olmo_hybrid",
@@ -138,6 +139,10 @@ __all__ = [
     "HYV3Config",
     "HyperCLOVAXConfig",
     "IsaacConfig",
+    "KimiK25Config",
+    "KimiK3Config",
+    "KimiLinearConfig",
+    "KimiVLConfig",
     "RWConfig",
     "LagunaConfig",
     "Lfm2MoeConfig",
@@ -153,9 +158,6 @@ __all__ = [
     "Moondream3VisionConfig",
     "MossTranscribeDiarizeConfig",
     "MoonViTConfig",
-    "KimiLinearConfig",
-    "KimiVLConfig",
-    "KimiK25Config",
     "NemotronConfig",
     "NemotronHConfig",
     "OlmoHybridConfig",

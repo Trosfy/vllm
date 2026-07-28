@@ -1187,6 +1187,7 @@ def kda_gate_cumsum_fwd_kernel(
     cu_seqlens,
     chunk_indices,
     cumsum_scale,
+    lower_bound,
     beta,
     threshold,
     T,
@@ -1196,6 +1197,7 @@ def kda_gate_cumsum_fwd_kernel(
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     i_d, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -1235,14 +1237,17 @@ def kda_gate_cumsum_fwd_kernel(
         b_bias = tl.load(g_bias + i_h * D + o_d, mask=o_d < D, other=0.0).to(tl.float32)
         b_g = b_g + b_bias[None, :]
 
-    b_a = -tl.exp(tl.load(A + i_h).to(tl.float32))
-    b_g_scaled = b_g * beta
-    b_softplus = tl.where(
-        b_g_scaled > threshold,
-        b_g,
-        (1.0 / beta) * log(1.0 + tl.exp(b_g_scaled)),
-    )
-    b_gate = b_a * b_softplus
+    b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
+    if USE_LOWER_BOUND:
+        b_gate = lower_bound * tl.sigmoid(b_a * b_g)
+    else:
+        b_g_scaled = b_g * beta
+        b_softplus = tl.where(
+            b_g_scaled > threshold,
+            b_g,
+            (1.0 / beta) * log(1.0 + tl.exp(b_g_scaled)),
+        )
+        b_gate = -b_a * b_softplus
 
     # Out-of-bounds rows (load returns 0, but softplus/bias can still make
     # b_gate non-zero) participate in the dot product. They only contribute to
@@ -1260,6 +1265,7 @@ def fused_kda_gate_chunk_cumsum(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
@@ -1293,12 +1299,14 @@ def fused_kda_gate_chunk_cumsum(
         # exp2-based kernels reproduce exp(g). Keep this in sync with the
         # `use_exp2=True` path in `_chunk_kda_fwd_with_cumulative_g`.
         cumsum_scale=RCP_LN2,
+        lower_bound=lower_bound or 0.0,
         beta=beta,
         threshold=threshold,
         T=T,
         H=H,
         D=D,
         BT=chunk_size,
+        USE_LOWER_BOUND=lower_bound is not None,
     )
     return y
 
@@ -1424,6 +1432,7 @@ def chunk_kda_with_fused_gate_fwd(
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
+    lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ):
     chunk_size = FLA_CHUNK_SIZE
@@ -1439,6 +1448,7 @@ def chunk_kda_with_fused_gate_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        lower_bound=lower_bound,
     )
     return _chunk_kda_fwd_with_cumulative_g(
         q=q,
@@ -1502,6 +1512,7 @@ def chunk_kda_with_fused_gate(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     **kwargs,
 ):
     """Run chunk KDA from raw gate projection using fused gate+cumsum."""
@@ -1523,6 +1534,7 @@ def chunk_kda_with_fused_gate(
         scale=scale,
         initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=output_final_state,
+        lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
     )
     return o, final_state
@@ -1543,6 +1555,7 @@ def kda_gate_fwd_kernel(
     A,
     y,
     g_bias,
+    lower_bound,
     beta: tl.constexpr,
     threshold: tl.constexpr,
     T,
@@ -1551,12 +1564,12 @@ def kda_gate_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
 
-    b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
+    b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
 
     stride_row = H * D
     stride_col = 1
@@ -1592,10 +1605,13 @@ def kda_gate_fwd_kernel(
     # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
     # When beta * x > threshold, use linear approximation x
     # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if USE_LOWER_BOUND:
+        b_y = lower_bound * tl.sigmoid(b_a * b_g)
+    else:
+        g_scaled = b_g * beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
+        b_y = -b_a * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1607,6 +1623,7 @@ def fused_kda_gate(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """
     Forward pass for KDA gate:
@@ -1634,6 +1651,7 @@ def fused_kda_gate(
         A,
         y,
         g_bias,
+        lower_bound or 0.0,
         beta,
         threshold,
         T,
@@ -1641,6 +1659,7 @@ def fused_kda_gate(
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)

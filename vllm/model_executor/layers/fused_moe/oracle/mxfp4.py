@@ -13,6 +13,7 @@ from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
+    MoEActivation,
     RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -470,6 +471,15 @@ def select_mxfp4_moe_backend(
     )
 
     runner_backend = config.moe_backend
+    if runner_backend == "auto" and config.activation is MoEActivation.SITU:
+        return _return_or_raise(
+            Mxfp4MoeBackend.B12X,
+            config,
+            kMxfp4Static,
+            None,
+            activation_format,
+            scope="local",
+        )
     if runner_backend != "auto":
         requested_backends = map_mxfp4_backend(runner_backend)
         if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
@@ -586,7 +596,9 @@ def select_deepseek_v4_mxfp4_moe_backend(
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
     runner_backend = config.moe_backend
-    if runner_backend == "auto" and envs.VLLM_USE_B12X_MOE:
+    if runner_backend == "auto" and (
+        envs.VLLM_USE_B12X_MOE or config.activation is MoEActivation.SITU
+    ):
         return _return_or_raise(
             Mxfp4MoeBackend.B12X,
             config,

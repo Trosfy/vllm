@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from functools import cache
 
+import regex as re
 import torch
 
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -130,6 +132,7 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    output_gate: torch.nn.Module | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -189,6 +192,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.o_proj = mla_modules.o_proj
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
+        self.output_gate = mla_modules.output_gate
         self.is_sparse = mla_modules.is_sparse
 
         # Whether to skip top-k token selection computation in this layer.
@@ -336,5 +340,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
+
+        if self.output_gate is not None:
+            gate = self.output_gate(hidden_states)[0]
+            attn_out = attn_out * torch.sigmoid(gate)
 
         return self.o_proj(attn_out)[0]

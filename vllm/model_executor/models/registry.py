@@ -136,6 +136,10 @@ _TEXT_GENERATION_MODELS = {
     "IQuestLoopCoderForCausalLM": ("iquest_loopcoder", "IQuestLoopCoderForCausalLM"),
     "Jais2ForCausalLM": ("jais2", "Jais2ForCausalLM"),
     "JambaForCausalLM": ("jamba", "JambaForCausalLM"),
+    "KimiK3ForConditionalGeneration": (
+        "kimi_linear",
+        "KimiK3ForConditionalGeneration",
+    ),
     "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),
     "Lfm2ForCausalLM": ("lfm2", "Lfm2ForCausalLM"),
     "Lfm2MoeForCausalLM": ("lfm2_moe", "Lfm2MoeForCausalLM"),
