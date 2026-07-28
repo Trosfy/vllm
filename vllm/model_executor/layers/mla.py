@@ -3,10 +3,10 @@
 import json
 import math
 import os
-import re
 from dataclasses import dataclass
 from functools import cache
 
+import regex as re
 import torch
 
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -45,9 +45,7 @@ def _is_glm_moe_dsa_model() -> bool:
         _IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    target_model_config = getattr(
-        speculative_config, "target_model_config", None
-    )
+    target_model_config = getattr(speculative_config, "target_model_config", None)
     target_model_type = (
         getattr(target_model_config.hf_config, "model_type", None)
         if target_model_config is not None
@@ -67,28 +65,27 @@ def _load_nvfp4_mla_outer_scales(path: str) -> tuple[float, ...]:
         raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} must contain a JSON object")
     if payload.get("format") != _NVFP4_MLA_SCALES_FORMAT:
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} has unsupported format "
-            f"{payload.get('format')!r}"
+            f"{_NVFP4_MLA_SCALES_ENV} has unsupported format {payload.get('format')!r}"
         )
     if type(payload.get("num_layers")) is not int or (
         payload["num_layers"] != _NVFP4_MLA_NUM_LAYERS
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"num_layers={_NVFP4_MLA_NUM_LAYERS}"
+            f"{_NVFP4_MLA_SCALES_ENV} must declare num_layers={_NVFP4_MLA_NUM_LAYERS}"
         )
     if type(payload.get("latent_dim")) is not int or (
         payload["latent_dim"] != _NVFP4_MLA_LATENT_DIM
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"latent_dim={_NVFP4_MLA_LATENT_DIM}"
+            f"{_NVFP4_MLA_SCALES_ENV} must declare latent_dim={_NVFP4_MLA_LATENT_DIM}"
         )
     denominator = payload.get("denominator")
-    if isinstance(denominator, bool) or not isinstance(
-        denominator, (int, float)
-    ) or not math.isclose(
-        float(denominator), _NVFP4_MLA_SCALE_DENOMINATOR, rel_tol=0.0, abs_tol=0.0
+    if (
+        isinstance(denominator, bool)
+        or not isinstance(denominator, (int, float))
+        or not math.isclose(
+            float(denominator), _NVFP4_MLA_SCALE_DENOMINATOR, rel_tol=0.0, abs_tol=0.0
+        )
     ):
         raise ValueError(
             f"{_NVFP4_MLA_SCALES_ENV} must declare "
@@ -130,6 +127,7 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    output_gate: torch.nn.Module | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -189,6 +187,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.o_proj = mla_modules.o_proj
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
+        self.output_gate = mla_modules.output_gate
         self.is_sparse = mla_modules.is_sparse
 
         # Whether to skip top-k token selection computation in this layer.
@@ -239,9 +238,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             # That layer is deep/late (not underflowing) and its KV is transient,
             # so identity there is a safe no-op for KLD.
             if 0 <= layer_idx < _NVFP4_MLA_NUM_LAYERS:
-                self._nvfp4_mla_outer_scale = _load_nvfp4_mla_outer_scales(
-                    scale_file
-                )[layer_idx]
+                self._nvfp4_mla_outer_scale = _load_nvfp4_mla_outer_scales(scale_file)[
+                    layer_idx
+                ]
         # forward_mqa receives this MLAAttention object as ``layer``.  Keep a
         # host float here so no device .item() or per-call scale tensor is needed.
         self.mla_attn._nvfp4_mla_outer_scale = self._nvfp4_mla_outer_scale
@@ -314,9 +313,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
-        if self._kv_fp8_rope and (
-            k_pe.dtype != torch.bfloat16 or k_pe.shape[-1] != 64
-        ):
+        if self._kv_fp8_rope and (k_pe.dtype != torch.bfloat16 or k_pe.shape[-1] != 64):
             raise RuntimeError(
                 "KV_FP8_ROPE POST-RoPE writer requires BF16 k_pe[...,64], got "
                 f"dtype={k_pe.dtype}, shape={tuple(k_pe.shape)}"
@@ -334,5 +331,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
+
+        if self.output_gate is not None:
+            gate = self.output_gate(hidden_states)[0]
+            attn_out = attn_out * torch.sigmoid(gate)
 
         return self.o_proj(attn_out)[0]

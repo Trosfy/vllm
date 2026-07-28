@@ -4,10 +4,15 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe import MoEActivation
+from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     convert_weight_to_mxfp4_moe_kernel_format,
     mxfp4_round_up_hidden_size_and_intermediate_size,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_w4a4_mxfp4 as compressed_mxfp4,
 )
 from vllm.model_executor.layers.quantization.mxfp4 import (
     _ceil_div,
@@ -181,3 +186,103 @@ def test_b12x_kimi_k3_shapes_and_checkpoint_tensors_are_not_generic_repacked() -
         assert (
             result.untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
         )
+
+
+def test_compressed_mxfp4_situ_selects_b12x(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        compressed_mxfp4.CutlassExpertsMxfp4,
+        "_supports_current_device",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        compressed_mxfp4,
+        "select_mxfp4_moe_backend",
+        lambda _moe: (Mxfp4MoeBackend.B12X, B12xExperts),
+    )
+
+    method = compressed_mxfp4.CompressedTensorsW4A4Mxfp4MoEMethod(
+        type("MoeConfig", (), {"activation": MoEActivation.SITU})()
+    )
+
+    assert method.mxfp4_backend == Mxfp4MoeBackend.B12X
+    assert method.experts_cls is B12xExperts
+    assert not method.use_cutlass_mxfp4
+
+
+def test_compressed_mxfp4_b12x_keeps_checkpoint_storage_and_prepares_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method = object.__new__(compressed_mxfp4.CompressedTensorsW4A4Mxfp4MoEMethod)
+    method.use_cutlass_mxfp4 = False
+    method.mxfp4_backend = Mxfp4MoeBackend.B12X
+    method.moe = object()
+    method.experts_cls = B12xExperts
+    method.moe_quant_config = None
+    method.moe_kernel = None
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "w13_weight_packed",
+        torch.nn.Parameter(
+            torch.empty(2, 16, 8, dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "w2_weight_packed",
+        torch.nn.Parameter(
+            torch.empty(2, 8, 8, dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "w13_weight_scale",
+        torch.nn.Parameter(
+            torch.empty(2, 16, 1, dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "w2_weight_scale",
+        torch.nn.Parameter(
+            torch.empty(2, 8, 1, dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    layer._expert_routing_tables = lambda: None
+
+    w13_ptr = layer.w13_weight_packed.untyped_storage().data_ptr()
+    w2_ptr = layer.w2_weight_packed.untyped_storage().data_ptr()
+    prepared_layers = []
+    fake_experts = type(
+        "FakeExperts",
+        (),
+        {
+            "process_weights_after_loading": lambda self, target: (
+                prepared_layers.append(target)
+            )
+        },
+    )()
+    fake_kernel = type("FakeKernel", (), {"fused_experts": fake_experts})()
+
+    monkeypatch.setattr(
+        compressed_mxfp4,
+        "make_mxfp4_moe_quant_config",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        compressed_mxfp4,
+        "make_mxfp4_moe_kernel",
+        lambda **_kwargs: fake_kernel,
+    )
+    monkeypatch.setattr(
+        compressed_mxfp4,
+        "prepare_moe_fp4_layer_for_marlin",
+        lambda _layer: pytest.fail("B12X must not invoke the Marlin repacker"),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert not hasattr(layer, "w13_weight_packed")
+    assert not hasattr(layer, "w2_weight_packed")
+    assert layer.w13_weight.untyped_storage().data_ptr() == w13_ptr
+    assert layer.w2_weight.untyped_storage().data_ptr() == w2_ptr
+    assert prepared_layers == [layer]

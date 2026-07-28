@@ -202,20 +202,44 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
 
-        self.g_a_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.g_a_proj",
-        )
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.g_b_proj",
-        )
+        self.use_full_rank_gate = bool(kda_config.get("use_full_rank_gate", False))
+        self.g_proj: ColumnParallelLinear | None
+        self.g_a_proj: ReplicatedLinear | None
+        self.g_b_proj: ColumnParallelLinear | None
+        if self.use_full_rank_gate:
+            self.g_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.g_proj",
+            )
+            self.g_a_proj = None
+            self.g_b_proj = None
+        else:
+            self.g_proj = None
+            self.g_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.g_a_proj",
+            )
+            self.g_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.g_b_proj",
+            )
+        self.gate_lower_bound = kda_config.get("gate_lower_bound")
+        if self.gate_lower_bound is not None:
+            self.gate_lower_bound = float(self.gate_lower_bound)
+            if not -20.0 <= self.gate_lower_bound < 0.0:
+                raise ValueError(
+                    "linear_attn_config.gate_lower_bound must be in [-20, 0), "
+                    f"got {self.gate_lower_bound}"
+                )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
             projection_size,
@@ -246,7 +270,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
 
-        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        if self.g_proj is not None:
+            g_proj_states = self.g_proj(hidden_states)[0]
+        else:
+            assert self.g_a_proj is not None
+            assert self.g_b_proj is not None
+            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
         core_attn_out = torch.zeros(
@@ -412,6 +441,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=non_spec_query_start_loc,
+                lower_bound=self.gate_lower_bound,
             )
             # Init cache
             recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
@@ -422,6 +452,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.A_log,
                 self.head_dim,
                 g_bias=self.dt_bias,
+                lower_bound=self.gate_lower_bound,
             ).unsqueeze(0)
             (
                 core_attn_out_non_spec,

@@ -8,6 +8,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
+    MoEActivation,
     RoutedExperts,
     SharedExperts,
 )
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
+    select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -49,7 +51,12 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         # use cutlass if supported, otherwise fallback to marlin for weight-only FP4
         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
         self.experts_cls: type[mk.FusedMoEExperts]
-        if self.use_cutlass_mxfp4:
+        if moe.activation is MoEActivation.SITU:
+            self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)
+            assert experts_cls is not None
+            self.experts_cls = experts_cls
+            self.use_cutlass_mxfp4 = False
+        elif self.use_cutlass_mxfp4:
             logger.info_once("Using CutlassExpertsMxfp4 for MXFP4 MoE")
             self.experts_cls = CutlassExpertsMxfp4
         elif current_platform.is_xpu():
@@ -188,6 +195,10 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale = torch.nn.Parameter(
                 torch.stack(swizzled_w2), requires_grad=False
             )
+        elif self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+            # B12X consumes the checkpoint's packed E2M1 values and E8M0
+            # K/32 scales directly; do not invoke the Marlin repacker.
+            pass
         elif current_platform.is_xpu():
             pass
         else:
@@ -208,6 +219,8 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 mxfp4_backend=self.mxfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
             )
+            if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def apply(
         self,

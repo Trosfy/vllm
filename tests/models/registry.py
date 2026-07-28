@@ -358,6 +358,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "random": "ai21labs/Jamba-tiny-random",
         },
     ),
+    "KimiK3ForConditionalGeneration": _HfExamplesInfo(
+        "moonshotai/Kimi-K3", trust_remote_code=True
+    ),
     "KimiLinearForCausalLM": _HfExamplesInfo(
         "moonshotai/Kimi-Linear-48B-A3B-Instruct", trust_remote_code=True
     ),
