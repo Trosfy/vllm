@@ -40,6 +40,9 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -78,7 +81,7 @@ _BF16_BYTES = 2
 _EXTEND_PREWARM_DONE: set[
     tuple[int | None, int, int, int, int, int, bool, str, bool]
 ] = set()
-_KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
+_KV_FP8_ROPE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
 
 
 _IS_GLM_MOE_DSA_CACHE: bool | None = None
@@ -125,6 +128,31 @@ def _is_glm_moe_dsa_model() -> bool:
 def _kv_fp8_rope_enabled() -> bool:
     """Strict public gate plus literal GLM architecture selection."""
     return _KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
+
+
+# Inline-scale two-level NVFP4 records: the writer derives a per-token
+# second-level scale (fp32 at record bytes [292, 296)) and the readers consume
+# it from the record instead of a per-layer launch scalar.  Requires the
+# 368-byte KV_FP8_ROPE=1 record and a SparkInfer build with the matching
+# writer/reader mode.  Mutually exclusive with VLLM_NVFP4_MLA_SCALES_FILE.
+_NVFP4_DYNAMIC_SCALE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.dynamic_scale
+
+
+def _require_callable_parameters(
+    feature: str,
+    callables: tuple[tuple[str, Any], ...],
+    required: frozenset[str],
+) -> None:
+    unsupported = [
+        name
+        for name, function in callables
+        if not required.issubset(inspect.signature(function).parameters)
+    ]
+    if unsupported:
+        raise RuntimeError(
+            f"{feature} requires SparkInfer callables accepting "
+            f"{sorted(required)!r}; unsupported: {', '.join(unsupported)}"
+        )
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -1284,6 +1312,27 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             self._concat_and_cache_nvfp4_mla_fp8_rope = (
                 concat_and_cache_nvfp4_mla_fp8_rope
             )
+        self._nvfp4_dynamic_scale = bool(
+            self._kv_fp8_rope and _NVFP4_DYNAMIC_SCALE_REQUESTED
+        )
+        if _NVFP4_DYNAMIC_SCALE_REQUESTED and not self._kv_fp8_rope:
+            raise RuntimeError(
+                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires the 368-byte "
+                "KV_FP8_ROPE=1 nvfp4_ds_mla record (got kv_cache_dtype="
+                f"{self.kv_cache_dtype!r}, KV_FP8_ROPE="
+                f"{'1' if _kv_fp8_rope_enabled() else '0'})"
+            )
+        if self._nvfp4_dynamic_scale:
+            _require_callable_parameters(
+                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 writer",
+                (
+                    (
+                        "concat_and_cache_nvfp4_mla_fp8_rope",
+                        self._concat_and_cache_nvfp4_mla_fp8_rope,
+                    ),
+                ),
+                frozenset({"per_token_scale"}),
+            )
 
         # MLA dims (absorbed: Q post-projection is [T, H, kv_lora_rank + rope]).
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
@@ -1427,20 +1476,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         if self._b12x_scale_format is not None:
             required_kwargs = {"latent_scale", "scale_format"}
-            unsupported_forwards = [
-                mode
-                for mode, forward in (
+            if self._nvfp4_dynamic_scale:
+                required_kwargs = required_kwargs | {"latent_scale_per_token"}
+            _require_callable_parameters(
+                "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla'",
+                (
                     ("decode", sparse_mla_decode_forward),
                     ("extend", sparse_mla_extend_forward),
-                )
-                if not required_kwargs.issubset(inspect.signature(forward).parameters)
-            ]
-            if unsupported_forwards:
-                raise RuntimeError(
-                    "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla' "
-                    "requires a b12x build with NVFP4 sparse-MLA API support; "
-                    "unsupported forwards: " + ", ".join(unsupported_forwards)
-                )
+                ),
+                frozenset(required_kwargs),
+            )
 
         # Eager PLAN -> BIND -> KERNEL (no b12x workspace/arena, ever). We build a
         # caller-owned-scratch PLAN once per mode; each forward maps a vLLM
@@ -1702,13 +1747,25 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 f"KV_FP8_ROPE writer reached a non-NVFP4 cache: {kv_cache_dtype!r}"
             )
         k_pe_flat = k_pe.squeeze(1)
-        self._concat_and_cache_nvfp4_mla_fp8_rope(
-            kv_c_normed,
-            k_pe_flat,
-            kv_cache,
-            slot_mapping.flatten(),
-            k_scale,
-        )
+        if self._nvfp4_dynamic_scale:
+            self._concat_and_cache_nvfp4_mla_fp8_rope(
+                kv_c_normed,
+                k_pe_flat,
+                kv_cache,
+                slot_mapping.flatten(),
+                k_scale,
+                per_token_scale=True,
+            )
+        else:
+            # Keyword omitted so pre-two-level SparkInfer builds keep working
+            # when the mode is off.
+            self._concat_and_cache_nvfp4_mla_fp8_rope(
+                kv_c_normed,
+                k_pe_flat,
+                kv_cache,
+                slot_mapping.flatten(),
+                k_scale,
+            )
 
     def _borrow_workspaces(self) -> list[torch.Tensor]:
         workspaces = current_workspace_manager().get_simultaneous(
@@ -2284,13 +2341,23 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         k_scale = getattr(layer, "_k_scale", None)
         if self._kv_fp8_rope:
-            self._concat_and_cache_nvfp4_mla_fp8_rope(
-                kv_c,
-                k_pe_flat,
-                gathered_buffer,
-                slots,
-                k_scale,
-            )
+            if self._nvfp4_dynamic_scale:
+                self._concat_and_cache_nvfp4_mla_fp8_rope(
+                    kv_c,
+                    k_pe_flat,
+                    gathered_buffer,
+                    slots,
+                    k_scale,
+                    per_token_scale=True,
+                )
+            else:
+                self._concat_and_cache_nvfp4_mla_fp8_rope(
+                    kv_c,
+                    k_pe_flat,
+                    gathered_buffer,
+                    slots,
+                    k_scale,
+                )
         elif self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla"):
             ops.concat_and_cache_mla(
                 kv_c,
@@ -2325,6 +2392,18 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     def _b12x_kernel_format_kwargs(self, latent_scale: float = 1.0) -> dict[str, Any]:
         if self._b12x_scale_format is None:
             return {}
+        if self._nvfp4_dynamic_scale:
+            if float(latent_scale) != 1.0:
+                raise RuntimeError(
+                    "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 is mutually exclusive with "
+                    "a per-layer outer scale (got latent_scale="
+                    f"{latent_scale!r}); unset VLLM_NVFP4_MLA_SCALES_FILE"
+                )
+            return {
+                "latent_scale": 1.0,
+                "scale_format": self._b12x_scale_format,
+                "latent_scale_per_token": True,
+            }
         return {
             "latent_scale": float(latent_scale),
             "scale_format": self._b12x_scale_format,

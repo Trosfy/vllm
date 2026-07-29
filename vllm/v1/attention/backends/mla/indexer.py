@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_indexer_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -30,7 +30,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MLAAttentionSpec,
+    get_kv_cache_cp_shard_count,
+)
 
 logger = init_logger(__name__)
 
@@ -284,9 +288,12 @@ def get_indexer_max_num_blocks_per_req(
     block_size: int,
     configured_cp_world_size: int,
     dcp_replicated: bool,
+    dcp_kv_shard_count: int | None = None,
 ) -> int:
     """Size indexer metadata for the cache group's effective DCP layout."""
-    effective_cp_world_size = 1 if dcp_replicated else configured_cp_world_size
+    effective_cp_world_size = (
+        1 if dcp_replicated else int(dcp_kv_shard_count or configured_cp_world_size)
+    )
     return cdiv(max_model_len, block_size * effective_cp_world_size)
 
 
@@ -370,8 +377,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         configured_cp_world_size = (
             configured_dcp_world_size * parallel_config.prefill_context_parallel_size
         )
-        self.dcp_world_size = 1 if self.dcp_replicated else configured_dcp_world_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.dcp_world_size = get_kv_cache_cp_shard_count(
+            self.kv_cache_spec,
+            configured_dcp_world_size,
+            parallel_config.prefill_context_parallel_size,
+        )
+        if self.dcp_world_size > 1:
+            indexer_group = get_indexer_dcp_group(self.dcp_world_size)
+            if int(indexer_group.world_size) != self.dcp_world_size:
+                raise RuntimeError(
+                    "Indexer metadata DCP group does not match its KV shard count: "
+                    f"group={indexer_group.world_size}, shards={self.dcp_world_size}"
+                )
+            self.dcp_rank = int(indexer_group.rank_in_group)
+        else:
+            self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
@@ -410,9 +430,23 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # caches). Outside the SM100 family the FP8
         # paged MQA logits kernel only supports next_n in (1, 2)
         # (deepgemm smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there.
-        self.use_flattening = not current_platform.is_device_capability_family(
-            100
-        ) and next_n not in (1, 2)
+        # The B12X / sparkinfer sparse indexer handles native next_n>2 on SM120
+        # directly (see sparse_attn_indexer warmup q_rows 1, 2, 4), so it must
+        # NOT be forced onto the DeepGEMM next_n<=2 flatten fallback. Flattening
+        # MTP-2/MTP-3 verification into rank-1 rows produced subtly wrong accepted
+        # tokens (code-gen syntax errors); the native (B, next_n) path keeps MTP
+        # correct. Use the canonical backend-aware predicate so this also holds
+        # when B12X is selected via --attention-backend B12X_MLA_SPARSE with the
+        # VLLM_USE_B12X_SPARSE_INDEXER env var unset (it also asserts SM120).
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            use_b12x_sparse_indexer,
+        )
+
+        self.use_flattening = (
+            not current_platform.is_device_capability_family(100)
+            and next_n not in (1, 2)
+            and not use_b12x_sparse_indexer()
+        )
         # SM100 supports the varlen paged MQA logits kernel (indices-selected,
         # next_n == 1 rows). Only compact spec-decode verification batches opt
         # into it; uniform DFlash draft proposal should keep the native path.
@@ -472,6 +506,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.kv_cache_spec.block_size,
             configured_cp_world_size,
             self.dcp_replicated,
+            getattr(self.kv_cache_spec, "dcp_kv_shard_count", None),
         )
         # Keep the expanded decode table layout identical to the model
         # runner's block table. The runner right-pads rows to a 128-token

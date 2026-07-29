@@ -1747,6 +1747,39 @@ def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
     ) == pytest.approx(2.0)
 
 
+def test_partial_replicated_mla_uses_lockstep_dcp8_layout():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    groups = [
+        KVCacheGroupSpec(["target"], target),
+        KVCacheGroupSpec(["indexer"], indexer),
+    ]
+
+    assert kv_cache_utils._use_lockstep_mla_allocation(groups, 8, 1)
+    assert target.block_size * 8 == indexer.block_size * 4 == 512
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer}, 8, 1
+    )
+    assert grouped_specs is not None
+    grouped = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert len(grouped) == 2
+    assert kv_cache_utils._use_lockstep_mla_allocation(grouped, 8, 1)
+    assert grouped[1].kv_cache_spec.page_size_bytes == indexer.page_size_bytes
+
+
 def test_lockstep_mla_predicate_rejects_nonmatching_layouts():
     sharded = MLAAttentionSpec(
         block_size=64,
@@ -1838,6 +1871,47 @@ def test_lockstep_mla_equal_page_sizes_use_distinct_tensors():
     assert [tensor.size for tensor in kv_cache_config.kv_cache_tensors] == [
         3 * sharded.page_size_bytes,
         3 * replicated.page_size_bytes,
+    ]
+
+
+def test_custom_cp_specs_with_same_block_size_stay_in_type_specific_groups():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    replicated_full = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    replicated_sink = SinkFullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+        sink_len=4,
+    )
+
+    grouped = group_and_unify_kv_cache_specs(
+        {
+            "target": target,
+            "full": replicated_full,
+            "sink": replicated_sink,
+        },
+        dcp_world_size=4,
+    )
+
+    assert grouped is not None
+    assert len(grouped) == 3
+    assert [set(group.kv_cache_specs) for group in grouped] == [
+        {"target"},
+        {"full"},
+        {"sink"},
     ]
 
 
