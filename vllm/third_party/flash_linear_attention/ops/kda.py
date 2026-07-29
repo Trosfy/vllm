@@ -9,6 +9,8 @@
 # ruff: noqa: E501
 
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -27,6 +29,75 @@ from .utils import FLA_CHUNK_SIZE, is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+
+def _kda_autotune_configs(configs):
+    """Select one valid config when post-KV runtime tuning cannot fit."""
+    if os.getenv("KDA_DISABLE_AUTOTUNE") == "1":
+        return configs[:1]
+    return configs
+
+
+def _do_bench_with_bounded_cache(fn, quantiles):
+    """Run Triton autotuning without its unconditional 256 MiB buffer.
+
+    Triton's NVIDIA benchmarker allocates a 256 MiB tensor solely to evict L2
+    cache lines.  That auxiliary allocation can OOM after a deliberately large
+    KV cache has consumed almost all device memory.  KDA has several kernels
+    which are first autotuned on the first request, so bound the eviction tensor
+    to both 16 MiB and one eighth of currently free device memory.  This only
+    affects autotuning measurements; it does not alter kernel execution.
+    """
+    from triton import runtime
+
+    active_driver = runtime.driver.active
+    original_get_empty_cache = active_driver.get_empty_cache_for_benchmark
+
+    def get_bounded_empty_cache():
+        free_bytes, _ = torch.cuda.mem_get_info()
+        cache_bytes = min(16 * 1024 * 1024, free_bytes // 8)
+        cache_ints = cache_bytes // 4
+        return torch.empty(cache_ints, dtype=torch.int, device="cuda")
+
+    active_driver.get_empty_cache_for_benchmark = get_bounded_empty_cache
+    try:
+        return active_driver.get_benchmarker()(fn, quantiles=quantiles)
+    finally:
+        active_driver.get_empty_cache_for_benchmark = original_get_empty_cache
+
+
+def _install_memory_tight_triton_runtime():
+    """Avoid all post-KV Triton autotuning allocations in this worker."""
+    if os.getenv("KDA_DISABLE_AUTOTUNE") != "1":
+        return
+
+    from triton import runtime
+    from triton.runtime.autotuner import Autotuner
+
+    active_driver = runtime.driver.active
+    if not getattr(active_driver, "_vllm_memory_tight_benchmark_cache", False):
+
+        def get_bounded_empty_cache():
+            free_bytes, _ = torch.cuda.mem_get_info()
+            cache_bytes = min(16 * 1024 * 1024, free_bytes // 8)
+            return torch.empty(cache_bytes // 4, dtype=torch.int, device="cuda")
+
+        active_driver.get_empty_cache_for_benchmark = get_bounded_empty_cache
+        active_driver._vllm_memory_tight_benchmark_cache = True
+
+    if not getattr(Autotuner, "_vllm_memory_tight_run", False):
+        original_run = Autotuner.run
+
+        def run_single_config(self, *args, **kwargs):
+            if len(self.configs) > 1:
+                self.configs = self.configs[:1]
+            return original_run(self, *args, **kwargs)
+
+        Autotuner.run = run_single_config
+        Autotuner._vllm_memory_tight_run = True
+
+
+_install_memory_tight_triton_runtime()
 
 
 def fused_recurrent_kda_fwd(
@@ -509,13 +580,16 @@ class FusedRMSNormGated(CustomOp):
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_kda_autotune_configs(
+        [
+            triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+            for BK in [32, 64]
+            for num_warps in [1, 2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["BC"],
+    do_bench=_do_bench_with_bounded_cache,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
@@ -620,8 +694,11 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=_kda_autotune_configs(
+        [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]]
+    ),
     key=["BK", "BT"],
+    do_bench=_do_bench_with_bounded_cache,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
@@ -806,12 +883,15 @@ def chunk_kda_scaled_dot_kkt_fwd(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_kda_autotune_configs(
+        [
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    do_bench=_do_bench_with_bounded_cache,
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
@@ -1006,14 +1086,19 @@ def recompute_w_u_fwd(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_kda_autotune_configs(
+        [
+            triton.Config(
+                {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
+            )
+            for BK in [32, 64]
+            for BV in [64, 128]
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["BT"],
+    do_bench=_do_bench_with_bounded_cache,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -1171,12 +1256,15 @@ def chunk_gla_fwd_o_gk(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BD": BD}, num_warps=num_warps)
-        for BD in [32, 64]
-        for num_warps in [2, 4, 8]
-    ],
+    configs=_kda_autotune_configs(
+        [
+            triton.Config({"BD": BD}, num_warps=num_warps)
+            for BD in [32, 64]
+            for num_warps in [2, 4, 8]
+        ]
+    ),
     key=["H", "D", "BT", "IS_VARLEN"],
+    do_bench=_do_bench_with_bounded_cache,
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_cumsum_fwd_kernel(
@@ -1541,13 +1629,16 @@ def chunk_kda_with_fused_gate(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
-        for bt in BT_LIST_AUTOTUNE
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [2, 3]
-    ],
+    configs=_kda_autotune_configs(
+        [
+            triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
+            for bt in BT_LIST_AUTOTUNE
+            for nw in NUM_WARPS_AUTOTUNE
+            for ns in [2, 3]
+        ]
+    ),
     key=["H", "D"],
+    do_bench=_do_bench_with_bounded_cache,
 )
 @triton.jit
 def kda_gate_fwd_kernel(

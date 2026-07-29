@@ -907,6 +907,7 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -916,6 +917,10 @@ def safetensors_weights_iterator(
 
     When *weight_name_prefixes* is provided, non-matching checkpoint tensors are
     skipped before reading from disk when the load strategy supports it.
+
+    When *indexed_tensor_files* is provided, only tensors assigned to each shard
+    by the safetensors index are yielded. This matters for composed checkpoints
+    whose physical shards may contain stale copies of remapped tensors.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -994,10 +999,19 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
+        st_file_abs = os.path.abspath(st_file)
+
+        def is_indexed_here(name: str) -> bool:
+            return indexed_tensor_files is None or (
+                indexed_tensor_files.get(name) == st_file_abs
+            )
+
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
+                if not is_indexed_here(name):
+                    continue
                 if weight_name_prefixes and not _matches_weight_name_prefixes(
                     name, weight_name_prefixes
                 ):
@@ -1019,6 +1033,8 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
+                    if not is_indexed_here(name):
+                        continue
                     if weight_name_prefixes and not _matches_weight_name_prefixes(
                         name, weight_name_prefixes
                     ):
@@ -1041,6 +1057,8 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
+                    if not is_indexed_here(name):
+                        continue
                     if weight_name_prefixes and not _matches_weight_name_prefixes(
                         name, weight_name_prefixes
                     ):

@@ -11,6 +11,8 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -19,7 +21,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -62,6 +63,38 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+class KimiColumnParallelGate(ColumnParallelLinear):
+    """TP-sharded K3 router with globally ordered FP32 logits."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_size,
+            bias=False,
+            gather_output=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
+            output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+        else:
+            output_parallel = torch.nn.functional.linear(
+                x.to(self.weight.dtype), self.weight
+            ).float()
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        return output, None
 
 
 class KimiMLP(nn.Module):
@@ -140,11 +173,9 @@ class KimiMoE(nn.Module):
                 "Only silu and situ are supported."
             )
 
-        self.gate = GateLinear(
+        self.gate = KimiColumnParallelGate(
             hidden_size,
             num_experts,
-            bias=False,
-            out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
 
@@ -167,15 +198,16 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.routed_expert_down_proj: ReplicatedLinear | None = None
+        self.routed_expert_down_proj: ColumnParallelLinear | None = None
         self.routed_expert_norm: RMSNorm | None = None
-        self.routed_expert_up_proj: ReplicatedLinear | None = None
+        self.routed_expert_up_proj: RowParallelLinear | None = None
         self.routed_output_transform: KimiRoutedOutputTransform | None = None
         if routed_expert_hidden_size is not None:
-            self.routed_expert_down_proj = ReplicatedLinear(
+            self.routed_expert_down_proj = ColumnParallelLinear(
                 hidden_size,
                 routed_expert_hidden_size,
                 bias=False,
+                gather_output=True,
                 quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
@@ -184,10 +216,12 @@ class KimiMoE(nn.Module):
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = ReplicatedLinear(
+            self.routed_expert_up_proj = RowParallelLinear(
                 routed_expert_hidden_size,
                 hidden_size,
                 bias=False,
+                input_is_parallel=False,
+                reduce_results=False,
                 quant_config=None,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
@@ -230,13 +264,20 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        up_proj: ReplicatedLinear,
+        up_proj: RowParallelLinear,
     ) -> None:
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The routed expert GEMM consumes TP-sharded intermediate channels and
+        # therefore returns a partial latent vector. Reconstruct it before
+        # latent RMSNorm, then let the row-parallel up projection emit a
+        # hidden-width partial. FusedMoE's final TP all-reduce combines that
+        # partial together with the shared-expert partial exactly once.
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         return self.up_proj(hidden_states)[0]
@@ -773,6 +814,14 @@ class KimiLinearModel(nn.Module):
                 continue
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
+            # kquant gives NF3 payloads distinct suffixes so they can coexist
+            # with untouched MXFP4 experts in one checkpoint. Normalize only
+            # the logical loader name; ``loaded_weight`` already contains the
+            # tensor read under the original safetensors key.
+            if name.endswith(".nf3_packed"):
+                name = name.removesuffix(".nf3_packed") + ".weight_packed"
+            elif name.endswith(".nf3_scale"):
+                name = name.removesuffix(".nf3_scale") + ".weight_scale"
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
@@ -840,7 +889,14 @@ class KimiLinearModel(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, loaded_weight, **kwargs)
+                    try:
+                        weight_loader(param, loaded_weight, **kwargs)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Failed to load Kimi weight {name}: checkpoint "
+                            f"shape={tuple(loaded_weight.shape)}, parameter "
+                            f"shape={tuple(param.shape)}"
+                        ) from exc
             loaded_params.add(name)
         return loaded_params
 

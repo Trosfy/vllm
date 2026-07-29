@@ -81,3 +81,35 @@ def test_safetensors_prefix_filter_fails_when_index_has_no_matches(tmp_path):
             "model.safetensors.index.json",
             ("mtp.",),
         )
+
+
+def test_safetensors_iterator_honors_tensor_to_shard_index(tmp_path):
+    base_shard = tmp_path / "model-00001-of-00002.safetensors"
+    overlay_shard = tmp_path / "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            "model.expert.weight": torch.tensor([1.0]),
+            "model.dense.weight": torch.tensor([2.0]),
+        },
+        base_shard,
+    )
+    save_file({"model.expert.weight": torch.tensor([3.0])}, overlay_shard)
+
+    indexed_tensor_files = {
+        "model.dense.weight": str(base_shard.resolve()),
+        "model.expert.weight": str(overlay_shard.resolve()),
+    }
+    weights = list(
+        safetensors_weights_iterator(
+            [str(base_shard), str(overlay_shard)],
+            use_tqdm_on_load=False,
+            indexed_tensor_files=indexed_tensor_files,
+        )
+    )
+
+    assert [name for name, _ in weights] == [
+        "model.dense.weight",
+        "model.expert.weight",
+    ]
+    assert weights[0][1].item() == 2.0
+    assert weights[1][1].item() == 3.0
