@@ -3,6 +3,7 @@
 
 from collections.abc import Iterable
 
+import regex
 import torch
 from torch import nn
 
@@ -64,9 +65,19 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# Matches "...experts.<id>.<w1|w2|w3>.<suffix>" checkpoint names for the O(1)
+# expert-tensor dispatch in load_weights.
+_EXPERT_TENSOR_RE = regex.compile(r"^(.*\.experts)\.(\d+)\.(w[123])\.(.+)$")
+
 
 class KimiColumnParallelGate(ColumnParallelLinear):
-    """TP-sharded K3 router with globally ordered FP32 logits."""
+    """TP-sharded K3 router with globally ordered FP32 logits.
+
+    When num_experts does not divide the TP world size (K3: 896 at TP6/TP12),
+    the weight is padded to the next multiple; ColumnParallelLinear's loader
+    zero-pads the checkpoint tail via pad_or_narrow and the gathered logits
+    are sliced back to the logical expert count.
+    """
 
     def __init__(
         self,
@@ -74,9 +85,12 @@ class KimiColumnParallelGate(ColumnParallelLinear):
         output_size: int,
         prefix: str,
     ) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        self._logical_output_size = output_size
+        padded_output_size = -(-output_size // tp_size) * tp_size
         super().__init__(
             input_size,
-            output_size,
+            padded_output_size,
             bias=False,
             gather_output=False,
             quant_config=None,
@@ -94,7 +108,7 @@ class KimiColumnParallelGate(ColumnParallelLinear):
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
-        return output, None
+        return output[..., : self._logical_output_size], None
 
 
 class KimiMLP(nn.Module):
@@ -826,6 +840,37 @@ class KimiLinearModel(nn.Module):
                 name = name.removesuffix(".nf3_packed") + ".weight_packed"
             elif name.endswith(".nf3_scale"):
                 name = name.removesuffix(".nf3_scale") + ".weight_scale"
+            elif name.endswith(".nf3_refit_packed"):
+                name = name.removesuffix(".nf3_refit_packed") + ".weight_packed"
+            elif name.endswith(".nf3_refit_scale"):
+                name = name.removesuffix(".nf3_refit_scale") + ".weight_scale"
+
+            # Fast path for per-expert tensors: at K3 scale (896 experts x 92
+            # layers x 3 matrices, ~500k tensors) the linear scan over the
+            # expert mapping list is O(experts) substring checks per tensor
+            # (~1.3e9 comparisons per worker); one regex gives the same
+            # mapping in O(1).
+            em = _EXPERT_TENSOR_RE.match(name)
+            if em is not None and expert_params_mapping:
+                eprefix, eid, wkey, esuffix = em.groups()
+                mapped = (
+                    f"{eprefix}."
+                    f"{'w13_' if wkey in ('w1', 'w3') else 'w2_'}{esuffix}"
+                )
+                if is_pp_missing_parameter(mapped, self):
+                    continue
+                eparam = params_dict.get(mapped)
+                if eparam is None:
+                    continue
+                eparam.weight_loader(
+                    eparam,
+                    loaded_weight,
+                    mapped,
+                    expert_id=int(eid),
+                    shard_id=wkey,
+                )
+                loaded_params.add(mapped)
+                continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
@@ -852,6 +897,15 @@ class KimiLinearModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
+                if "fused_qkv_a_proj" in name:
+                    # Replicated (disable_tp) merged linear: the stock merged
+                    # loader applies a tp_rank shard offset, which is wrong
+                    # for a replicated param. Copy the halves directly.
+                    offset = 0 if shard_id == 0 else self.config.q_lora_rank
+                    param.data.narrow(0, offset, loaded_weight.shape[0]).copy_(
+                        loaded_weight.to(param.dtype)
+                    )
+                    break
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break

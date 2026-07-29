@@ -64,7 +64,9 @@ def _get_mla_prefill_backend_priorities(
             MLAPrefillBackendEnum.FLASH_ATTN,
         ]
 
-    if device_capability.major == 10:  # Blackwell
+    if (
+        device_capability.major >= 10
+    ):  # Blackwell (SM100 datacenter, SM120 GeForce/RTX PRO)
         return [
             MLAPrefillBackendEnum.FLASH_ATTN,
             MLAPrefillBackendEnum.TRTLLM_RAGGED,

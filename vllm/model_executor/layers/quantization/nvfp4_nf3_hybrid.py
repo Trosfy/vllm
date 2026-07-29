@@ -200,6 +200,32 @@ def _read_hybrid_keys(config: Any) -> tuple[dict[str, list[int]] | None, str | N
     return hybrid_bit_map, kept_format
 
 
+def _apply_nf3_codebook_override(levels: list[float]) -> None:
+    """Install a checkpoint-specific NF3 codebook process-wide.
+
+    The b12x execution path crosses the ``torch.ops.sparkinfer`` custom-op
+    boundary with primitive args only; the op re-resolves its kernel from
+    module globals, so a per-kernel codebook argument cannot reach the
+    silicon. One process serves one model, so a global is correct here. The
+    env stamp folds the codebook into sparkinfer's compile disk-cache key
+    (SPARKINFER_* env vars are part of its cache context), preventing stale
+    cubins when a different-codebook model is served later.
+    """
+    import os
+
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as _sk
+    from sparkinfer.moe._shared.kernels.w4a16 import prepare as _sp
+
+    t = tuple(float(v) for v in levels)
+    if tuple(_sk._NF3_CODEBOOK) != t:
+        logger.info_once(
+            "Overriding b12x NF3 codebook with checkpoint levels: %s", t
+        )
+        _sk._NF3_CODEBOOK = t
+        _sp._NF3_CODEBOOK = t
+    os.environ["SPARKINFER_NF3_CODEBOOK"] = ",".join(f"{v:.10g}" for v in t)
+
+
 def _unpack_nf3_codes(packed: torch.Tensor, size_k: int) -> torch.Tensor:
     """Unpack NF3 codes stored 8-per-3-bytes: uint8 [E, N, K//8*3] -> int32
     [E, N, K] codes in 0..7."""
@@ -370,6 +396,7 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         )
         self.hybrid_bit_map: dict[str, list[int]] = hybrid_bit_map or {}
         self.kept_format = kept_format
+        self.nf3_levels: list[float] | None = None
         self.shared_runtime = _HybridSharedRuntime()
 
     def get_name(self) -> QuantizationMethods:
@@ -387,16 +414,14 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
                 quant_config=self, moe_config=layer.moe_config
             )
         if isinstance(layer, LinearBase):
-            # Honor the online MXFP8 overlay (--quantization-config) on the
-            # checkpoint's BF16 dense linears: shared experts via the
-            # `shared_experts` spec, other dense linears (KDA/MLA attention
-            # projections, dense-layer MLP) via `linear` with its `ignore`
-            # list. K3 TP16 does not fit at BF16 attention weights.
-            if method := self._get_shared_expert_online_method(layer, prefix):
-                return method
-            if method := self._get_dense_linear_online_method(layer, prefix):
-                return method
-            return UnquantizedLinearMethod()
+            # Honor the --quantization-config online overlay (MXFP8 on BF16
+            # attention/shared-expert linears): at K3 TP6/TP12 the per-GPU
+            # ledger needs the halved non-expert footprint; without an overlay
+            # spec this falls through to plain BF16.
+            online = self._get_shared_expert_online_method(
+                layer, prefix
+            ) or self._get_dense_linear_online_method(layer, prefix)
+            return online or UnquantizedLinearMethod()
         # In particular, do not inherit ModelOpt's serialized-NVFP4 method for
         # ParallelLMHead/VocabParallelEmbedding. K3 stores both as BF16; using
         # the parent method allocates a packed [vocab, hidden/2] parameter and
@@ -443,6 +468,14 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         assert isinstance(config, NvFp4Nf3HybridConfig)
         config.hybrid_bit_map = hybrid_bit_map
         config.kept_format = kept_format
+        nf3_levels = original_config.get("nf3_levels")
+        quantization = original_config.get("quantization")
+        if nf3_levels is None and isinstance(quantization, dict):
+            nf3_levels = quantization.get("nf3_levels")
+        if nf3_levels is not None:
+            if len(nf3_levels) != 8:
+                raise ValueError("nf3_levels must contain exactly 8 dequant levels")
+            config.nf3_levels = [float(v) for v in nf3_levels]
         return config
 
 
@@ -502,6 +535,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 "nvfp4_nf3_hybrid only supports SiLU/SiTU-gated MoE layers, got "
                 f"{layer.activation}."
             )
+        if self.quant_config.nf3_levels is not None:
+            _apply_nf3_codebook_override(self.quant_config.nf3_levels)
         bits = self._layer_bits(layer)
         kept_mx = bits is not None and self.quant_config.kept_format == "mxfp4_e8m0k32"
         if bits is None:

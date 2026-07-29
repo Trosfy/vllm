@@ -50,7 +50,10 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
 
     @classmethod
     def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
-        return device_capability.major == 10
+        # FlashInfer's ragged prefill (FA2-style) JIT-compiles for the target
+        # arch and runs on both datacenter (SM100) and GeForce/RTX PRO (SM120)
+        # Blackwell.
+        return device_capability.major >= 10
 
     @classmethod
     def is_available(cls) -> bool:

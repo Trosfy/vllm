@@ -717,7 +717,18 @@ def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
         or _is_deepseek_v4_config(model_config)
         or _is_sparse_mla_config(model_config)
         or _is_minimax_m3_config(model_config)
+        or _is_kimi_k3_config(model_config)
     )
+
+
+def _is_kimi_k3_config(model_config: ModelConfig) -> bool:
+    # Kimi K3 (KDA + MLA hybrid, 896-expert latent MoE). At TP6/TP12 only the
+    # vocab axis (163840) needs virtual-TP padding; heads (96) and
+    # moe_intermediate (3072) divide evenly, so the generic plan applies.
+    for config in _iter_virtual_tp_configs(model_config):
+        if getattr(config, "model_type", None) in {"kimi_k3", "kimi_linear"}:
+            return True
+    return False
 
 
 def _uses_native_b12x_moe(vllm_config: VllmConfig) -> bool:
