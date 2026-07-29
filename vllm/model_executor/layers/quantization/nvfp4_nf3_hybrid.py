@@ -660,19 +660,36 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # group (uint8) instead of e4m3 per group_size.
         nv_group = 32 if kept_mx else group_size
         nv_dtype = torch.uint8 if kept_mx else torch.float8_e4m3fn
-        for name, shape, dtype in (
-            ("w13_nv_scale", (num_kept, 2 * inter, hidden // nv_group), nv_dtype),
-            ("w13_nf3_scale", (num_nf3, 2 * inter, hidden // 32), torch.float8_e4m3fn),
-            ("w2_nv_scale", (num_kept, hidden, inter // nv_group), nv_dtype),
-            ("w2_nf3_scale", (num_nf3, hidden, inter // 32), torch.float8_e4m3fn),
+        # NF3 scale storage is CPU-staged: at 86 GiB/GPU of expert codes
+        # (K3 TP6/TP12) the extra ~7 GiB of checkpoint-layout scales does not
+        # fit alongside BF16 non-expert weights during load. The repack
+        # streams them through the GPU per chunk; _vllm_keep_on_cpu stops
+        # device_loading_context from bulk-moving them first.
+        for name, shape, dtype, dev in (
+            ("w13_nv_scale", (num_kept, 2 * inter, hidden // nv_group), nv_dtype, None),
+            (
+                "w13_nf3_scale",
+                (num_nf3, 2 * inter, hidden // 32),
+                torch.float8_e4m3fn,
+                "cpu",
+            ),
+            ("w2_nv_scale", (num_kept, hidden, inter // nv_group), nv_dtype, None),
+            (
+                "w2_nf3_scale",
+                (num_nf3, hidden, inter // 32),
+                torch.float8_e4m3fn,
+                "cpu",
+            ),
         ):
-            layer.register_parameter(
-                name,
-                torch.nn.Parameter(
-                    torch.zeros(shape, dtype=dtype, device=torch.cuda.current_device()),
-                    requires_grad=False,
+            scale_param = torch.nn.Parameter(
+                torch.zeros(
+                    shape, dtype=dtype, device=dev or torch.cuda.current_device()
                 ),
+                requires_grad=False,
             )
+            if dev == "cpu":
+                scale_param._vllm_keep_on_cpu = True
+            layer.register_parameter(name, scale_param)
 
     def _build_kept_mxfp4(self, layer: "RoutedExperts") -> None:
         """Build the MXFP4 kept tier as a modular kernel over the kept
@@ -881,7 +898,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             for start in range(0, num_nf3, _NF3_PACK_CHUNK):
                 end = min(start + _NF3_PACK_CHUNK, num_nf3)
                 packed = _nf3_pack_scale_experts(
-                    layer.w13_nf3_scale[start:end].float() * (2.0**-4),
+                    layer.w13_nf3_scale[start:end].to(device).float() * (2.0**-4),
                     size_k=hidden,
                     size_n=2 * inter,
                 )
@@ -897,7 +914,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             for start in range(0, num_nf3, _NF3_PACK_CHUNK):
                 end = min(start + _NF3_PACK_CHUNK, num_nf3)
                 packed = _nf3_pack_scale_experts(
-                    layer.w2_nf3_scale[start:end].float() * (2.0**-4),
+                    layer.w2_nf3_scale[start:end].to(device).float() * (2.0**-4),
                     size_k=inter,
                     size_n=hidden,
                 )

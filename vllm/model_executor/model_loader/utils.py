@@ -196,6 +196,10 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
+            if getattr(p, "_vllm_keep_on_cpu", False):
+                # Deliberately CPU-staged (e.g. streamed NF3 repack at
+                # near-capacity VRAM); the quant method streams it itself.
+                continue
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):

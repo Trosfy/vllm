@@ -108,7 +108,61 @@ class KimiColumnParallelGate(ColumnParallelLinear):
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
-        return output[..., : self._logical_output_size], None
+        return output[..., : self._logical_output_size].contiguous(), None
+
+
+class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
+    """ColumnParallelLinear whose output axis pads to a TP multiple.
+
+    K3's latent size (3584) does not divide TP6/TP12; checkpoint tails
+    zero-fill via pad_or_narrow and the gathered output is sliced back.
+    """
+
+    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        self._logical_output_size = output_size
+        padded = -(-output_size // tp_size) * tp_size
+        super().__init__(
+            input_size,
+            padded,
+            bias=False,
+            gather_output=True,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        out, bias = super().forward(x)
+        out = out[..., : self._logical_output_size]
+        # b12x MoE launches require contiguous inputs; the slice is a view.
+        return out.contiguous(), bias
+
+
+class KimiPaddedRowParallelLinear(RowParallelLinear):
+    """RowParallelLinear whose input axis pads to a TP multiple.
+
+    The input tensor is zero-extended to the padded width; the padded weight
+    rows are zero-filled at load, so the product is exact.
+    """
+
+    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        padded = -(-input_size // tp_size) * tp_size
+        self._input_pad = padded - input_size
+        super().__init__(
+            padded,
+            output_size,
+            bias=False,
+            input_is_parallel=False,
+            reduce_results=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self._input_pad:
+            x = torch.nn.functional.pad(x, (0, self._input_pad))
+        return super().forward(x)
 
 
 class KimiMLP(nn.Module):
@@ -217,16 +271,9 @@ class KimiMoE(nn.Module):
         self.routed_expert_up_proj: RowParallelLinear | None = None
         self.routed_output_transform: KimiRoutedOutputTransform | None = None
         if routed_expert_hidden_size is not None:
-            # quant_config=None: the checkpoint stores the latent projections
-            # in BF16 and its compressed-tensors ignore list does not cover
-            # them, so passing the config through would create unloadable
-            # MXFP4 linear layers.
-            self.routed_expert_down_proj = ColumnParallelLinear(
+            self.routed_expert_down_proj = KimiPaddedColumnParallelLinear(
                 hidden_size,
                 routed_expert_hidden_size,
-                bias=False,
-                gather_output=True,
-                quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -234,13 +281,9 @@ class KimiMoE(nn.Module):
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = RowParallelLinear(
+            self.routed_expert_up_proj = KimiPaddedRowParallelLinear(
                 routed_expert_hidden_size,
                 hidden_size,
-                bias=False,
-                input_is_parallel=False,
-                reduce_results=False,
-                quant_config=None,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
             self.routed_output_transform = KimiRoutedOutputTransform(

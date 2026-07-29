@@ -33,6 +33,16 @@ except ImportError:
 _DEFAULT_NUM_CHUNKS = 32
 
 
+def _flashinfer_prefill_backend() -> str:
+    """CUTLASS FMHA needs SM100a/SM110a tcgen05; SM12x uses the FA2 path."""
+    from vllm.platforms import current_platform
+
+    cap = current_platform.get_device_capability()
+    if cap is not None and cap.major >= 12:
+        return "fa2"
+    return "cutlass"
+
+
 class FlashInferPrefillBackend(MLAPrefillBackend):
     """FlashInfer backend for MLA prefill."""
 
@@ -102,7 +112,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
             for _ in range(len(self._prefill_chunks), num_chunks):
                 self._prefill_chunks.append(
                     BatchPrefillWithRaggedKVCacheWrapper(
-                        workspace_buffer, "NHD", backend="cutlass"
+                        workspace_buffer, "NHD", backend=_flashinfer_prefill_backend()
                     )
                 )
 
@@ -140,7 +150,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         has_context = prefill_metadata.chunked_context is not None
         if self._prefill_main is None:
             self._prefill_main = BatchPrefillWithRaggedKVCacheWrapper(
-                self._workspace_buffer, "NHD", backend="cutlass"
+                self._workspace_buffer, "NHD", backend=_flashinfer_prefill_backend()
             )
             self._ensure_chunks(_DEFAULT_NUM_CHUNKS, self._workspace_buffer)
 
