@@ -299,6 +299,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
+                    indexed_tensor_files=indexed_tensor_files,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

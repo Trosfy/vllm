@@ -53,7 +53,6 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
     deepseek_v4_compressor_triton_warmup,
 )
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
     PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
@@ -458,6 +457,11 @@ class Worker(WorkerBase):
         """Materialize persistent kernel resources before KV cache sizing."""
         if getattr(self, "_kernel_warmup_complete", False):
             return
+        # This module initializes CUDA while importing. Keep it out of the
+        # module-level worker import so a CUDA-clean forkserver can preload the
+        # worker stack and safely fork all TP ranks in parallel.
+        from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+
         kernel_warmup(self)
         self._kernel_warmup_complete = True
 

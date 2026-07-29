@@ -1001,9 +1001,9 @@ def safetensors_weights_iterator(
     ):
         st_file_abs = os.path.abspath(st_file)
 
-        def is_indexed_here(name: str) -> bool:
+        def is_indexed_here(name: str, indexed_file: str = st_file_abs) -> bool:
             return indexed_tensor_files is None or (
-                indexed_tensor_files.get(name) == st_file_abs
+                indexed_tensor_files.get(name) == indexed_file
             )
 
         if safetensors_load_strategy == "eager":
@@ -1225,9 +1225,21 @@ def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     weight_name_prefixes: Sequence[str] | None = None,
+    *,
+    indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using instanttensor library."""
+    using instanttensor library.
+
+    ``InstantTensor.safe_open`` normally streams every physical tensor in its
+    input files.  That is incorrect and unnecessarily expensive for composed
+    checkpoints, where the final safetensors index may remap a tensor to an
+    overlay shard while leaving a stale copy in a base shard.  When an index
+    is available, restrict InstantTensor's ordered metadata and C++ I/O layout
+    to the indexed byte ranges before opening the loader.  Consecutive selected
+    tensors are coalesced into one range; disjoint ranges reuse the same file
+    as independent loader inputs, so skipped payload bytes are never read.
+    """
     try:
         import instanttensor
     except ImportError as e:
@@ -1248,9 +1260,27 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
-    with instanttensor.safe_open(
-        hf_weights_files, framework="pt", device=device, process_group=process_group
-    ) as f:
+    restrict_before_io = indexed_tensor_files is not None or bool(weight_name_prefixes)
+    instant_open = instanttensor.safe_open(
+        list(hf_weights_files),
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        load_now=not restrict_before_io,
+        # Model weight loaders consume and copy every yielded tensor before
+        # requesting the next one.  A second owning clone here only doubles
+        # device traffic and transient memory.  Our InstantTensor build records
+        # a consumer-stream event before reusing its ring-buffer storage.
+        copy=False,
+    )
+    if restrict_before_io:
+        _restrict_instanttensor_to_selected_ranges(
+            instant_open,
+            indexed_tensor_files=indexed_tensor_files,
+            weight_name_prefixes=weight_name_prefixes,
+        )
+
+    with instant_open as f:
         for name, tensor in tqdm(
             f.tensors(),
             desc="Loading safetensors using InstantTensor loader",
@@ -1265,6 +1295,128 @@ def instanttensor_weights_iterator(
             ):
                 continue
             yield name, tensor
+
+
+def _restrict_instanttensor_to_selected_ranges(
+    instant_open: Any,
+    *,
+    indexed_tensor_files: dict[str, str] | None,
+    weight_name_prefixes: Sequence[str] | None,
+) -> None:
+    """Replace an unopened InstantTensor layout with selected physical ranges.
+
+    InstantTensor 0.1.9 exposes the metadata and offset arrays used by its C++
+    loader.  The C++ API accepts repeated filenames, which lets each contiguous
+    selected run become a separate logical input without copying or repacking
+    the checkpoint.  Keep this adapter strict so an upstream API/layout change
+    fails before any weight I/O instead of silently loading the wrong tensor.
+    """
+    required_attrs = (
+        "filename",
+        "ordered_tensor_metadatas",
+        "tensor_offsets",
+        "tensor_sizes",
+        "total_tensor_size",
+        "tensor_name_to_index",
+        "loader_handle",
+        "_determine_buffer_size",
+    )
+    missing = [name for name in required_attrs if not hasattr(instant_open, name)]
+    if missing:
+        raise RuntimeError(
+            "Installed InstantTensor does not expose the metadata layout needed "
+            f"for index-aware loading (missing: {', '.join(missing)})"
+        )
+    if instant_open.loader_handle is not None:
+        raise RuntimeError("InstantTensor selection must be applied before opening I/O")
+
+    filenames = list(instant_open.filename)
+    metadata = list(instant_open.ordered_tensor_metadatas)
+    offsets = list(instant_open.tensor_offsets)
+    selected_filenames: list[str] = []
+    selected_metadata: list[tuple[str, dict[str, object]]] = []
+    selected_offsets: list[tuple[int, int]] = []
+    metadata_pos = 0
+    offset_pos = 0
+
+    for filename in filenames:
+        filename_abs = os.path.abspath(filename)
+        with safe_open(filename, framework="pt") as physical_file:
+            physical_names = list(physical_file.offset_keys())
+        tensor_count = len(physical_names)
+        file_metadata = metadata[metadata_pos : metadata_pos + tensor_count]
+        file_offsets = offsets[offset_pos : offset_pos + tensor_count + 1]
+        if len(file_metadata) != tensor_count or len(file_offsets) != tensor_count + 1:
+            raise RuntimeError(
+                "InstantTensor metadata/offset count does not match safetensors "
+                f"header for {filename}"
+            )
+        metadata_names = [name for name, _ in file_metadata]
+        if metadata_names != physical_names:
+            raise RuntimeError(
+                "InstantTensor tensor order does not match safetensors offset order "
+                f"for {filename}"
+            )
+
+        keep = []
+        for name in physical_names:
+            indexed_here = indexed_tensor_files is None or (
+                indexed_tensor_files.get(name) == filename_abs
+            )
+            prefix_matches = not weight_name_prefixes or _matches_weight_name_prefixes(
+                name, weight_name_prefixes
+            )
+            keep.append(indexed_here and prefix_matches)
+
+        run_start = 0
+        while run_start < tensor_count:
+            while run_start < tensor_count and not keep[run_start]:
+                run_start += 1
+            if run_start == tensor_count:
+                break
+            run_end = run_start + 1
+            while run_end < tensor_count and keep[run_end]:
+                run_end += 1
+
+            logical_file_index = len(selected_filenames)
+            selected_filenames.append(filename)
+            selected_metadata.extend(file_metadata[run_start:run_end])
+            selected_offsets.extend(
+                (logical_file_index, int(file_offsets[idx][1]))
+                for idx in range(run_start, run_end)
+            )
+            selected_offsets.append((logical_file_index, int(file_offsets[run_end][1])))
+            run_start = run_end
+
+        metadata_pos += tensor_count
+        offset_pos += tensor_count + 1
+
+    if metadata_pos != len(metadata) or offset_pos != len(offsets):
+        raise RuntimeError(
+            "InstantTensor layout contains unaccounted metadata or offsets"
+        )
+    if not selected_metadata:
+        raise RuntimeError("InstantTensor index/prefix selection matched no tensors")
+
+    selected_names = [name for name, _ in selected_metadata]
+    if len(selected_names) != len(set(selected_names)):
+        raise RuntimeError(
+            "InstantTensor index-aware selection still contains duplicate tensor names"
+        )
+    selected_sizes = [
+        int(item["data_offsets"][1]) - int(item["data_offsets"][0])
+        for _, item in selected_metadata
+    ]
+    instant_open.filename = selected_filenames
+    instant_open.ordered_tensor_metadatas = selected_metadata
+    instant_open.tensor_name_to_index = {
+        name: idx for idx, name in enumerate(selected_names)
+    }
+    instant_open.tensor_offsets = selected_offsets
+    instant_open.tensor_sizes = selected_sizes
+    instant_open.total_tensor_size = sum(selected_sizes)
+    # Recompute the ring buffer against selected tensors and their I/O layout.
+    instant_open._determine_buffer_size(None)
 
 
 def pt_weights_iterator(

@@ -107,8 +107,8 @@ def test_unpack_nf3_codes():
     torch.testing.assert_close(_unpack_nf3_codes(packed, size_k=8), expected)
 
 
-def test_kimi_tp16_uses_128_wide_fc1_tile():
-    assert _b12x_tiles_for_geometry(3584, 3072 // 16) == (64, 128, 64, 128)
+def test_kimi_tp16_uses_tuned_fc1_tile():
+    assert _b12x_tiles_for_geometry(3584, 3072 // 16) == (128, 64, 64, 128)
 
 
 def test_kquant_nf3_scale_reinterprets_raw_fp8_bits():
@@ -128,7 +128,30 @@ def test_grid188_tier_descriptors_encode_exact_partition():
     descriptors = _combined_tier_local_descriptors(remap)
 
     assert descriptors[:64] == list(range(64))
-    assert descriptors[64:] == [0x100 | local_id for local_id in range(192)]
+    assert descriptors[64:] == [0x10000 | local_id for local_id in range(192)]
+
+
+def test_k3_tier_descriptors_preserve_local_ids_above_255():
+    num_kept, num_nf3 = 717, 179
+    remap = {
+        **{global_id: (0, global_id) for global_id in range(num_kept)},
+        **{
+            global_id: (1, global_id - num_kept)
+            for global_id in range(num_kept, num_kept + num_nf3)
+        },
+    }
+
+    descriptors = _combined_tier_local_descriptors(
+        remap,
+        num_experts=num_kept + num_nf3,
+        num_kept=num_kept,
+        num_nf3=num_nf3,
+    )
+
+    assert descriptors[256] == 256
+    assert descriptors[716] == 716
+    assert descriptors[717] == 0x10000
+    assert descriptors[-1] == 0x10000 | 178
 
 
 def test_grid188_tier_descriptors_reject_incomplete_partition():
