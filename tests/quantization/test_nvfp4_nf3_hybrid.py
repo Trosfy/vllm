@@ -8,11 +8,14 @@ from vllm.config.quantization import resolve_quantization_config
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     NvFp4Nf3HybridConfig,
+    _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
+    _decode_kquant_nf3_scale,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 
 @pytest.mark.parametrize(
@@ -83,6 +86,16 @@ def test_config_accepts_dense_mxfp8_online_overlay():
     assert resolved.ignore == ["re:.*kv_b_proj"]
 
 
+def test_config_does_not_quantize_bf16_lm_head():
+    config = NvFp4Nf3HybridConfig(
+        is_checkpoint_nvfp4_serialized=True,
+        hybrid_bit_map={"1": [4, 3]},
+    )
+    lm_head = ParallelLMHead.__new__(ParallelLMHead)
+
+    assert config.get_quant_method(lm_head, "lm_head") is None
+
+
 def test_unpack_nf3_codes():
     expected = torch.tensor([[[0, 1, 2, 3, 4, 5, 6, 7]]], dtype=torch.int32)
     word = sum(int(code) << (index * 3) for index, code in enumerate(expected[0, 0]))
@@ -92,6 +105,18 @@ def test_unpack_nf3_codes():
     )
 
     torch.testing.assert_close(_unpack_nf3_codes(packed, size_k=8), expected)
+
+
+def test_kimi_tp16_uses_128_wide_fc1_tile():
+    assert _b12x_tiles_for_geometry(3584, 3072 // 16) == (64, 128, 64, 128)
+
+
+def test_kquant_nf3_scale_reinterprets_raw_fp8_bits():
+    biased = torch.tensor([0.5, 2.0, 8.0], dtype=torch.float8_e4m3fn)
+    decoded = _decode_kquant_nf3_scale(biased.view(torch.uint8))
+
+    assert decoded.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(decoded.float() * (2.0**-4), biased.float() / 16)
 
 
 def test_grid188_tier_descriptors_encode_exact_partition():

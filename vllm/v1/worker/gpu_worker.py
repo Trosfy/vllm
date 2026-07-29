@@ -748,6 +748,27 @@ class Worker(WorkerBase):
             self.get_model(), self.get_kv_cache_spec(), self.vllm_config
         )
 
+        # Profiling and kernel warmup can leave large, fragmented free blocks in
+        # the caching allocator.  Hybrid caches are allocated as several large
+        # tensors, so retaining those fragments can OOM even when the profiled
+        # (or explicitly requested) cache size fits in total device memory.
+        # Release only unused allocator blocks after all warmups have completed;
+        # live model weights and persistent kernel workspaces are unaffected.
+        allocator_stats = torch.accelerator.memory_stats(self.device)
+        reserved_before = allocator_stats.get("reserved_bytes.all.current", 0)
+        gc.collect()
+        torch.accelerator.empty_cache()
+        reserved_after = torch.accelerator.memory_stats(self.device).get(
+            "reserved_bytes.all.current", 0
+        )
+        logger.info_once(
+            "KV cache pre-allocation cleanup released %s GiB of unused "
+            "allocator memory (%s GiB -> %s GiB reserved)",
+            format_gib(max(reserved_before - reserved_after, 0)),
+            format_gib(reserved_before),
+            format_gib(reserved_after),
+        )
+
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 

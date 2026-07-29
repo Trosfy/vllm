@@ -41,8 +41,13 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.utils import set_weight_attrs
@@ -64,9 +69,10 @@ _B12X_TILES = (64, 256, 64, 256)
 _B12X_DECODE_M = 8
 # Global scale the NF3 prepare path expects (scales are stored pre-divided).
 _NF3_GLOBAL_SCALE = 2.0**116
-# Expert-chunk size for NF3 unpack/repack (bounds transient VRAM: the int32
-# code planes are ~400 MB per 16 w13 experts at GLM-5.2 shapes).
-_NF3_PACK_CHUNK = 16
+# Expert-chunk size for NF3 unpack/repack. Kimi K3 TP16 runs with less than
+# 4 GiB of headroom after loading, so keep the int32 decode temporary small;
+# final packed planes are written directly into their resident buffers below.
+_NF3_PACK_CHUNK = 4
 # Exact one-grid decode specialization published for the TP4 hybrid checkpoint.
 _GRID188_M = 4
 _GRID188_TOPK = 8
@@ -169,6 +175,44 @@ def _unpack_nf3_codes(packed: torch.Tensor, size_k: int) -> torch.Tensor:
     return codes.reshape(num_experts, rows, size_k)
 
 
+def _b12x_tiles_for_geometry(
+    hidden_size: int, intermediate_size: int
+) -> tuple[int, int, int, int]:
+    """Select one fixed b12x tile pair that exactly divides both GEMMs.
+
+    GLM's TP-local expert width uses N=256 tiles. Kimi K3 at TP16 has a
+    local expert width of 192, so FC1 has N=384 and needs an N=128 tile.
+    Both GEMMs use the measured 128-thread K64/N128 SM121 specialization.
+    """
+    candidates = (_B12X_TILES, (64, 128, 64, 128))
+    for fc1_k, fc1_n, fc2_k, fc2_n in candidates:
+        if (
+            hidden_size % fc1_k == 0
+            and (2 * intermediate_size) % fc1_n == 0
+            and intermediate_size % fc2_k == 0
+            and hidden_size % fc2_n == 0
+        ):
+            return (fc1_k, fc1_n, fc2_k, fc2_n)
+    raise ValueError(
+        "nvfp4_nf3_hybrid has no fixed b12x tile configuration for "
+        f"hidden={hidden_size}, intermediate={intermediate_size}"
+    )
+
+
+def _decode_kquant_nf3_scale(raw: torch.Tensor) -> torch.Tensor:
+    """Interpret kquant's uint8 payload as biased E4M3 scale values.
+
+    kquant stores the raw E4M3 bits of ``scale * 16``. Keeping the biased
+    FP8 value resident avoids expanding the checkpoint scales to FP32; the
+    bias is removed immediately before SparkInfer's scale packer runs.
+    """
+    if raw.dtype == torch.uint8:
+        return raw.contiguous().view(torch.float8_e4m3fn)
+    if raw.dtype == torch.float8_e4m3fn:
+        return raw
+    raise TypeError(f"NF3 scale must be uint8/E4M3, got {raw.dtype}")
+
+
 class _HybridSharedRuntime:
     """Process-wide b12x W4A16 runtime shared by every hybrid MoE layer.
 
@@ -213,6 +257,7 @@ class _HybridLayerState:
         self.kept_mx = kept_mx
         self.num_kept = sum(1 for tier, _ in remap.values() if tier == 0)
         self.num_nf3 = sum(1 for tier, _ in remap.values() if tier == 1)
+        self.tiles = _b12x_tiles_for_geometry(hidden_size, intermediate_size)
         # b12x prepared weights (W4A16PackedWeights / PreparedNF3MoeWeights).
         self.prep_kept: Any = None
         self.prep_nf3: Any = None
@@ -223,7 +268,7 @@ class _HybridLayerState:
         self.launch_kept: tuple[Any, Any] | None = None
         self.launch_nf3: tuple[Any, Any] | None = None
         # MXFP4 kept tier: modular kernel + its weight-holder module and a
-        # global -> local map whose sentinel is num_kept (kernel drops it).
+        # global -> local map; -1 is the inactive-route sentinel.
         self.kept_kernel: Any = None
         self.kept_module: torch.nn.Module | None = None
         self.kept_remap: torch.Tensor | None = None
@@ -270,6 +315,25 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
 
     def get_name(self) -> QuantizationMethods:
         return "nvfp4_nf3_hybrid"
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        """Quantize only routed experts; K3's remaining tensors are BF16.
+
+        The source checkpoint has no serialized ModelOpt tensors for dense
+        linears. Inheriting ModelOpt's default selection would nevertheless
+        allocate FP4 parameters for every such layer and make them unloadable.
+        """
+        if isinstance(layer, RoutedExperts):
+            return self.FusedMoEMethodCls(
+                quant_config=self, moe_config=layer.moe_config
+            )
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        # In particular, do not inherit ModelOpt's serialized-NVFP4 method for
+        # ParallelLMHead/VocabParallelEmbedding. K3 stores both as BF16; using
+        # the parent method allocates a packed [vocab, hidden/2] parameter and
+        # then fails when the [vocab, hidden] checkpoint tensor is loaded.
+        return None
 
     @classmethod
     def override_quantization_method(
@@ -365,9 +429,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         assert self.quant_config.is_checkpoint_nvfp4_serialized
-        if layer.activation is not MoEActivation.SILU:
+        if layer.activation not in (MoEActivation.SILU, MoEActivation.SITU):
             raise NotImplementedError(
-                "nvfp4_nf3_hybrid only supports SiLU-gated MoE layers, got "
+                "nvfp4_nf3_hybrid only supports SiLU/SiTU-gated MoE layers, got "
                 f"{layer.activation}."
             )
         bits = self._layer_bits(layer)
@@ -442,7 +506,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if "weight_scale" in name:  # block scale: demux by tier
                 suffix = "_nv_scale" if tier == 0 else "_nf3_scale"
                 target = getattr(layer, f"{family}{suffix}")
-            elif "weight_packed" in name:  # NF3 packed codes
+            elif tier == 1:  # NF3 packed codes (serialized as nf3_packed)
                 target = getattr(layer, f"{family}_weight_packed")
             else:  # plain NVFP4/MXFP4 weight
                 target = getattr(layer, f"{family}_weight")
@@ -451,7 +515,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 # gate -> top half, up -> bottom half of the fused rows.
                 half = dst.shape[0] // 2
                 dst = dst[:half] if shard_id == "w1" else dst[half:]
-            dst.copy_(loaded_weight.reshape(dst.shape).to(dst.dtype))
+            if loaded_weight.numel() != dst.numel():
+                raise RuntimeError(
+                    "hybrid expert tensor shape mismatch: "
+                    f"layer={layer.layer_name}, expert={expert_id}, tier={tier}, "
+                    f"shard={shard_id}, mapped_name={name}, "
+                    f"checkpoint_shape={tuple(loaded_weight.shape)}, "
+                    f"destination_shape={tuple(dst.shape)}"
+                )
+            loaded_weight = loaded_weight.reshape(dst.shape)
+            if tier == 1 and "weight_scale" in name:
+                loaded_weight = _decode_kquant_nf3_scale(loaded_weight)
+            dst.copy_(loaded_weight.to(dst.dtype))
             return True
 
         def register(name: str, shape: tuple[int, ...], dtype=torch.uint8) -> None:
@@ -505,7 +580,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         by the weight loader, so the kernel must see tp=1 (the layer's
         post-apply all-reduce handles TP). ``apply`` remaps top-k ids so
         kept experts map to [0, num_kept) and everything else to the
-        sentinel num_kept, which the kernel drops.
+        direct-kernel inactive-route sentinel -1.
         """
         from vllm.model_executor.layers.fused_moe.config import (
             FusedMoEParallelConfig,
@@ -565,8 +640,12 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # post-load maybe_init_modular_kernel() returns early instead of
         # rebuilding a kernel from the (freed) standard weight attrs.
         self.moe_kernel = kernel
+        # Use the direct-kernel inactive-route sentinel.  The route-packed
+        # path also drops negative ids, while the small-M direct path only
+        # checks ``expert_idx >= 0`` and would interpret ``num_kept`` as an
+        # out-of-bounds expert rather than as a sentinel.
         kept_remap = torch.full(
-            (state.num_experts,), num_kept, dtype=torch.int32, device=device
+            (state.num_experts,), -1, dtype=torch.int32, device=device
         )
         for global_id, (tier, local_id) in state.remap.items():
             if tier == 0:
@@ -616,40 +695,83 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         for global_id, (tier, local_id) in state.remap.items():
             (emap_kept if tier == 0 else emap_nf3)[global_id] = local_id
         state.emap_kept, state.emap_nf3 = emap_kept, emap_nf3
-        fc1_tile_n, fc2_tile_n = _B12X_TILES[1], _B12X_TILES[3]
+        fc1_tile_n, fc2_tile_n = state.tiles[1], state.tiles[3]
 
         if num_nf3 > 0:
-            w13_planes, w2_planes = [], []
-            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
-                codes = _unpack_nf3_codes(
-                    layer.w13_weight_packed[start : start + _NF3_PACK_CHUNK], hidden
-                )
-                w13_planes.append(
-                    _nf3_pack_code_experts(
-                        codes, size_k=hidden, size_n=2 * inter, tile_n=fc1_tile_n
-                    )
-                )
-                del codes
-            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
-                codes = _unpack_nf3_codes(
-                    layer.w2_weight_packed[start : start + _NF3_PACK_CHUNK], inter
-                )
-                w2_planes.append(
-                    _nf3_pack_code_experts(
-                        codes, size_k=inter, size_n=hidden, tile_n=fc2_tile_n
-                    )
-                )
-                del codes
-            w13_nf3 = torch.cat(w13_planes, 0).contiguous()
-            del w13_planes
-            w2_nf3 = torch.cat(w2_planes, 0).contiguous()
-            del w2_planes
-            w13_nf3_scale = _nf3_pack_scale_experts(
-                layer.w13_nf3_scale.float(), size_k=hidden, size_n=2 * inter
+            def drop_parameter_data(name: str) -> None:
+                param = getattr(layer, name)
+                param.data = param.data.new_empty((0,))
+
+            # Allocate each resident plane once and fill it by expert chunks.
+            # The previous list+cat path retained every chunk and then allocated
+            # a second full-size tensor (429 MiB for K3 TP16 w13), leaving more
+            # than 1 GiB of unusable holes in expandable CUDA allocator
+            # segments. Direct copies both lower peak VRAM and keep the final
+            # allocation topology stable for the subsequent 1M-token KV cache.
+            w13_words = 3 * (2 * inter) * hidden // 32
+            w13_nf3 = torch.empty(
+                (num_nf3, w13_words), dtype=torch.int32, device=device
             )
-            w2_nf3_scale = _nf3_pack_scale_experts(
-                layer.w2_nf3_scale.float(), size_k=inter, size_n=hidden
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                codes = _unpack_nf3_codes(
+                    layer.w13_weight_packed[start:end], hidden
+                )
+                packed = _nf3_pack_code_experts(
+                    codes, size_k=hidden, size_n=2 * inter, tile_n=fc1_tile_n
+                )
+                w13_nf3[start:end].copy_(packed)
+                del codes, packed
+            drop_parameter_data("w13_weight_packed")
+
+            w2_words = 3 * hidden * inter // 32
+            w2_nf3 = torch.empty(
+                (num_nf3, w2_words), dtype=torch.int32, device=device
             )
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                codes = _unpack_nf3_codes(
+                    layer.w2_weight_packed[start:end], inter
+                )
+                packed = _nf3_pack_code_experts(
+                    codes, size_k=inter, size_n=hidden, tile_n=fc2_tile_n
+                )
+                w2_nf3[start:end].copy_(packed)
+                del codes, packed
+            drop_parameter_data("w2_weight_packed")
+
+            w13_nf3_scale = torch.empty(
+                (num_nf3, hidden // 32, 2 * inter),
+                dtype=torch.uint8,
+                device=device,
+            )
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                packed = _nf3_pack_scale_experts(
+                    layer.w13_nf3_scale[start:end].float() * (2.0**-4),
+                    size_k=hidden,
+                    size_n=2 * inter,
+                )
+                w13_nf3_scale[start:end].copy_(packed)
+                del packed
+            drop_parameter_data("w13_nf3_scale")
+
+            w2_nf3_scale = torch.empty(
+                (num_nf3, inter // 32, hidden),
+                dtype=torch.uint8,
+                device=device,
+            )
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                packed = _nf3_pack_scale_experts(
+                    layer.w2_nf3_scale[start:end].float() * (2.0**-4),
+                    size_k=inter,
+                    size_n=hidden,
+                )
+                w2_nf3_scale[start:end].copy_(packed)
+                del packed
+            drop_parameter_data("w2_nf3_scale")
+
             nf3_global = torch.full(
                 (num_nf3,), _NF3_GLOBAL_SCALE, dtype=torch.float32, device=device
             )
@@ -719,17 +841,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             for name in ("w13_weight", "w2_weight", "w13_nv_scale", "w2_nv_scale"):
                 param = getattr(layer, name)
                 param.data = param.data.new_empty((0,))
-        # Free the NF3 originals (both tiers now live in kernel format).
-        for name in (
-            "w13_weight_packed",
-            "w2_weight_packed",
-            "w13_nf3_scale",
-            "w2_nf3_scale",
-        ):
-            param = getattr(layer, name)
-            param.data = param.data.new_empty((0,))
-
-    def _get_launch_pair(self, prepared: Any) -> tuple[Any, Any]:
+    def _get_launch_pair(
+        self, prepared: Any, state: _HybridLayerState
+    ) -> tuple[Any, Any]:
         """Compile (or fetch cached) preplanned launches for one tier.
 
         The prefill launch covers ALL m in [1, max_m]: packed block-64
@@ -756,6 +870,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             runtime.max_m,
             hidden,
             inter,
+            layer_activation := self.moe.activation.value,
+            state.tiles,
         )
         cached = runtime.launches.get(key)
         if cached is not None:
@@ -766,7 +882,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             intermediate_size=inter,
             num_experts=prepared.num_experts,
             top_k=runtime.topk,
-            activation="silu",
+            activation=layer_activation,
             apply_router_weight_on_input=False,
             element_dtype="bf16",
             fast_math=True,
@@ -776,7 +892,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             ),
             weight_layout=prepared.weight_layout,
             scale_format=prepared.scale_format,
-            force_tile_config=_B12X_TILES,
+            force_tile_config=state.tiles,
         )
         cap_slots = max_packed_route_slots(
             runtime.max_m * runtime.topk, 64, self.moe.num_experts
@@ -791,8 +907,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             **common,
         )
         assert (int(prefill.fc1_tile_n), int(prefill.fc2_tile_n)) == (
-            _B12X_TILES[1],
-            _B12X_TILES[3],
+            state.tiles[1],
+            state.tiles[3],
         ), "b12x tile pin failed"
         decode = prefill
         try:
@@ -806,8 +922,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 **common,
             )
             assert (int(candidate.fc1_tile_n), int(candidate.fc2_tile_n)) == (
-                _B12X_TILES[1],
-                _B12X_TILES[3],
+                state.tiles[1],
+                state.tiles[3],
             ), "b12x TC-decode tile pin failed"
             decode = candidate
         except Exception as exc:
@@ -1081,9 +1197,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 f"nvfp4_nf3_hybrid: topk changed {runtime.topk} -> {topk}"
             )
         if state.prep_kept is not None:
-            state.launch_kept = self._get_launch_pair(state.prep_kept)
+            state.launch_kept = self._get_launch_pair(state.prep_kept, state)
         if state.prep_nf3 is not None:
-            state.launch_nf3 = self._get_launch_pair(state.prep_nf3)
+            state.launch_nf3 = self._get_launch_pair(state.prep_nf3, state)
         if runtime.buffers is None:
             prep_any = state.prep_kept or state.prep_nf3
             if prep_any is None:
@@ -1122,9 +1238,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 )
             runtime.buffers = buffers
             # Per-tier outputs; fully overwritten by every launch that uses
-            # them, so sharing them across layers is safe.
+            # them, so sharing them across layers is safe. MXFP4 kept experts
+            # run through their modular kernel and return a separate output;
+            # in that case (and for an all-NF3 layer) the packed buffer's own
+            # output can serve NF3 directly. Avoiding a redundant
+            # [max_m, hidden] BF16 tensor saves 7 MiB for K3 at max_m=1024,
+            # which is material when the 1M-token cache fits by only a few MiB.
             runtime.out_kept = buffers.output
-            runtime.out_nf3 = torch.empty_like(buffers.output)
+            runtime.out_nf3 = (
+                buffers.output
+                if state.prep_kept is None
+                else torch.empty_like(buffers.output)
+            )
         self._prepare_grid188(layer, topk)
         state.runtime_ready = True
 
@@ -1149,11 +1274,21 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if not ids.is_contiguous():
             ids = ids.contiguous()
         if use_decode:
-            # Direct top-k path: the kernel reads flat LOCAL ids and skips
-            # negatives itself; expert_map doubles as the global -> local
-            # lookup table (graph-safe gather) and must not be passed.
+            # Direct top-k path: the kernel reads flat LOCAL ids.  Unlike the
+            # packed route builder, SparkInfer's direct launcher cannot safely
+            # consume an all-negative tier (and some versions dereference
+            # negative routes before applying the router weight).  Replace
+            # inactive routes with expert zero and give them an exact-zero
+            # weight.  This remains graph-safe and avoids a host-side
+            # ``any().item()`` synchronization on every decode token.
             ids = expert_map[ids.long()].to(torch.int32).contiguous()
+            active = ids >= 0
+            topk_weights = topk_weights.masked_fill(~active, 0.0).contiguous()
+            ids.clamp_min_(0)
             launch_expert_map = None
+            # Keep the explicit clear as a backstop for launch variants which
+            # do not overwrite an output row whose router weights are all zero.
+            output.zero_()
         else:
             # Packed path: the kernel translates global -> local and drops
             # the -1 entries of the other tier.
@@ -1164,7 +1299,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             prepared,
             topk_weights,
             ids,
-            activation="silu",
+            activation=self.moe.activation.value,
             intermediate_cache13=buffers.intermediate_cache13,
             intermediate_cache2=buffers.intermediate_cache2,
             output=output,
@@ -1201,9 +1336,19 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 state.emap_kept,
                 runtime.out_kept[:m],
                 decode,
-            )
+        )
         kept_module = state.kept_module
         kept_ids = state.kept_remap[topk_ids.long()]
+        # Neither the small-M nor the M=9 packed MXFP4 launcher safely handles
+        # a token with only -1 routes in this tier.  Never expose the sentinel
+        # to the device kernel: expert zero with an exact-zero router weight is
+        # a no-op.  (The general large-prefill route builder can filter -1,
+        # but using this one contract for both regimes avoids a decode-only
+        # all-empty-tier NaN.)
+        active = kept_ids >= 0
+        topk_weights = topk_weights.masked_fill(~active, 0.0).contiguous()
+        kept_ids = kept_ids.clamp_min(0)
+        kept_ids = kept_ids.to(torch.int32).contiguous()
         return state.kept_kernel.apply(
             x,
             kept_module.w13_weight,
@@ -1267,17 +1412,54 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             ):
                 logger.info_once("nvfp4_nf3_hybrid: executing hybrid one-grid decode")
                 return self._run_grid188(layer, x, weights, grid_ids)
+        result_m = m
+        if decode and state.kept_mx:
+            # SparkInfer's small-M MXFP4 SiTU/W4A16 path is not yet safe for
+            # K3's TP16 geometry (H=3584, local I=192): it produces NaNs for
+            # both hybrid and all-MXFP4 layers.  The packed-route launch is
+            # numerically correct and already used for prefill.  Pad only the
+            # routed-expert call past the direct threshold, give dummy rows
+            # zero router weights, then discard their outputs.  This is a
+            # correctness-first decode fallback; it costs compute but only
+            # tens of KiB and keeps TP16 + the 1M KV-cache memory target.
+            logger.warning_once(
+                "nvfp4_nf3_hybrid: padding K3 MXFP4 decode to packed-route "
+                "M=%d because the TP16 SiTU direct kernel is not numerically safe",
+                _B12X_DECODE_M + 1,
+            )
+            packed_m = _B12X_DECODE_M + 1
+            if runtime.max_m < packed_m:
+                raise RuntimeError(
+                    "nvfp4_nf3_hybrid requires max_num_batched_tokens >= "
+                    f"{packed_m} for safe hybrid decode"
+                )
+            pad_m = packed_m - m
+            x = torch.cat((x, x.new_zeros((pad_m, x.shape[1]))), dim=0)
+            weights = torch.cat(
+                (weights, weights.new_zeros((pad_m, weights.shape[1]))), dim=0
+            )
+            topk_ids = torch.cat(
+                (
+                    topk_ids,
+                    topk_ids.new_zeros((pad_m, topk_ids.shape[1])),
+                ),
+                dim=0,
+            )
+            m = packed_m
+            decode = False
         if state.num_nf3 == 0:
-            # Uniform-NVFP4 layer (e.g. MTP head): single-tier launch.
-            output = torch.empty((m, state.hidden_size), dtype=x.dtype, device=x.device)
+            # Uniform kept layer (including all-MXFP4 decoder layers and an
+            # unmapped NVFP4 MTP head): single-tier launch.
+            return self._run_kept(layer, x, weights, topk_ids, decode)[:result_m]
+        if state.num_kept == 0:
             return self._run_tier(
                 x,
                 weights,
                 topk_ids,
-                state.prep_kept,
-                state.launch_kept,
-                state.emap_kept,
-                output,
+                state.prep_nf3,
+                state.launch_nf3,
+                state.emap_nf3,
+                runtime.out_nf3[:m],
                 decode,
             )
         out_kept = self._run_kept(layer, x, weights, topk_ids, decode)
@@ -1291,7 +1473,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             runtime.out_nf3[:m],
             decode,
         )
-        return out_kept + out_nf3
+        return (out_kept + out_nf3)[:result_m]
 
 
 NvFp4Nf3HybridConfig.FusedMoEMethodCls = NvFp4Nf3HybridMoEMethod

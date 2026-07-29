@@ -8,6 +8,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     divide,
+    get_tensor_model_parallel_rank,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -200,7 +201,22 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+
+        def load_a_log(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+            # K3 serializes A_log as a padded flat [128] tensor although the
+            # reference implementation consumes only num_heads=96 entries.
+            # Shard the logical prefix in the same contiguous head order as
+            # q/k/v, then reshape it to the broadcast shape used by vLLM KDA.
+            if loaded_weight.ndim != 1 or loaded_weight.numel() < self.num_heads:
+                raise ValueError(
+                    "K3 A_log must be a padded flat tensor with at least "
+                    f"{self.num_heads} entries, got {tuple(loaded_weight.shape)}"
+                )
+            start = get_tensor_model_parallel_rank() * self.local_num_heads
+            local = loaded_weight.narrow(0, start, self.local_num_heads)
+            param.data.copy_(local.reshape(param.shape))
+
+        set_weight_attrs(self.A_log, {"weight_loader": load_a_log})
 
         self.use_full_rank_gate = bool(kda_config.get("use_full_rank_gate", False))
         self.g_proj: ColumnParallelLinear | None
