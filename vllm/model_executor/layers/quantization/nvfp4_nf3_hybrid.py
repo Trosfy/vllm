@@ -26,6 +26,7 @@ launch with an expert map.
 """
 
 import dataclasses
+import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -80,13 +81,24 @@ _GRID188_HIDDEN = 6144
 _GRID188_INTERMEDIATE = 512
 _GRID188_NUM_KEPT = 64
 _GRID188_NUM_NF3 = 192
+# Kimi K3 TP16 decode geometry.  Its tier sizes vary by layer, so only the
+# global geometry is pinned here; each layer compiles against its exact split.
+_K3_HYBRID_M = 1
+_K3_HYBRID_TOPK = 16
+_K3_HYBRID_HIDDEN = 3584
+_K3_HYBRID_INTERMEDIATE = 192
+_K3_HYBRID_EXPERTS = 896
 
 
 def _combined_tier_local_descriptors(
     remap: dict[int, tuple[int, int]],
+    *,
+    num_experts: int = _GRID188_NUM_KEPT + _GRID188_NUM_NF3,
+    num_kept: int = _GRID188_NUM_KEPT,
+    num_nf3: int = _GRID188_NUM_NF3,
 ) -> list[int]:
-    """Encode an exact E64/E192 partition for the mapped Grid188 kernel."""
-    descriptors = [-1] * (_GRID188_NUM_KEPT + _GRID188_NUM_NF3)
+    """Encode an exact two-tier partition for the hybrid one-grid kernel."""
+    descriptors = [-1] * num_experts
     seen_local = (set(), set())
     for global_id, tier_local in remap.items():
         try:
@@ -99,9 +111,7 @@ def _combined_tier_local_descriptors(
             raise ValueError(f"invalid global expert ID {global_id!r}")
         if descriptors[global_id_i] != -1:
             raise ValueError(f"duplicate global expert ID {global_id_i}")
-        local_limit = (
-            _GRID188_NUM_KEPT if tier_i == 0 else _GRID188_NUM_NF3 if tier_i == 1 else 0
-        )
+        local_limit = num_kept if tier_i == 0 else num_nf3 if tier_i == 1 else 0
         if (
             tier_i != tier
             or local_id_i != local_id
@@ -114,13 +124,15 @@ def _combined_tier_local_descriptors(
                 f"duplicate tier/local expert descriptor {(tier_i, local_id_i)!r}"
             )
         seen_local[tier_i].add(local_id_i)
-        descriptors[global_id_i] = local_id_i if tier_i == 0 else 0x100 | local_id_i
+        descriptors[global_id_i] = (
+            local_id_i if tier_i == 0 else 0x10000 | local_id_i
+        )
     if any(descriptor < 0 for descriptor in descriptors):
-        raise ValueError("heterogeneous remap does not cover all 256 global experts")
-    if seen_local[0] != set(range(_GRID188_NUM_KEPT)) or seen_local[1] != set(
-        range(_GRID188_NUM_NF3)
-    ):
-        raise ValueError("heterogeneous remap is not a complete E64/E192 partition")
+        raise ValueError(
+            f"heterogeneous remap does not cover all {num_experts} global experts"
+        )
+    if seen_local[0] != set(range(num_kept)) or seen_local[1] != set(range(num_nf3)):
+        raise ValueError("heterogeneous remap is not a complete two-tier partition")
     return descriptors
 
 
@@ -143,6 +155,30 @@ def _is_grid188_geometry(
         and num_kept == _GRID188_NUM_KEPT
         and num_nf3 == _GRID188_NUM_NF3
         and topk == _GRID188_TOPK
+    )
+
+
+def _is_k3_hybrid_geometry(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_kept: int,
+    num_nf3: int,
+    topk: int,
+    kept_mx: bool,
+) -> bool:
+    return (
+        envs.VLLM_NF3_GRID188_DECODE
+        and bool(int(os.getenv("VLLM_K3_HYBRID_DECODE", "1")))
+        and kept_mx
+        and hidden_size == _K3_HYBRID_HIDDEN
+        and intermediate_size == _K3_HYBRID_INTERMEDIATE
+        and num_experts == _K3_HYBRID_EXPERTS
+        and num_kept > 0
+        and num_nf3 > 0
+        and num_kept + num_nf3 == num_experts
+        and topk == _K3_HYBRID_TOPK
     )
 
 
@@ -184,6 +220,16 @@ def _b12x_tiles_for_geometry(
     local expert width of 192, so FC1 has N=384 and needs an N=128 tile.
     Both GEMMs use the measured 128-thread K64/N128 SM121 specialization.
     """
+    # TP16 K3 M=1 tuning on SM121 favors a narrower FC1 N tile with twice the
+    # K depth. Across the checkpoint's real mixed-tier splits this cuts the
+    # one-grid kernel by roughly 1--3% in eager and 24--28% in graph replay.
+    # Keep the specialization local to K3 so existing GLM/Grid188 packing is
+    # byte-for-byte unchanged.
+    if (
+        hidden_size == _K3_HYBRID_HIDDEN
+        and intermediate_size == _K3_HYBRID_INTERMEDIATE
+    ):
+        return (128, 64, 64, 128)
     candidates = (_B12X_TILES, (64, 128, 64, 128))
     for fc1_k, fc1_n, fc2_k, fc2_n in candidates:
         if (
@@ -235,6 +281,10 @@ class _HybridSharedRuntime:
         self.grid188_sms: int | None = None
         self.grid188_max_shared_mem: int | None = None
         self.grid188_disabled_reason: str | None = None
+        self.k3_hybrid_scratch: dict[str, torch.Tensor] | None = None
+        self.k3_hybrid_sms: int | None = None
+        self.k3_hybrid_max_shared_mem: int | None = None
+        self.k3_hybrid_disabled_reason: str | None = None
 
 
 class _HybridLayerState:
@@ -260,6 +310,9 @@ class _HybridLayerState:
         self.tiles = _b12x_tiles_for_geometry(hidden_size, intermediate_size)
         # b12x prepared weights (W4A16PackedWeights / PreparedNF3MoeWeights).
         self.prep_kept: Any = None
+        # Native MXFP4 W4A16 representation already owned by kept_kernel.
+        # This is a view/metadata bundle, not a second resident weight copy.
+        self.prep_kept_hybrid: Any = None
         self.prep_nf3: Any = None
         # Global -> local id maps, -1 for experts outside the tier.
         self.emap_kept: torch.Tensor | None = None
@@ -277,6 +330,12 @@ class _HybridLayerState:
         self.grid188_tier_map: torch.Tensor | None = None
         self.grid188_output: torch.Tensor | None = None
         self.grid188_ready = False
+        # K3 TP16 one-grid MXFP4/NF3 decode resources.
+        self.k3_hybrid_launch: Any = None
+        self.k3_hybrid_weight_views: tuple[torch.Tensor, ...] | None = None
+        self.k3_hybrid_tier_map: torch.Tensor | None = None
+        self.k3_hybrid_output: torch.Tensor | None = None
+        self.k3_hybrid_ready = False
         # Keeps kernel-format tensors alive: b12x prepared weights VIEW the
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
@@ -636,6 +695,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             routing_tables=None,
         )
         kernel.fused_experts.process_weights_after_loading(kept_module)
+        prepared_experts = kernel.fused_experts._lookup_prepared_experts()
+        if prepared_experts is None:
+            raise RuntimeError("MXFP4 modular kernel did not publish prepared weights")
+        state.prep_kept_hybrid = prepared_experts.representation_for("w4a16")
         # Owning a modular kernel makes supports_internal_mk True, so vLLM's
         # post-load maybe_init_modular_kernel() returns early instead of
         # rebuilding a kernel from the (freed) standard weight attrs.
@@ -698,6 +761,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         fc1_tile_n, fc2_tile_n = state.tiles[1], state.tiles[3]
 
         if num_nf3 > 0:
+
             def drop_parameter_data(name: str) -> None:
                 param = getattr(layer, name)
                 param.data = param.data.new_empty((0,))
@@ -714,9 +778,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             )
             for start in range(0, num_nf3, _NF3_PACK_CHUNK):
                 end = min(start + _NF3_PACK_CHUNK, num_nf3)
-                codes = _unpack_nf3_codes(
-                    layer.w13_weight_packed[start:end], hidden
-                )
+                codes = _unpack_nf3_codes(layer.w13_weight_packed[start:end], hidden)
                 packed = _nf3_pack_code_experts(
                     codes, size_k=hidden, size_n=2 * inter, tile_n=fc1_tile_n
                 )
@@ -725,14 +787,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             drop_parameter_data("w13_weight_packed")
 
             w2_words = 3 * hidden * inter // 32
-            w2_nf3 = torch.empty(
-                (num_nf3, w2_words), dtype=torch.int32, device=device
-            )
+            w2_nf3 = torch.empty((num_nf3, w2_words), dtype=torch.int32, device=device)
             for start in range(0, num_nf3, _NF3_PACK_CHUNK):
                 end = min(start + _NF3_PACK_CHUNK, num_nf3)
-                codes = _unpack_nf3_codes(
-                    layer.w2_weight_packed[start:end], inter
-                )
+                codes = _unpack_nf3_codes(layer.w2_weight_packed[start:end], inter)
                 packed = _nf3_pack_code_experts(
                     codes, size_k=inter, size_n=hidden, tile_n=fc2_tile_n
                 )
@@ -841,6 +899,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             for name in ("w13_weight", "w2_weight", "w13_nv_scale", "w2_nv_scale"):
                 param = getattr(layer, name)
                 param.data = param.data.new_empty((0,))
+
     def _get_launch_pair(
         self, prepared: Any, state: _HybridLayerState
     ) -> tuple[Any, Any]:
@@ -936,10 +995,13 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         return runtime.launches[key]
 
     @staticmethod
-    def _grid188_prepared_views(prepared: Any) -> tuple[torch.Tensor, ...]:
+    def _hybrid_prepared_views(prepared: Any) -> tuple[torch.Tensor, ...]:
+        weight_dtype = (
+            torch.uint8 if prepared.weight_layout == "modelopt" else torch.int32
+        )
         return (
-            prepared.w13.view(torch.int32).view(-1),
-            prepared.w2.view(torch.int32).view(-1),
+            prepared.w13.view(weight_dtype).view(-1),
+            prepared.w2.view(weight_dtype).view(-1),
             prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
             prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
             prepared.w13_global_scale.view(-1),
@@ -947,10 +1009,13 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
 
     @staticmethod
-    def _borrow_grid188_scratch(
+    def _borrow_hybrid_scratch(
         buffers: Any,
         *,
         device: torch.device,
+        routed_rows: int,
+        fc1_cols: int,
+        intermediate_size: int,
         scratch_elements: int,
         workspace_words: int,
     ) -> dict[str, torch.Tensor]:
@@ -958,8 +1023,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         specs = (
             # Flat 1-D views: the unified hybrid op compiles against flat
             # intermediate buffers ([m*topk rows] x fc1_cols / intermediate).
-            ("fc1", "intermediate_cache13", torch.bfloat16, (32 * 1024,)),
-            ("activated", "intermediate_cache2", torch.bfloat16, (32 * 512,)),
+            (
+                "fc1",
+                "intermediate_cache13",
+                torch.bfloat16,
+                (routed_rows * fc1_cols,),
+            ),
+            (
+                "activated",
+                "intermediate_cache2",
+                torch.bfloat16,
+                (routed_rows * intermediate_size,),
+            ),
             ("fc1_c_tmp", "fc1_c_tmp", torch.float32, (scratch_elements,)),
             ("fc2_c_tmp", "fc2_c_tmp", torch.float32, (scratch_elements,)),
         )
@@ -980,11 +1055,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 or source.data_ptr() % 16
             ):
                 raise RuntimeError(
-                    f"Grid188 scratch source {source_name} failed admission"
+                    f"hybrid scratch source {source_name} failed admission"
                 )
             storage_id = int(source.untyped_storage().data_ptr())
             if storage_id in storage_ids:
-                raise RuntimeError("Grid188 scratch sources alias each other")
+                raise RuntimeError("hybrid scratch sources alias each other")
             storage_ids.add(storage_id)
             borrowed[target_name] = source.view(-1)[:elements].view(shape)
         borrowed["workspace"] = torch.zeros(
@@ -1073,9 +1148,12 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                     "w4a16_fused_moe_hybrid_launch",
                 ):
                     raise RuntimeError("hybrid one-grid custom op is unavailable")
-                runtime.grid188_scratch = self._borrow_grid188_scratch(
+                runtime.grid188_scratch = self._borrow_hybrid_scratch(
                     runtime.buffers,
                     device=prep_kept.w13.device,
+                    routed_rows=_GRID188_M * _GRID188_TOPK,
+                    fc1_cols=2 * _GRID188_INTERMEDIATE,
+                    intermediate_size=_GRID188_INTERMEDIATE,
                     scratch_elements=packed_gemm_scratch_elements(
                         size_n=max(2 * _GRID188_INTERMEDIATE, _GRID188_HIDDEN),
                         route_slots=_GRID188_M * _GRID188_TOPK,
@@ -1089,8 +1167,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 runtime.grid188_launch = launch
 
             weight_views = (
-                *self._grid188_prepared_views(prep_kept),
-                *self._grid188_prepared_views(prep_nf3),
+                *self._hybrid_prepared_views(prep_kept),
+                *self._hybrid_prepared_views(prep_nf3),
             )
             tier_map = torch.tensor(
                 _combined_tier_local_descriptors(state.remap),
@@ -1116,6 +1194,144 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             logger.warning_once(
                 "nvfp4_nf3_hybrid: Grid188 unavailable; using serial decode: %s",
                 runtime.grid188_disabled_reason,
+            )
+
+    def _prepare_k3_hybrid(self, layer: "RoutedExperts", topk: int) -> None:
+        """Arm K3 TP16's single-token MXFP4+NF3 one-grid decode path."""
+        state: _HybridLayerState = layer.hybrid_state
+        runtime = self.quant_config.shared_runtime
+        if state.k3_hybrid_ready or runtime.k3_hybrid_disabled_reason is not None:
+            return
+        if not _is_k3_hybrid_geometry(
+            hidden_size=state.hidden_size,
+            intermediate_size=state.intermediate_size,
+            num_experts=state.num_experts,
+            num_kept=state.num_kept,
+            num_nf3=state.num_nf3,
+            topk=topk,
+            kept_mx=state.kept_mx,
+        ):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            runtime.k3_hybrid_disabled_reason = (
+                "resources were not prepared before capture"
+            )
+            return
+        try:
+            prep_kept, prep_nf3 = state.prep_kept_hybrid, state.prep_nf3
+            if prep_kept is None or prep_nf3 is None:
+                raise RuntimeError("both prepared K3 tiers are required")
+            prepared_contract = (
+                prep_kept.weight_layout == "modelopt"
+                and prep_kept.scale_format == "e8m0_k32"
+                and prep_kept.w13_layout == "w31"
+                and int(prep_kept.num_experts) == state.num_kept
+                and prep_nf3.weight_layout == "nf3_2p1"
+                and prep_nf3.scale_format == "e4m3_k32"
+                and int(prep_nf3.num_experts) == state.num_nf3
+            )
+            if not prepared_contract:
+                raise RuntimeError("prepared tier layouts do not match K3 hybrid ABI")
+
+            from sparkinfer.moe._shared.kernels.w4a16.host import (
+                packed_gemm_scratch_elements,
+            )
+            from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+                compile_w4a16_fused_moe_hybrid,
+            )
+
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            sms = int(props.multi_processor_count)
+            max_shared_mem = int(
+                getattr(props, "shared_memory_per_block_optin", 101_376)
+            )
+            launch = compile_w4a16_fused_moe_hybrid(
+                size_m=_K3_HYBRID_M,
+                hidden_size=_K3_HYBRID_HIDDEN,
+                intermediate_size=_K3_HYBRID_INTERMEDIATE,
+                tier0_num_experts=state.num_kept,
+                tier1_num_experts=state.num_nf3,
+                top_k=_K3_HYBRID_TOPK,
+                activation="situ",
+                map_slots=_K3_HYBRID_EXPERTS,
+                element_dtype="bf16",
+                fast_math=True,
+                sms=sms,
+                max_shared_mem=max_shared_mem,
+                tier0_weight_layout=prep_kept.weight_layout,
+                tier0_scale_format=prep_kept.scale_format,
+                tier0_w13_layout=prep_kept.w13_layout,
+                tier1_weight_layout=prep_nf3.weight_layout,
+                tier1_scale_format=prep_nf3.scale_format,
+                tier1_w13_layout=prep_nf3.w13_layout,
+                force_tile_config=state.tiles,
+                schedule_whole_tiles=True,
+            )
+            if (
+                int(launch.size_m) != _K3_HYBRID_M
+                or int(launch.blocks_per_sm) != 1
+                or int(launch.map_slots) != _K3_HYBRID_EXPERTS
+                or int(launch.local_memory_bytes) > 0
+            ):
+                raise RuntimeError("compiled K3 hybrid launch failed admission")
+            if not hasattr(torch.ops.sparkinfer, "w4a16_fused_moe_hybrid_launch"):
+                raise RuntimeError("hybrid one-grid custom op is unavailable")
+            if runtime.k3_hybrid_scratch is None:
+                runtime.k3_hybrid_scratch = self._borrow_hybrid_scratch(
+                    runtime.buffers,
+                    device=prep_kept.w13.device,
+                    routed_rows=_K3_HYBRID_M * _K3_HYBRID_TOPK,
+                    fc1_cols=2 * _K3_HYBRID_INTERMEDIATE,
+                    intermediate_size=_K3_HYBRID_INTERMEDIATE,
+                    scratch_elements=packed_gemm_scratch_elements(
+                        size_n=max(
+                            2 * _K3_HYBRID_INTERMEDIATE, _K3_HYBRID_HIDDEN
+                        ),
+                        route_slots=_K3_HYBRID_M * _K3_HYBRID_TOPK,
+                        moe_block_size=8,
+                        sms=sms,
+                    ),
+                    workspace_words=sms * 4 + 2,
+                )
+                runtime.k3_hybrid_sms = sms
+                runtime.k3_hybrid_max_shared_mem = max_shared_mem
+
+            state.k3_hybrid_launch = launch
+            state.k3_hybrid_weight_views = (
+                *self._hybrid_prepared_views(prep_kept),
+                *self._hybrid_prepared_views(prep_nf3),
+            )
+            state.k3_hybrid_tier_map = torch.tensor(
+                _combined_tier_local_descriptors(
+                    state.remap,
+                    num_experts=state.num_experts,
+                    num_kept=state.num_kept,
+                    num_nf3=state.num_nf3,
+                ),
+                dtype=torch.int32,
+                device=prep_kept.w13.device,
+            ).contiguous()
+            # The output escapes this layer and is consumed by later residual
+            # operations. Give each layer distinct storage so full-decode CUDA
+            # graph capture cannot observe all mixed layers as aliases of the
+            # same external buffer. This costs only 7 KiB per mixed K3 layer.
+            state.k3_hybrid_output = torch.empty(
+                (_K3_HYBRID_M, _K3_HYBRID_HIDDEN),
+                dtype=torch.bfloat16,
+                device=prep_kept.w13.device,
+            )
+            state.k3_hybrid_ready = True
+            logger.info_once(
+                "nvfp4_nf3_hybrid: armed K3 TP16 one-grid decode "
+                "(MXFP4=%d, NF3=%d)",
+                state.num_kept,
+                state.num_nf3,
+            )
+        except Exception as exc:
+            runtime.k3_hybrid_disabled_reason = f"{type(exc).__name__}: {exc}"
+            logger.warning_once(
+                "nvfp4_nf3_hybrid: K3 one-grid unavailable; using serial decode: %s",
+                runtime.k3_hybrid_disabled_reason,
             )
 
     def _run_grid188(
@@ -1176,6 +1392,64 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             int(torch.cuda.current_stream(x.device).cuda_stream),
         )
         return state.grid188_output[:m]
+
+    def _run_k3_hybrid(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        state: _HybridLayerState = layer.hybrid_state
+        runtime = self.quant_config.shared_runtime
+        launch = state.k3_hybrid_launch
+        scratch = runtime.k3_hybrid_scratch
+        assert launch is not None and scratch is not None
+        assert runtime.k3_hybrid_sms is not None
+        assert runtime.k3_hybrid_max_shared_mem is not None
+        assert state.k3_hybrid_weight_views is not None
+        assert state.k3_hybrid_tier_map is not None
+        assert state.k3_hybrid_output is not None
+        torch.ops.sparkinfer.w4a16_fused_moe_hybrid_launch(
+            x,
+            *state.k3_hybrid_weight_views,
+            topk_ids.view(-1),
+            state.k3_hybrid_tier_map,
+            scratch["fc1"],
+            scratch["activated"],
+            state.k3_hybrid_output.view(-1),
+            topk_weights,
+            scratch["fc1_c_tmp"],
+            scratch["fc2_c_tmp"],
+            scratch["workspace"],
+            int(x.shape[0]),
+            int(launch.size_m),
+            int(launch.hidden_size),
+            int(launch.intermediate_size),
+            int(launch.tier0_num_experts),
+            int(launch.tier1_num_experts),
+            int(launch.top_k),
+            launch.activation,
+            int(launch.map_slots),
+            int(launch.moe_block_size),
+            launch.element_dtype,
+            bool(launch.fast_math),
+            runtime.k3_hybrid_sms,
+            runtime.k3_hybrid_max_shared_mem,
+            launch.tier0_weight_layout,
+            launch.tier0_scale_format,
+            launch.tier0_w13_layout,
+            launch.tier1_weight_layout,
+            launch.tier1_scale_format,
+            launch.tier1_w13_layout,
+            int(launch.fc1_tile_k),
+            int(launch.fc1_tile_n),
+            int(launch.fc2_tile_k),
+            int(launch.fc2_tile_n),
+            bool(launch.schedule_whole_tiles),
+            int(torch.cuda.current_stream(x.device).cuda_stream),
+        )
+        return state.k3_hybrid_output
 
     def _ensure_runtime(self, layer: "RoutedExperts", m: int, topk: int) -> None:
         """First-apply init: per-tier preplanned launches plus ONE shared
@@ -1251,6 +1525,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 else torch.empty_like(buffers.output)
             )
         self._prepare_grid188(layer, topk)
+        self._prepare_k3_hybrid(layer, topk)
         state.runtime_ready = True
 
     def _run_tier(
@@ -1336,7 +1611,38 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 state.emap_kept,
                 runtime.out_kept[:m],
                 decode,
-        )
+            )
+        result_m = int(x.shape[0])
+        if decode and state.kept_mx and result_m != 1:
+            # The native MXFP4 microkernel is valuable for single-sequence
+            # decode, where M is exactly one.  Chunked-prefill tails can also
+            # land in the nominal decode range (M=2..8); specializing the
+            # microkernel for every tail M and every per-layer expert count
+            # creates thousands of surprise JIT compiles.  Keep those tails on
+            # the numerically-safe packed route while NF3 retains its direct
+            # launch at the original M.
+            packed_m = _B12X_DECODE_M + 1
+            if runtime.max_m < packed_m:
+                raise RuntimeError(
+                    "nvfp4_nf3_hybrid requires max_num_batched_tokens >= "
+                    f"{packed_m} for safe hybrid prefill tails"
+                )
+            pad_m = packed_m - result_m
+            x = torch.cat((x, x.new_zeros((pad_m, x.shape[1]))), dim=0)
+            topk_weights = torch.cat(
+                (
+                    topk_weights,
+                    topk_weights.new_zeros((pad_m, topk_weights.shape[1])),
+                ),
+                dim=0,
+            )
+            topk_ids = torch.cat(
+                (
+                    topk_ids,
+                    topk_ids.new_zeros((pad_m, topk_ids.shape[1])),
+                ),
+                dim=0,
+            )
         kept_module = state.kept_module
         kept_ids = state.kept_remap[topk_ids.long()]
         # Neither the small-M nor the M=9 packed MXFP4 launcher safely handles
@@ -1361,7 +1667,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=False,
             shared_experts=None,
             shared_experts_input=None,
-        )
+        )[:result_m]
 
     def apply(
         self,
@@ -1412,45 +1718,29 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             ):
                 logger.info_once("nvfp4_nf3_hybrid: executing hybrid one-grid decode")
                 return self._run_grid188(layer, x, weights, grid_ids)
-        result_m = m
-        if decode and state.kept_mx:
-            # SparkInfer's small-M MXFP4 SiTU/W4A16 path is not yet safe for
-            # K3's TP16 geometry (H=3584, local I=192): it produces NaNs for
-            # both hybrid and all-MXFP4 layers.  The packed-route launch is
-            # numerically correct and already used for prefill.  Pad only the
-            # routed-expert call past the direct threshold, give dummy rows
-            # zero router weights, then discard their outputs.  This is a
-            # correctness-first decode fallback; it costs compute but only
-            # tens of KiB and keeps TP16 + the 1M KV-cache memory target.
-            logger.warning_once(
-                "nvfp4_nf3_hybrid: padding K3 MXFP4 decode to packed-route "
-                "M=%d because the TP16 SiTU direct kernel is not numerically safe",
-                _B12X_DECODE_M + 1,
+        if state.k3_hybrid_ready and m == _K3_HYBRID_M:
+            hybrid_ids = (
+                topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
-            packed_m = _B12X_DECODE_M + 1
-            if runtime.max_m < packed_m:
-                raise RuntimeError(
-                    "nvfp4_nf3_hybrid requires max_num_batched_tokens >= "
-                    f"{packed_m} for safe hybrid decode"
+            if not hybrid_ids.is_contiguous():
+                hybrid_ids = hybrid_ids.contiguous()
+            if (
+                x.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and hybrid_ids.numel() == _K3_HYBRID_TOPK
+                and hybrid_ids.is_cuda
+                and hybrid_ids.device == x.device
+                and hybrid_ids.data_ptr() % 16 == 0
+                and weights.numel() == _K3_HYBRID_TOPK
+            ):
+                logger.info_once(
+                    "nvfp4_nf3_hybrid: executing K3 TP16 one-grid decode"
                 )
-            pad_m = packed_m - m
-            x = torch.cat((x, x.new_zeros((pad_m, x.shape[1]))), dim=0)
-            weights = torch.cat(
-                (weights, weights.new_zeros((pad_m, weights.shape[1]))), dim=0
-            )
-            topk_ids = torch.cat(
-                (
-                    topk_ids,
-                    topk_ids.new_zeros((pad_m, topk_ids.shape[1])),
-                ),
-                dim=0,
-            )
-            m = packed_m
-            decode = False
+                return self._run_k3_hybrid(layer, x, weights, hybrid_ids)
         if state.num_nf3 == 0:
             # Uniform kept layer (including all-MXFP4 decoder layers and an
             # unmapped NVFP4 MTP head): single-tier launch.
-            return self._run_kept(layer, x, weights, topk_ids, decode)[:result_m]
+            return self._run_kept(layer, x, weights, topk_ids, decode)
         if state.num_kept == 0:
             return self._run_tier(
                 x,
@@ -1473,7 +1763,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             runtime.out_nf3[:m],
             decode,
         )
-        return (out_kept + out_nf3)[:result_m]
+        return out_kept + out_nf3
 
 
 NvFp4Nf3HybridConfig.FusedMoEMethodCls = NvFp4Nf3HybridMoEMethod

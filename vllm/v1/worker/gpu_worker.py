@@ -53,7 +53,6 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
     deepseek_v4_compressor_triton_warmup,
 )
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
     PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
@@ -818,6 +817,11 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        # Importing this module initializes CUDA, so keep it out of the
+        # module-level worker import. A CUDA-clean forkserver can then preload
+        # gpu_worker before forking all TP ranks in parallel.
+        from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+
         kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0
