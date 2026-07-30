@@ -165,10 +165,23 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         # re-tokenization of the rendered string downstream.
         kwargs = params.get_apply_chat_template_kwargs()
         _apply_k3_thinking_kwargs(kwargs)
-        if params.tool_choice not in (None, "auto"):
-            kwargs["tool_choice"] = _dump_k3_template_value(params.tool_choice)
-        if params.response_format is not None:
-            kwargs["response_format"] = _dump_k3_template_value(params.response_format)
+        # This ChatParams generation predates the dedicated tool_choice /
+        # response_format fields; accept them from the params object when
+        # present and fall back to values arriving via chat_template_kwargs.
+        tool_choice = getattr(params, "tool_choice", None)
+        if tool_choice is None:
+            tool_choice = kwargs.get("tool_choice")
+        if tool_choice in (None, "auto"):
+            kwargs.pop("tool_choice", None)
+        else:
+            kwargs["tool_choice"] = _dump_k3_template_value(tool_choice)
+        response_format = getattr(params, "response_format", None)
+        if response_format is None:
+            response_format = kwargs.get("response_format")
+        if response_format is None:
+            kwargs.pop("response_format", None)
+        else:
+            kwargs["response_format"] = _dump_k3_template_value(response_format)
         kwargs["tokenize"] = True
         return self.get_tokenizer().apply_chat_template(conversation, **kwargs)
 
