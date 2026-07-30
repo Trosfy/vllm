@@ -846,10 +846,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         ):
             return "w4a8_mx"
         if source_format == "fp4_e8m0_k32" and activation is MoEActivation.SITU:
-            logger.warning_once(
-                "B12X SiTU MXFP4 shape hidden=%d, local intermediate=%d "
-                "does not fit the in-place W4A8-MX layout; using W4A16 to "
-                "avoid a second model-sized weight allocation.",
+            # The native W4A16 mode is the default for shapes the in-place
+            # W4A8-MX layout does not cover (e.g. Kimi K3 TP16's local
+            # intermediate 192): the 256x128 rp storage tiling would pad
+            # ~30%, a second model-sized allocation. Compact-tail rp storage
+            # is the tracked path to W4A8 for these shapes.
+            logger.info_once(
+                "B12X SiTU MXFP4 shape hidden=%d, local intermediate=%d: "
+                "serving the native W4A16 mode (in-place W4A8-MX needs "
+                "intermediate %% 128 == 0).",
                 hidden_size,
                 intermediate_size,
             )
