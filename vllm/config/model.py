@@ -84,7 +84,7 @@ RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify"]
 ConvertOption = Literal["auto", ConvertType]
 TokenizerMode = Literal[
-    "auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4", "inkling"
+    "auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4", "inkling", "kimi_k3"
 ]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 LogprobsMode = Literal[
@@ -627,6 +627,8 @@ class ModelConfig:
                 self.tokenizer_mode = "terratorch"
             elif arch == "MoonshotKimiaForCausalLM":
                 self.tokenizer_mode = "kimi_audio"
+            elif arch == "KimiK3ForConditionalGeneration":
+                self.tokenizer_mode = "kimi_k3"
             elif arch == "DeepseekV32ForCausalLM":
                 self.tokenizer_mode = "deepseek_v32"
             elif arch == "DeepseekV4ForCausalLM":

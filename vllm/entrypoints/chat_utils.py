@@ -1983,13 +1983,21 @@ async def parse_chat_messages_async(
     return conversation, mm_data, mm_uuids
 
 
-_KIMI_MODEL_TYPES = ("kimi_k2", "kimi_k25")
+_KIMI_MODEL_TYPES = ("kimi_k2", "kimi_k25", "kimi_k3")
 
 
 def get_tool_call_id_type(model_config: ModelConfig) -> str:
     """Return the tool-call ID type for a given model configuration."""
     hf_overrides = getattr(model_config, "hf_overrides", None)
-    if model_config.hf_text_config.model_type in _KIMI_MODEL_TYPES or (
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    # Check both configs: Kimi K3 nests a kimi_linear text config inside a
+    # kimi_k3 top-level config.
+    model_types = (
+        getattr(hf_config, "model_type", None),
+        getattr(hf_text_config, "model_type", None),
+    )
+    if any(model_type in _KIMI_MODEL_TYPES for model_type in model_types) or (
         isinstance(hf_overrides, dict)
         and hf_overrides.get("model_type") in _KIMI_MODEL_TYPES
     ):

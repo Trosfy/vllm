@@ -82,6 +82,9 @@ AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepSeekV4MTPModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3MTPModel",
+        "KimiLinearForCausalLM",
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
     }
