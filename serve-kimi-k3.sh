@@ -25,7 +25,7 @@ fi
 # Only shadow the installed vLLM when the source tree carries the compiled
 # extensions; wheel-based deployments run site-packages with this repo's
 # python files overlaid instead.
-if compgen -G "${SCRIPT_DIR}/vllm/_C*.so" >/dev/null; then
+if [[ -e "${SCRIPT_DIR}/vllm/_C_stable_libtorch.abi3.so" ]]; then
   export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 
@@ -53,7 +53,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"
 # weights; batch sizes above the capture list run eagerly.
 COMPILATION_CONFIG="${COMPILATION_CONFIG:-{\"mode\": 0, \"cudagraph_mode\": \"PIECEWISE\", \"cudagraph_capture_sizes\": [1]}}"
 
-cd "${SCRIPT_DIR}"
+
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --trust-remote-code \
