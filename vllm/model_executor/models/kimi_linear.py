@@ -11,6 +11,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -802,13 +803,44 @@ class KimiLinearModel(nn.Module):
             hidden_states = None
             residual = block_residual
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        import os as _os
+
+        _dbg = (
+            _os.environ.get("KIMI_DEBUG_NORMS")
+            and get_tensor_model_parallel_rank() == 0
+        )
+        if _dbg:
+            _e = prefix_sum if prefix_sum is not None else hidden_states
+            print(
+                f"[norms] embed: {_e.float().norm(dim=-1).mean().item():.4f} "
+                f"tokens={_e.shape[0]}",
+                flush=True,
+            )
+        for _li, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer]
+        ):
             hidden_states, prefix_sum, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 prefix_sum=prefix_sum,
             )
+            if _dbg and (_li < 6 or _li % 8 == 0 or _li >= 90):
+                _h = hidden_states.float().norm(dim=-1).mean().item()
+                _p = (
+                    prefix_sum.float().norm(dim=-1).mean().item()
+                    if prefix_sum is not None
+                    else -1.0
+                )
+                _r = (
+                    residual.float().norm(dim=-1).mean().item()
+                    if residual is not None
+                    else -1.0
+                )
+                print(
+                    f"[norms] L{_li}: h={_h:.4f} psum={_p:.4f} res={_r:.4f}",
+                    flush=True,
+                )
 
         assert hidden_states is not None
         assert residual is not None
@@ -833,9 +865,21 @@ class KimiLinearModel(nn.Module):
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
             )
+            if _dbg:
+                print(
+                    f"[norms] post-attn_res: "
+                    f"{hidden_states.float().norm(dim=-1).mean().item():.4f}",
+                    flush=True,
+                )
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
+        if _dbg:
+            print(
+                f"[norms] final: "
+                f"{hidden_states.float().norm(dim=-1).mean().item():.4f}",
+                flush=True,
+            )
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
