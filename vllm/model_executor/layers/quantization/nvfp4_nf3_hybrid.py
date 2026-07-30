@@ -943,7 +943,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         fc1_tile_n, fc2_tile_n = state.tiles[1], state.tiles[3]
 
         if num_nf3 > 0 and self.quant_config.demoted_format == "exl3_3":
-            from sparkinfer.moe import trellis_moe
+            from sparkinfer.moe import fused_moe
 
             # Projection-major native stacks; prepare_weights wraps zero-copy.
             w13 = layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
@@ -958,15 +958,27 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 ],
                 dim=1,
             ).contiguous()
-            state.trellis_weights = trellis_moe.prepare_weights(
-                w13,
-                w2t,
+            wplan = fused_moe.plan_weights(
+                quant_modes="w4a16",
+                source_format="exl3_trellis_mcg",
+                activation=self.moe.activation.value,
+                params_dtype=self.moe.in_dtype,
+                num_experts=num_nf3,
+                hidden_size=hidden,
+                intermediate_size=inter,
+                w13_layout="w13",
+                trellis_bits=3,
+            )
+            state.trellis_weights = fused_moe.prepare_weights(
+                plan=wplan,
+                params_dtype=self.moe.in_dtype,
+                w1_fp4=w13,
+                w2_fp4=w2t,
                 gate_suh=layer.w13_exl3_suh.data[:, 0].contiguous(),
                 up_suh=layer.w13_exl3_suh.data[:, 1].contiguous(),
                 intermediate_rotations=inter_rot,
                 down_svh=layer.w2_exl3_svh.data.contiguous(),
-                codebook="mcg",
-                mcg=self.quant_config.trellis_mcg,
+                trellis_mcg=self.quant_config.trellis_mcg,
             )
             for pname in (
                 "w13_exl3_trellis",
@@ -1689,7 +1701,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if state.prep_kept is not None:
             state.launch_kept = self._get_launch_pair(state.prep_kept, state)
         if getattr(state, "trellis_weights", None) is not None:
-            from sparkinfer.moe import trellis_moe
+            from sparkinfer.moe import fused_moe
 
             key = (
                 "trellis",
@@ -1701,26 +1713,26 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             )
             plan = runtime.launches.get(key)
             if plan is None:
-                caps = trellis_moe.Caps(
+                caps = fused_moe.Caps(
                     max_tokens=runtime.max_m,
                     num_topk=runtime.topk,
-                    num_experts=state.num_nf3,
-                    hidden_size=state.hidden_size,
-                    intermediate_size=state.intermediate_size,
                     device=torch.cuda.current_device(),
-                    activation=getattr(self, "_activation_name", "silu"),
-                    trellis_bits=3,
+                    weight_plan=state.trellis_weights.plan,
+                    quant_mode="w4a16",
                     route_num_experts=self.moe.num_experts,
                 )
-                plan = trellis_moe.plan(caps)
+                plan = fused_moe.plan(caps)
                 runtime.launches[key] = plan
             state.trellis_plan = plan
+            spec = plan.scratch_specs()[0]
+            need = int(torch.Size(spec.shape).numel())
             if getattr(runtime, "trellis_scratch", None) is None or (
-                runtime.trellis_scratch.numel() < plan.scratch_nbytes
+                runtime.trellis_scratch.numel() < need
+                or runtime.trellis_scratch.dtype != spec.dtype
             ):
                 runtime.trellis_scratch = torch.empty(
-                    plan.scratch_nbytes,
-                    dtype=torch.uint8,
+                    spec.shape,
+                    dtype=spec.dtype,
                     device=torch.cuda.current_device(),
                 )
         if state.prep_nf3 is not None:
@@ -1991,23 +2003,25 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             # unmapped NVFP4 MTP head): single-tier launch.
             return self._run_kept(layer, x, weights, topk_ids, decode)
         if getattr(state, "trellis_weights", None) is not None:
-            from sparkinfer.moe import trellis_moe
+            from sparkinfer.moe import fused_moe
 
             tids = (
                 topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
             if not tids.is_contiguous():
                 tids = tids.contiguous()
-            binding = trellis_moe.bind(
+            binding = fused_moe.bind(
                 state.trellis_plan,
                 scratch=runtime.trellis_scratch,
                 a=x if x.is_contiguous() else x.contiguous(),
-                weights=state.trellis_weights,
+                experts=state.trellis_weights,
                 topk_weights=weights,
                 topk_ids=tids,
                 route_expert_map=state.emap_nf3,
             )
-            out_trellis = trellis_moe.run(binding=binding)[:m]
+            # The unified full-rotation top-k sum emits fp32; downstream
+            # layers expect the model dtype.
+            out_trellis = fused_moe.run(binding=binding)[:m].to(x.dtype)
             if state.num_kept == 0:
                 return out_trellis
             return self._run_kept(layer, x, weights, topk_ids, decode)[:m] + out_trellis

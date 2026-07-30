@@ -23,13 +23,23 @@ export VLLM_USE_B12X_MOE=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_ENABLE_PCIE_ALLREDUCE=0
 export KDA_DISABLE_AUTOTUNE=1
+# Refactored b12x defaults K3 SiTU MXFP4 experts to w4a8_mx at TP12 (local
+# I=256 divides 128); the hybrid kept-tier launches are built for w4a16.
+# Revisit W4A8 during the perf pass.
+export B12X_MOE_FORCE_A16=1
+# First-request decode-shape CuTe compiles can exceed the 300s default;
+# they disk-cache after the first run.
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 export VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=134217728
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # EXL3 skeleton replicates suh/svh sign vectors per rank (~1.4 GiB), leaving
 # little free memory at load start; staging buffers are freed after load.
-export INSTANTTENSOR_MAX_FREE_MEM_USAGE=0.9
+export INSTANTTENSOR_MAX_FREE_MEM_USAGE=0.6
 export INSTANTTENSOR_BACKEND=AIO
 
+# KDA fat projections (q/k/v/o) join the MXFP8 overlay (-2.05 GiB/rank);
+# the exp-compounding gate-adjacent paths (g/f_a/f_b/b_proj/conv1d) and
+# kv_b_proj stay BF16.
 OVERLAY='{"linear":{"weight":"mxfp8"},"shared_experts":{"weight":"mxfp8"},"ignore":["re:.*kv_b_proj","re:.*conv1d","re:.*\\.b_proj","re:.*\\.q_proj","re:.*\\.k_proj","re:.*\\.v_proj","re:.*\\.g_proj","re:.*f_a_proj","re:.*f_b_proj","re:.*o_proj","re:.*lm_head","re:.*attn_res"]}'
 
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
@@ -42,8 +52,8 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --tensor-parallel-size 12 \
   --enforce-eager \
   --load-format instanttensor \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.97}" \
-  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}" \
-  --max-num-seqs "${MAX_NUM_SEQS:-4}" \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.985}" \
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-1024}" \
+  --max-num-seqs "${MAX_NUM_SEQS:-2}" \
   --quantization-config "${OVERLAY}" \
   "$@"
