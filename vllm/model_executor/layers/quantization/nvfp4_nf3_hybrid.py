@@ -387,6 +387,15 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
                 quant_config=self, moe_config=layer.moe_config
             )
         if isinstance(layer, LinearBase):
+            # Honor the online MXFP8 overlay (--quantization-config) on the
+            # checkpoint's BF16 dense linears: shared experts via the
+            # `shared_experts` spec, other dense linears (KDA/MLA attention
+            # projections, dense-layer MLP) via `linear` with its `ignore`
+            # list. K3 TP16 does not fit at BF16 attention weights.
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
+            if method := self._get_dense_linear_online_method(layer, prefix):
+                return method
             return UnquantizedLinearMethod()
         # In particular, do not inherit ModelOpt's serialized-NVFP4 method for
         # ParallelLMHead/VocabParallelEmbedding. K3 stores both as BF16; using
@@ -721,6 +730,37 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # copies) so resident VRAM stays flat.
         for name in ("w13_weight", "w2_weight", "w13_nv_scale", "w2_nv_scale"):
             delattr(layer, name)
+        # The prepared representation carries its own packed scale grids; the
+        # pre-prepare scale tensors are then dead weight (38.5+19.3 MiB per K3
+        # TP16 layer, ~5 GiB per rank over 92 layers). Release their storage
+        # in place (every reference — keepalive, kept_module, quant config —
+        # observes the swap) unless the prepared grids alias them.
+        prep = state.prep_kept_hybrid
+        prep_ptrs = set()
+        for field in (
+            "w13", "w2", "w13_scale", "w2_scale",
+            "micro_w13_scale", "micro_w2_scale",
+            "w13_global_scale", "w2_global_scale",
+            "micro_w13_global_scale", "micro_w2_global_scale",
+        ):
+            value = getattr(prep, field, None)
+            if isinstance(value, torch.Tensor):
+                prep_ptrs.add(value.untyped_storage().data_ptr())
+        freed = 0
+        for tensor in (w13_scale, w2_scale):
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.numel() > 0
+                and tensor.untyped_storage().data_ptr() not in prep_ptrs
+            ):
+                freed += tensor.numel() * tensor.element_size()
+                tensor.data = tensor.data.new_empty((0,))
+        if freed:
+            logger.info_once(
+                "nvfp4_nf3_hybrid: released %.1f MiB/layer of pre-prepare kept "
+                "scale storage (prepared grids are self-contained)",
+                freed / 2**20,
+            )
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         """Repack both tiers into b12x W4A16 kernel formats.
