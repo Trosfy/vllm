@@ -203,14 +203,16 @@ class KimiMoE(nn.Module):
         self.routed_expert_up_proj: RowParallelLinear | None = None
         self.routed_output_transform: KimiRoutedOutputTransform | None = None
         if routed_expert_hidden_size is not None:
-            # quant_config is passed so the online MXFP8 dense overlay can
-            # reach the latent projections; K3 TP16 needs the extra headroom.
+            # quant_config=None: the checkpoint stores the latent projections
+            # in BF16 and its compressed-tensors ignore list does not cover
+            # them, so passing the config through would create unloadable
+            # MXFP4 linear layers.
             self.routed_expert_down_proj = ColumnParallelLinear(
                 hidden_size,
                 routed_expert_hidden_size,
                 bias=False,
                 gather_output=True,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -224,7 +226,7 @@ class KimiMoE(nn.Module):
                 bias=False,
                 input_is_parallel=False,
                 reduce_results=False,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
             self.routed_output_transform = KimiRoutedOutputTransform(
