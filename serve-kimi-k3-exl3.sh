@@ -25,13 +25,15 @@ export VLLM_ENABLE_PCIE_ALLREDUCE=0
 export KDA_DISABLE_AUTOTUNE=1
 export VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=134217728
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export INSTANTTENSOR_MAX_FREE_MEM_USAGE=0.2
+# EXL3 skeleton replicates suh/svh sign vectors per rank (~1.4 GiB), leaving
+# little free memory at load start; staging buffers are freed after load.
+export INSTANTTENSOR_MAX_FREE_MEM_USAGE=0.9
 export INSTANTTENSOR_BACKEND=AIO
 
 OVERLAY='{"linear":{"weight":"mxfp8"},"shared_experts":{"weight":"mxfp8"},"ignore":["re:.*kv_b_proj","re:.*conv1d","re:.*\\.b_proj","re:.*\\.q_proj","re:.*\\.k_proj","re:.*\\.v_proj","re:.*\\.g_proj","re:.*f_a_proj","re:.*f_b_proj","re:.*o_proj","re:.*lm_head","re:.*attn_res"]}'
 
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
-  /models/Kimi-K3-EXL3-3p19-serve \
+  "${MODEL_DIR:-/models/Kimi-K3-EXL3-3p14-serve}" \
   --served-model-name kimi-k3-exl3 \
   --trust-remote-code \
   --host 127.0.0.1 \
@@ -40,7 +42,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --tensor-parallel-size 12 \
   --enforce-eager \
   --load-format instanttensor \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.94}" \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.97}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}" \
   --max-num-seqs "${MAX_NUM_SEQS:-4}" \
   --quantization-config "${OVERLAY}" \

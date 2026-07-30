@@ -124,9 +124,7 @@ def _combined_tier_local_descriptors(
                 f"duplicate tier/local expert descriptor {(tier_i, local_id_i)!r}"
             )
         seen_local[tier_i].add(local_id_i)
-        descriptors[global_id_i] = (
-            local_id_i if tier_i == 0 else 0x10000 | local_id_i
-        )
+        descriptors[global_id_i] = local_id_i if tier_i == 0 else 0x10000 | local_id_i
     if any(descriptor < 0 for descriptor in descriptors):
         raise ValueError(
             f"heterogeneous remap does not cover all {num_experts} global experts"
@@ -218,9 +216,7 @@ def _apply_nf3_codebook_override(levels: list[float]) -> None:
 
     t = tuple(float(v) for v in levels)
     if tuple(_sk._NF3_CODEBOOK) != t:
-        logger.info_once(
-            "Overriding b12x NF3 codebook with checkpoint levels: %s", t
-        )
+        logger.info_once("Overriding b12x NF3 codebook with checkpoint levels: %s", t)
         _sk._NF3_CODEBOOK = t
         _sp._NF3_CODEBOOK = t
     os.environ["SPARKINFER_NF3_CODEBOOK"] = ",".join(f"{v:.10g}" for v in t)
@@ -402,6 +398,7 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         # sparkinfer trellis_moe.
         self.demoted_format: str = "nf3_2p1"
         self.trellis_mcg: int = 0
+        self.trellis_shared_su: bool = False
         self.shared_runtime = _HybridSharedRuntime()
 
     def get_name(self) -> QuantizationMethods:
@@ -493,10 +490,15 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
             trellis = quantization.get("trellis")
         if isinstance(trellis, dict) and "mcg_mult" in trellis:
             config.trellis_mcg = int(
-                torch.tensor(
-                    int(trellis["mcg_mult"]), dtype=torch.uint32
-                ).view(torch.int32)
+                torch.tensor(int(trellis["mcg_mult"]), dtype=torch.uint32).view(
+                    torch.int32
+                )
             )
+        if isinstance(trellis, dict):
+            # shared-su artifacts store one H-side rotation row per
+            # (layer, matrix); register [1, ...] params and let the kernels
+            # broadcast (zero expert stride).
+            config.trellis_shared_su = bool(trellis.get("shared_su", False))
         return config
 
 
@@ -632,6 +634,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                         elif part == "suh":
                             lw = lw.chunk(tp_size, 0)[tp_rank]  # I axis
                         # svh spans H: replicated
+                # shared-su artifacts register one broadcast row for the
+                # H-side vectors; every expert carries an identical copy, so
+                # writes to row 0 are idempotent.
+                if target.data.shape[0] == 1:
+                    local_id = 0
                 if family == "w13":
                     widx = 0 if shard_id == "w1" else 1
                     dst = target.data[local_id, widx]
@@ -708,7 +715,12 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 (num_nf3, 2, hidden // 16, inter // 16, tb),
                 torch.int16,
             )
-            register("w13_exl3_suh", (num_nf3, 2, hidden), torch.float16)
+            # shared-su artifacts: one broadcast row instead of per-expert
+            # H-side vectors (saves ~1.4 GiB/rank at K3 scale).
+            h_rows = (
+                1 if getattr(self.quant_config, "trellis_shared_su", False) else num_nf3
+            )
+            register("w13_exl3_suh", (h_rows, 2, hidden), torch.float16)
             register("w13_exl3_svh", (num_nf3, 2, inter), torch.float16)
             register(
                 "w2_exl3_trellis",
@@ -716,7 +728,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 torch.int16,
             )
             register("w2_exl3_suh", (num_nf3, inter), torch.float16)
-            register("w2_exl3_svh", (num_nf3, hidden), torch.float16)
+            register("w2_exl3_svh", (h_rows, hidden), torch.float16)
         register("w13_weight", (num_kept, 2 * inter, hidden // 2))
         register(
             "w13_weight_packed",
@@ -934,9 +946,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             from sparkinfer.moe import trellis_moe
 
             # Projection-major native stacks; prepare_weights wraps zero-copy.
-            w13 = (
-                layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
-            )
+            w13 = layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
             w2t = layer.w2_exl3_trellis.data.contiguous()
             # intermediate rotation bundle order pinned by the closure test:
             # (gate_svh, down_suh, up_svh)
@@ -1493,9 +1503,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                     fc1_cols=2 * _K3_HYBRID_INTERMEDIATE,
                     intermediate_size=_K3_HYBRID_INTERMEDIATE,
                     scratch_elements=packed_gemm_scratch_elements(
-                        size_n=max(
-                            2 * _K3_HYBRID_INTERMEDIATE, _K3_HYBRID_HIDDEN
-                        ),
+                        size_n=max(2 * _K3_HYBRID_INTERMEDIATE, _K3_HYBRID_HIDDEN),
                         route_slots=_K3_HYBRID_M * _K3_HYBRID_TOPK,
                         moe_block_size=8,
                         sms=sms,
@@ -1531,8 +1539,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             )
             state.k3_hybrid_ready = True
             logger.info_once(
-                "nvfp4_nf3_hybrid: armed K3 TP16 one-grid decode "
-                "(MXFP4=%d, NF3=%d)",
+                "nvfp4_nf3_hybrid: armed K3 TP16 one-grid decode (MXFP4=%d, NF3=%d)",
                 state.num_kept,
                 state.num_nf3,
             )
@@ -1977,9 +1984,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 and hybrid_ids.data_ptr() % 16 == 0
                 and weights.numel() == _K3_HYBRID_TOPK
             ):
-                logger.info_once(
-                    "nvfp4_nf3_hybrid: executing K3 TP16 one-grid decode"
-                )
+                logger.info_once("nvfp4_nf3_hybrid: executing K3 TP16 one-grid decode")
                 return self._run_k3_hybrid(layer, x, weights, hybrid_ids)
         if state.num_nf3 == 0:
             # Uniform kept layer (including all-MXFP4 decoder layers and an
@@ -1989,9 +1994,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             from sparkinfer.moe import trellis_moe
 
             tids = (
-                topk_ids
-                if topk_ids.dtype == torch.int32
-                else topk_ids.to(torch.int32)
+                topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
             if not tids.is_contiguous():
                 tids = tids.contiguous()
@@ -2007,10 +2010,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             out_trellis = trellis_moe.run(binding=binding)[:m]
             if state.num_kept == 0:
                 return out_trellis
-            return (
-                self._run_kept(layer, x, weights, topk_ids, decode)[:m]
-                + out_trellis
-            )
+            return self._run_kept(layer, x, weights, topk_ids, decode)[:m] + out_trellis
         if state.num_kept == 0:
             return self._run_tier(
                 x,
