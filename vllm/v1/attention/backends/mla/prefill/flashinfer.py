@@ -33,16 +33,6 @@ except ImportError:
 _DEFAULT_NUM_CHUNKS = 32
 
 
-def _flashinfer_prefill_backend() -> str:
-    """CUTLASS FMHA needs SM100a/SM110a tcgen05; SM12x uses the FA2 path."""
-    from vllm.platforms import current_platform
-
-    cap = current_platform.get_device_capability()
-    if cap is not None and cap.major >= 12:
-        return "fa2"
-    return "cutlass"
-
-
 class FlashInferPrefillBackend(MLAPrefillBackend):
     """FlashInfer backend for MLA prefill."""
 
@@ -60,10 +50,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
 
     @classmethod
     def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
-        # FlashInfer's ragged prefill (FA2-style) JIT-compiles for the target
-        # arch and runs on both datacenter (SM100) and GeForce/RTX PRO (SM120)
-        # Blackwell.
-        return device_capability.major >= 10
+        return device_capability.major == 10
 
     @classmethod
     def is_available(cls) -> bool:
@@ -112,7 +99,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
             for _ in range(len(self._prefill_chunks), num_chunks):
                 self._prefill_chunks.append(
                     BatchPrefillWithRaggedKVCacheWrapper(
-                        workspace_buffer, "NHD", backend=_flashinfer_prefill_backend()
+                        workspace_buffer, "NHD", backend="cutlass"
                     )
                 )
 
@@ -150,7 +137,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         has_context = prefill_metadata.chunked_context is not None
         if self._prefill_main is None:
             self._prefill_main = BatchPrefillWithRaggedKVCacheWrapper(
-                self._workspace_buffer, "NHD", backend=_flashinfer_prefill_backend()
+                self._workspace_buffer, "NHD", backend="cutlass"
             )
             self._ensure_chunks(_DEFAULT_NUM_CHUNKS, self._workspace_buffer)
 
