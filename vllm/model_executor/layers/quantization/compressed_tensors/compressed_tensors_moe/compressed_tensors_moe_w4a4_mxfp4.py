@@ -221,6 +221,48 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             )
             if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
                 self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+                self._release_superseded_scale_storage(layer)
+
+    def _release_superseded_scale_storage(self, layer: RoutedExperts) -> None:
+        """Free checkpoint scale grids the prepared b12x weights supersede.
+
+        The W4A16 native prepare packs its own (kernel-layout) scale grids
+        and keeps the FP4 payloads by reference, so the checkpoint-layout
+        scale parameters become dead weight (~55 MiB per Kimi K3 TP16
+        layer, ~5 GiB per rank over 92 layers). Release their storage in
+        place unless the prepared representation aliases it.
+        """
+        prepared = self.moe_kernel.fused_experts._lookup_prepared_experts()
+        if prepared is None:
+            return
+        try:
+            rep = prepared.representation_for("w4a16")
+        except (KeyError, ValueError, AttributeError):
+            return
+        prep_ptrs = set()
+        for field in (
+            "w13", "w2", "w13_scale", "w2_scale",
+            "micro_w13_scale", "micro_w2_scale",
+        ):
+            value = getattr(rep, field, None)
+            if isinstance(value, torch.Tensor):
+                prep_ptrs.add(value.untyped_storage().data_ptr())
+        freed = 0
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            tensor = getattr(layer, name, None)
+            if (
+                isinstance(tensor, torch.nn.Parameter)
+                and tensor.numel() > 0
+                and tensor.untyped_storage().data_ptr() not in prep_ptrs
+            ):
+                freed += tensor.numel() * tensor.element_size()
+                tensor.data = tensor.data.new_empty((0,))
+        if freed:
+            logger.info_once(
+                "compressed-tensors b12x MXFP4: released %.1f MiB/layer of "
+                "superseded checkpoint scale storage",
+                freed / 2**20,
+            )
 
     def apply(
         self,
