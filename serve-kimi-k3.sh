@@ -33,8 +33,11 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-forkserver}"
-# Breakable cudagraphs auto-enable for the K3 architecture; the B12X MoE env
-# keeps the capture prewarm path active for the auto-selected SiTU experts.
+# Breakable cudagraphs are required for the piecewise capture below. The
+# arch-based auto-enable sets this via os.environ too late for forkserver
+# workers (they inherit the forkserver's env snapshot), so pin it here. The
+# B12X MoE env keeps the capture prewarm active for the SiTU experts.
+export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}"
 export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
 # The measured reservation is ~4x actual capture use; K3's fit needs it back.
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
