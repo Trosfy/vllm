@@ -47,6 +47,26 @@ def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
     return min(ideal_splits, max_splits)
 
 
+def _select_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
+    """Select the adaptive or operator-requested static split count."""
+    static_splits = envs.VLLM_TRITON_MLA_STATIC_KV_SPLITS
+    if static_splits is None:
+        return _compute_num_kv_splits(max_seq_len, sm_count)
+
+    max_splits = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER
+    if static_splits < 1 or static_splits & (static_splits - 1):
+        raise ValueError(
+            "VLLM_TRITON_MLA_STATIC_KV_SPLITS must be a positive power of two, "
+            f"got {static_splits}."
+        )
+    if static_splits > max_splits:
+        raise ValueError(
+            "VLLM_TRITON_MLA_STATIC_KV_SPLITS exceeds the backend limit "
+            f"({static_splits} > {max_splits})."
+        )
+    return static_splits
+
+
 class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -70,7 +90,7 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         B = self.vllm_config.scheduler_config.max_num_seqs
         # DCP all-gathers the query heads before forward_mqa.
         q_num_heads = self.num_heads * self.dcp_world_size
-        max_splits = _compute_num_kv_splits(
+        max_splits = _select_num_kv_splits(
             self.model_config.max_model_len,
             current_platform.num_compute_units(),
         )
@@ -239,7 +259,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if envs.VLLM_BATCH_INVARIANT:
             num_kv_splits = 1
         else:
-            num_kv_splits = _compute_num_kv_splits(
+            num_kv_splits = _select_num_kv_splits(
                 attn_metadata.max_seq_len, self._sm_count
             )
 
