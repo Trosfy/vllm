@@ -399,6 +399,10 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         self.demoted_format: str = "nf3_2p1"
         self.trellis_mcg: int = 0
         self.trellis_shared_su: bool = False
+        # "mxfp8" routes non-ignored dense linears to the serialized loader
+        # (offline-baked fp8 weights + e8m0 scales in the checkpoint).
+        self.dense_format: str | None = None
+        self.dense_ignored_layers: list[str] = []
         self.shared_runtime = _HybridSharedRuntime()
 
     def get_name(self) -> QuantizationMethods:
@@ -416,6 +420,24 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
                 quant_config=self, moe_config=layer.moe_config
             )
         if isinstance(layer, LinearBase):
+            # Serialized-MXFP8 dense linears (kquant offline bake): same
+            # dense_format convention Fp8Config uses. Modules in
+            # dense_ignored_layers stay BF16 (kv_b_proj, KDA gate heads...).
+            if self.dense_format == "mxfp8":
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Mxfp8SerializedLinearMethod,
+                )
+                from vllm.model_executor.layers.quantization.utils.quant_utils import (  # noqa: E501
+                    is_layer_skipped,
+                )
+
+                if not is_layer_skipped(
+                    prefix=prefix,
+                    ignored_layers=self.dense_ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+                ):
+                    return Mxfp8SerializedLinearMethod()
+                return UnquantizedLinearMethod()
             # Honor the --quantization-config online overlay (MXFP8 on BF16
             # attention/shared-expert linears): at K3 TP6/TP12 the per-GPU
             # ledger needs the halved non-expert footprint; without an overlay
@@ -499,6 +521,14 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
             # (layer, matrix); register [1, ...] params and let the kernels
             # broadcast (zero expert stride).
             config.trellis_shared_su = bool(trellis.get("shared_su", False))
+        dense_format = original_config.get("dense_format")
+        if dense_format is not None:
+            if dense_format != "mxfp8":
+                raise ValueError(f"unsupported dense_format {dense_format!r}")
+            config.dense_format = dense_format
+            config.dense_ignored_layers = list(
+                original_config.get("ignored_layers") or []
+            )
         return config
 
 

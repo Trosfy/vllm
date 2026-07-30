@@ -27,6 +27,9 @@ export KDA_DISABLE_AUTOTUNE=1
 # I=256 divides 128); the hybrid kept-tier launches are built for w4a16.
 # Revisit W4A8 during the perf pass.
 export B12X_MOE_FORCE_A16=1
+# Route online MXFP8 dense linears through sparkinfer B12X GEMM (flashinfer
+# mm_mxfp8 does not exist in this build) - from Martin's hard-won constraints.
+export VLLM_USE_B12X_FP8_GEMM=1
 # First-request decode-shape CuTe compiles can exceed the 300s default;
 # they disk-cache after the first run.
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
@@ -51,9 +54,9 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --max-model-len "${MAX_MODEL_LEN:-4096}" \
   --tensor-parallel-size 12 \
   --enforce-eager \
-  --load-format instanttensor \
+  --load-format safetensors \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.985}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-1024}" \
   --max-num-seqs "${MAX_NUM_SEQS:-2}" \
-  --quantization-config "${OVERLAY}" \
+  \
   "$@"
