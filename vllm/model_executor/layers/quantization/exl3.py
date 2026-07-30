@@ -292,7 +292,6 @@ def _positive_env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
 
-
 def _resolve_prefill_capacity(max_batched_tokens: int) -> int:
     """Resolve the optional EXL3 arena bound within the scheduler contract."""
 
@@ -2178,15 +2177,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # bound remains fail-closed while a smaller opt-in Trellis capacity is
         # handled by slicing at dispatch.
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
-        prefill_capacity = _positive_env_int(
-            "VLLM_EXL3_PREFILL_CAPACITY", max_batched_tokens
-        )
-        if prefill_capacity > max_batched_tokens:
-            raise ValueError(
-                "VLLM_EXL3_PREFILL_CAPACITY cannot exceed "
-                "max_num_batched_tokens: "
-                f"capacity={prefill_capacity}, max={max_batched_tokens}"
-            )
+        prefill_capacity = _resolve_prefill_capacity(max_batched_tokens)
         prefill_plan_enabled = prefill_trellis and max_batched_tokens > max_trellis_m
         parity_rows = (
             min(chunk, max_batched_tokens)
