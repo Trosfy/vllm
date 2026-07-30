@@ -61,7 +61,25 @@ _O, _C, _S = r"<\|open\|>", r"<\|close\|>", r"<\|sep\|>"
 _TEXT_UNTIL_SEP = r"(?:(?!" + _S + r").)*?"
 
 
+_UNTERMINATED_MARKER = re.compile(r"<\|(?:open|close)\|>(?:(?!" + _S + r").)*\Z", re.S)
+
+
 def _partial_tag_overlap(text: str, tag: str) -> int:
+    """Number of trailing characters that must be withheld from streaming.
+
+    The detokenizer renders markers with interior spacing
+    (``"<|close|> response <|sep|>"``), so prefix-matching the space-free
+    literal ``"<|close|>response<|sep|>"`` stops matching once the space
+    arrives and the marker leaks into visible text.  Withhold on two
+    conditions:
+
+    (a) a *complete* ``<|open|>``/``<|close|>`` whose ``<|sep|>`` has not
+        arrived yet -- the section name and separator are still in flight;
+    (b) an *incomplete* tag prefix at the very end (original behaviour).
+    """
+    m = _UNTERMINATED_MARKER.search(text)
+    if m is not None:
+        return len(text) - m.start()
     max_len = min(len(text), len(tag) - 1)
     for n in range(max_len, 0, -1):
         if text.endswith(tag[:n]):
@@ -218,7 +236,6 @@ class KimiK3ToolParser(ToolParser):
         """
         call_attrs = self._attrs(attrs)
         tool_name = call_attrs.get("tool", "")
-        tool_index = call_attrs.get("index", "")
         arguments: dict = {}
         for arg_match in self._arg_re.finditer(body):
             arg_attrs = self._attrs(arg_match["attrs"])
@@ -234,16 +251,7 @@ class KimiK3ToolParser(ToolParser):
                     arguments[key] = raw_value
         if not tool_name:
             return None
-        tool_call_id = tool_name
-        if tool_index:
-            try:
-                tool_call_id = f"{tool_name}:{int(tool_index) - 1}"
-            except ValueError:
-                tool_call_id = f"{tool_name}:{tool_index}"
-        # id uses the API-side zero-based call ordinal; XTML's message index
-        # stays one-based when rendering tool result messages.
         return ToolCall(
-            id=tool_call_id,
             type="function",
             function=FunctionCall(
                 name=tool_name,
