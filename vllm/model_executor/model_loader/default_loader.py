@@ -447,6 +447,33 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        if self.load_config.load_format == "instanttensor" and (
+            meta_device_layers := sorted(
+                {
+                    type(quant_method).__name__
+                    for module in model.modules()
+                    if getattr(
+                        (quant_method := getattr(module, "quant_method", None)),
+                        "uses_meta_device",
+                        False,
+                    )
+                }
+            )
+        ):
+            # Online-quantized layers route loads through the layerwise
+            # wrapper, which buffers yielded tensors until a module's last
+            # shard arrives. InstantTensor's copy=False views alias
+            # ring-buffer storage that is recycled as soon as the loader
+            # returns, so deferred replay reads whichever bytes landed there
+            # later -- nondeterministic weight corruption keyed to IO timing.
+            raise ValueError(
+                "load_format='instanttensor' cannot load models with online-"
+                f"quantized (meta-device) layers ({', '.join(meta_device_layers)}): "
+                "deferred weight buffering outlives InstantTensor's zero-copy "
+                "ring-buffer views. Use --load-format safetensors or "
+                "fastsafetensors, whose iterators yield owned tensors."
+            )
+
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (
