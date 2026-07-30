@@ -518,6 +518,13 @@ class Worker(WorkerBase):
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
+                # The profile run above can leave its activation peak parked
+                # as reserved-but-unallocated allocator pages. The trial
+                # capture allocates from raw device memory (graph pool), so
+                # release those pages first; on near-full deployments the
+                # difference decides whether capture fits at all.
+                gc.collect()
+                torch.accelerator.empty_cache()
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
