@@ -128,6 +128,53 @@ def _patch_flashinfer_autotune_deps(monkeypatch):
     return calls
 
 
+def test_flashinfer_autotune_dummy_run_skips_pre_kv_v2_attention() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+    )
+
+    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
+
+    assert kwargs == {
+        "num_tokens": 8192,
+        "skip_eplb": True,
+        "is_profile": True,
+        "skip_attn": True,
+    }
+
+
+def test_flashinfer_autotune_dummy_run_keeps_attention_after_kv_init() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+        block_tables=object(),
+    )
+
+    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
+
+    assert kwargs == {
+        "num_tokens": 8192,
+        "skip_eplb": True,
+        "is_profile": True,
+    }
+
+
+def test_flashinfer_autotune_dummy_run_keeps_v1_signature() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        vllm_config=SimpleNamespace(use_v2_model_runner=False),
+    )
+
+    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
+
+    assert kwargs == {
+        "num_tokens": 8192,
+        "skip_eplb": True,
+        "is_profile": True,
+    }
+
+
 def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
     from vllm.distributed import parallel_state
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
