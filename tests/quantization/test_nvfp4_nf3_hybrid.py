@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
     _decode_kquant_nf3_scale,
+    _is_dense_layer_ignored,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
@@ -94,6 +95,38 @@ def test_config_does_not_quantize_bf16_lm_head():
     lm_head = ParallelLMHead.__new__(ParallelLMHead)
 
     assert config.get_quant_method(lm_head, "lm_head") is None
+
+
+@pytest.mark.parametrize(
+    ("prefix", "expected"),
+    [
+        ("model.layers.0.self_attn.g_proj", True),
+        ("model.layers.0.self_attn.b_proj", True),
+        ("model.layers.0.self_attn.q_b_proj", False),
+        ("model.layers.3.self_attn.kv_b_proj", True),
+        ("model.vision_tower.encoder.layers.0.mlp.fc1", True),
+        ("model.layers.0.self_attn.q_proj", False),
+    ],
+)
+def test_dense_mxfp8_short_exclusions_match_path_components(prefix, expected):
+    ignored = ["g_proj", "b_proj", "kv_b_proj", "vision_tower"]
+
+    assert _is_dense_layer_ignored(prefix, ignored, {}) is expected
+
+
+def test_dense_mxfp8_full_prefix_exclusion_still_matches():
+    prefix = "model.layers.0.self_attn.q_proj"
+
+    assert _is_dense_layer_ignored(prefix, [prefix], {})
+
+
+def test_dense_mxfp8_rejects_partially_excluded_fused_linear():
+    with pytest.raises(ValueError, match="some but not all shards"):
+        _is_dense_layer_ignored(
+            "model.layers.0.mlp.gate_up_proj",
+            ["gate_proj"],
+            {"gate_up_proj": ["gate_proj", "up_proj"]},
+        )
 
 
 def test_unpack_nf3_codes():

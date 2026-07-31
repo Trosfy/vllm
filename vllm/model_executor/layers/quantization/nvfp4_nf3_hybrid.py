@@ -51,6 +51,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -88,6 +91,46 @@ _K3_HYBRID_TOPK = 16
 _K3_HYBRID_HIDDEN = 3584
 _K3_HYBRID_INTERMEDIATE = 192
 _K3_HYBRID_EXPERTS = 896
+
+
+def _is_dense_layer_ignored(
+    prefix: str,
+    ignored_layers: list[str],
+    fused_mapping: dict[str, list[str]],
+) -> bool:
+    """Resolve dense-format exclusions from full paths or module names.
+
+    kquant artifacts use leaf/component names such as ``g_proj`` and
+    ``vision_tower`` because the same exclusion applies throughout the model.
+    ``is_layer_skipped`` otherwise treats entries as exact full prefixes, which
+    silently quantizes those BF16-only modules and leaves their nonexistent
+    MXFP8 scales uninitialized.
+
+    Expand component-only entries to the concrete prefix (and to each logical
+    child of a fused linear) before delegating to the standard matcher. This
+    preserves its validation that all shards of a fused linear use one format,
+    while avoiding substring matches such as ``b_proj`` matching ``q_b_proj``.
+    """
+    expanded = list(ignored_layers)
+    candidates = [prefix]
+    base, separator, projection = prefix.rpartition(".")
+    if projection in fused_mapping:
+        candidates.extend(
+            f"{base}{separator}{shard}" for shard in fused_mapping[projection]
+        )
+
+    for ignored in ignored_layers:
+        if not ignored or "." in ignored:
+            continue
+        expanded.extend(
+            candidate for candidate in candidates if ignored in candidate.split(".")
+        )
+
+    return is_layer_skipped(
+        prefix=prefix,
+        ignored_layers=expanded,
+        fused_mapping=fused_mapping,
+    )
 
 
 def _combined_tier_local_descriptors(
@@ -427,11 +470,8 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
                 from vllm.model_executor.layers.quantization.fp8 import (
                     Mxfp8SerializedLinearMethod,
                 )
-                from vllm.model_executor.layers.quantization.utils.quant_utils import (  # noqa: E501
-                    is_layer_skipped,
-                )
 
-                if not is_layer_skipped(
+                if not _is_dense_layer_ignored(
                     prefix=prefix,
                     ignored_layers=self.dense_ignored_layers,
                     fused_mapping=self.packed_modules_mapping,
