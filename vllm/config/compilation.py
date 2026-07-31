@@ -1225,7 +1225,11 @@ class CompilationConfig:
                 logger.warning_once(
                     "Sequence parallelism is incompatible with piecewise "
                     "cudagraph when use_inductor_graph_partition is off. "
-                    "Setting cudagraph_mode to FULL."
+                    "Setting cudagraph_mode to FULL. If the attention "
+                    "backend cannot capture FULL graphs (e.g. with "
+                    "spec-decode), cudagraphs are disabled entirely; set "
+                    "use_inductor_graph_partition=True to keep piecewise "
+                    "cudagraphs with SP."
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
@@ -1519,11 +1523,24 @@ class CompilationConfig:
         self, uniform_decode_query_len: int, tensor_parallel_size: int
     ):
         multiple_of = uniform_decode_query_len
-        if tensor_parallel_size > 1 and self.pass_config.enable_sp:
-            multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
+        sp_multiple_of = None
+        sp_min_token_num = self.pass_config.sp_min_token_num
+        # SP only binds captured sizes at or above sp_min_token_num; when no
+        # captured size can reach the threshold, spec-decode divisibility is
+        # the only constraint.
+        sp_binds_captured_sizes = sp_min_token_num is None or (
+            self.max_cudagraph_capture_size is not None
+            and self.max_cudagraph_capture_size >= sp_min_token_num
+        )
+        if (
+            tensor_parallel_size > 1
+            and self.pass_config.enable_sp
+            and sp_binds_captured_sizes
+        ):
+            sp_multiple_of = max(uniform_decode_query_len, tensor_parallel_size)
             if (
-                multiple_of % uniform_decode_query_len != 0
-                or multiple_of % tensor_parallel_size != 0
+                sp_multiple_of % uniform_decode_query_len != 0
+                or sp_multiple_of % tensor_parallel_size != 0
             ):
                 raise ValueError(
                     f"Can't determine cudagraph shapes that are both a "
@@ -1534,21 +1551,46 @@ class CompilationConfig:
                     f"num_speculative_tokens or disable sequence parallelism"
                 )
 
-        if not self.cudagraph_capture_sizes or multiple_of <= 1:
+        if not self.cudagraph_capture_sizes or (
+            multiple_of <= 1 and sp_multiple_of is None
+        ):
             return
+
+        def _round_for(size: int) -> int:
+            # Sizes below sp_min_token_num run non-SP graphs and only need
+            # spec-decode divisibility (sp_multiple_of % multiple_of == 0).
+            rounded = round_up(size, multiple_of)
+            if sp_multiple_of is not None and (
+                sp_min_token_num is None or rounded >= sp_min_token_num
+            ):
+                rounded = round_up(rounded, sp_multiple_of)
+            return rounded
 
         assert self.max_cudagraph_capture_size is not None
         rounded_sizes = sorted(
             set(
-                round_up(size, multiple_of)
+                _round_for(size)
                 for size in self.cudagraph_capture_sizes
-                if round_up(size, multiple_of) <= self.max_cudagraph_capture_size
+                if _round_for(size) <= self.max_cudagraph_capture_size
             )
         )
+        # Spec decode uniform decode graphs are shaped by request count:
+        # num_reqs * (1 + num_speculative_tokens). Keep small interactive
+        # request counts exact so FULL decode graphs do not replay with
+        # padded virtual requests just because the original capture-size list
+        # skipped that request count.
+        small_decode_sizes = {
+            multiple_of * num_reqs
+            for num_reqs in range(1, 33)
+            if multiple_of * num_reqs <= self.max_cudagraph_capture_size
+        }
+        rounded_sizes = sorted(set(rounded_sizes) | small_decode_sizes)
 
-        if len(rounded_sizes) == 0 and multiple_of <= self.max_cudagraph_capture_size:
+        if len(rounded_sizes) == 0:
             # if one valid but would be round_down use that
-            rounded_sizes = [multiple_of]
+            smallest = _round_for(1)
+            if smallest <= self.max_cudagraph_capture_size:
+                rounded_sizes = [smallest]
 
         if len(rounded_sizes) == 0:
             raise ValueError(
