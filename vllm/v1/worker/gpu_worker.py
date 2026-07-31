@@ -52,7 +52,9 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
+    deepseek_v4_compressor_triton_warmup,
+)
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -86,6 +88,23 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def kernel_warmup(worker: "Worker") -> None:
+    """Run kernel warmup without importing its CUDA dependencies on preload.
+
+    Args:
+        worker: Worker whose kernels should be warmed up.
+
+    Returns:
+        None.
+    """
+    from vllm.model_executor.warmup.kernel_warmup import (
+        kernel_warmup as run_kernel_warmup,
+    )
+
+    run_kernel_warmup(worker)
+
 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
@@ -401,9 +420,16 @@ class Worker(WorkerBase):
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
-        # Initialize workspace manager
+        # Target and speculative captures retain workspace views concurrently,
+        # so speculative V2 execution needs a separate ownership lane.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        num_workspace_lanes = (
+            2
+            if self.use_v2_model_runner
+            and self.vllm_config.speculative_config is not None
+            else 1
+        )
+        init_workspace_manager(self.device, num_ubatches, num_workspace_lanes)
 
         # Construct the model runner
         if self.use_v2_model_runner:
@@ -456,6 +482,33 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def _warmup_kernels_once(self) -> None:
+        """Materialize persistent kernel resources before KV cache sizing."""
+        if getattr(self, "_kernel_warmup_complete", False):
+            return
+        kernel_warmup(self)
+        self._kernel_warmup_complete = True
+
+    def _profile_model_with_kernel_warmup(self) -> None:
+        """Profile activations on top of persistent kernel allocations."""
+        # The first pass initializes runner state required by some warmups.
+        self.model_runner.profile_run()
+        deepseek_v4_compressor_triton_warmup(
+            self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+        )
+        self._warmup_kernels_once()
+
+        # The first pass may include one-time compiler or loader temporaries.
+        # Keep every persistent allocation initialized above, but exclude that
+        # startup-only high-water mark from the activation measurement. The
+        # second pass below establishes the repeatable serving peak.
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
+        # Kernel warmup can create persistent modules and communication pools.
+        # A second pass is required so the measured peak contains both those
+        # allocations and the model's transient activation workspace.
+        self.model_runner.profile_run()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -475,6 +528,10 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            deepseek_v4_compressor_triton_warmup(
+                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+            )
+            self._warmup_kernels_once()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -501,20 +558,43 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            self._profile_model_with_kernel_warmup()
 
-        # Profile CUDA graph memory if graphs will be captured.
-        # ROCm is included: #44825 moved the profiler to
-        # torch.accelerator.get_memory_info (reliable on ROCm, as used by
-        # the AMD-CI mem tests), and graph_pool_handle resolves to the same
-        # torch.cuda handle the live capture path already uses on ROCm.
-        # XPU stays excluded (see #39977).
-        cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
+                "allocated_bytes.all.peak", 0
+            )
+
+            # Profile CUDA graph memory if graphs will be captured.
+            # ROCm is included: #44825 moved the profiler to
+            # torch.accelerator.get_memory_info (reliable on ROCm, as used by
+            # the AMD-CI mem tests), and graph_pool_handle resolves to the same
+            # torch.cuda handle the live capture path already uses on ROCm.
+            # XPU stays excluded (see #39977).
+            cudagraph_memory_estimate = 0
+            if (
+                current_platform.is_cuda_alike()
+                and self.vllm_config.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            ):
+                # The profile run above can leave its activation peak parked
+                # as reserved-but-unallocated allocator pages. The trial
+                # capture allocates from raw device memory (graph pool), so
+                # release those pages first; on near-full deployments the
+                # difference decides whether capture fits at all.
+                gc.collect()
+                torch.accelerator.empty_cache()
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+
+        # Use the pre-cudagraph torch peak to avoid double-counting.
+        profile_result.torch_peak_increase = (
+            profile_torch_peak - profile_result.before_profile.torch_peak
+        )
+        profile_result.transient_peak_headroom = (
+            profile_torch_peak - profile_result.after_profile.torch_allocated
+        )
+        profile_result.non_kv_cache_memory = (
+            profile_result.total_consumed + profile_result.transient_peak_headroom
+        )
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
@@ -661,6 +741,10 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
+        deepseek_v4_compressor_triton_warmup(
+            self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+        )
+
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
@@ -710,7 +794,7 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        self._warmup_kernels_once()
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -776,10 +860,10 @@ class Worker(WorkerBase):
                 f"{format_gib(self.peak_activation_memory)} GiB "
                 f"for peak activation, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
-                f"config with `--kv-cache-memory="
+                f"config with `--kv-cache-memory-bytes="
                 f"{kv_cache_memory_bytes_to_requested_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_requested_limit)} GiB) to fit "
-                f"into requested memory, or `--kv-cache-memory="
+                f"into requested memory, or `--kv-cache-memory-bytes="
                 f"{kv_cache_memory_bytes_to_gpu_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_gpu_limit)} GiB) to fully "
                 f"utilize gpu memory. Current kv cache memory in use is "
@@ -832,6 +916,11 @@ class Worker(WorkerBase):
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+
+        # Keep vLLM's stable B12X diagnostics while notifying the renamed
+        # external package that post-start kernel compilation is unexpected.
+        os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
+        os.environ["SPARKINFER_ENGINE_STARTED"] = "1"
 
         activate_jit_monitor(
             mode=self.observability_config.jit_monitor_mode,
@@ -1329,7 +1418,9 @@ class Worker(WorkerBase):
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
-            model_runner.shutdown()
+            shutdown = getattr(model_runner, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
