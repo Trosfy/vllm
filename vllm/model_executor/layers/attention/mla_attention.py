@@ -188,6 +188,7 @@ return curr_o @ W_O
 """
 
 import functools
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -217,6 +218,14 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
+    can_implement_b12x_mxfp8_bmm,
+    can_implement_bf16_mla_query,
+    can_implement_mxfp8_mla_query,
+    run_b12x_mxfp8_bmm,
+    run_bf16_mla_query,
+    run_mxfp8_mla_query,
+)
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
     get_attention_context,
@@ -249,6 +258,7 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -275,8 +285,16 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.common import (
+    cp_lse_ag_out_ar,
+    cp_lse_ag_out_rs,
+    cp_lse_ag_out_rs_into,
+)
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
+    sanitize_dcp_attn_empty_rows,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.triton_merge_attn_states import mask_empty_context
 from vllm.v1.attention.selector import get_attn_backend
@@ -290,6 +308,222 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+_B12X_ABSORB_BMM_MAX_M = 32
+
+
+def _run_mla_query_bmm(
+    query: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    use_safe_op: bool,
+) -> None:
+    if (
+        use_safe_op
+        and current_platform.is_cuda()
+        and query.is_cuda
+        and weight.is_cuda
+        and output.is_cuda
+        and query.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and output.dtype == torch.bfloat16
+    ):
+        try:
+            safe_bmm = torch.ops._C.safe_mla_query_bmm
+        except AttributeError:
+            safe_bmm = None
+        if safe_bmm is not None:
+            safe_bmm(query, weight, output)
+            return
+
+    # Fallback for CPU tests, non-BF16 paths, and builds without the CUDA op.
+    # The copy keeps tight DCP/custom-allocation query views out of torch.bmm.
+    torch.bmm(query.contiguous() if use_safe_op else query, weight, out=output)
+
+
+@functools.cache
+def _b12x_absorb_bmm_enabled() -> bool:
+    return envs.VLLM_B12X_ABSORB_BMM
+
+
+def _find_linear_weight_device(layer: torch.nn.Module) -> torch.device | None:
+    """Find the device that owns a linear layer's loaded weights.
+
+    Args:
+        layer: Linear layer or a wrapper around one.
+
+    Returns:
+        The loaded weight device, or ``None`` when the layer owns no tensors.
+    """
+    while hasattr(layer, "base_layer") and hasattr(layer.base_layer, "quant_method"):
+        layer = layer.base_layer
+
+    for name in ("weight", "qweight", "weight_packed"):
+        weight = getattr(layer, name, None)
+        if isinstance(weight, torch.Tensor):
+            return weight.device
+    for parameter in layer.parameters(recurse=False):
+        return parameter.device
+    for buffer in layer.buffers(recurse=False):
+        return buffer.device
+    return None
+
+
+def _preallocate_absorbed_mla_weights(
+    layer: "MLAAttention", act_dtype: torch.dtype
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Allocate persistent MLA weights before temporary dequantization storage.
+
+    Compatible weights from an earlier load are reused in place, preserving
+    their addresses for CUDA graphs.
+
+    Args:
+        layer: MLA attention layer whose KV projection will be absorbed.
+        act_dtype: Data type used by the absorbed projection weights.
+
+    Returns:
+        Optional new storage for ``W_UV`` and ``W_UK_T``, respectively.
+
+    Raises:
+        RuntimeError: If neither the source projection nor reusable absorbed
+            weights identify the target device.
+    """
+    w_uv_shape = (layer.num_heads, layer.kv_lora_rank, layer.v_head_dim)
+    w_uk_t_shape = (
+        layer.num_heads,
+        layer.qk_nope_head_dim,
+        layer.kv_lora_rank,
+    )
+    current_w_uv = getattr(layer, "W_UV", None)
+    current_w_uk_t = getattr(layer, "W_UK_T", None)
+
+    device = _find_linear_weight_device(layer.kv_b_proj)
+    if device is None:
+        current_devices = {
+            weight.device
+            for weight in (current_w_uv, current_w_uk_t)
+            if isinstance(weight, torch.Tensor)
+        }
+        if len(current_devices) != 1:
+            raise RuntimeError(
+                "Cannot determine the device for absorbed MLA projection weights."
+            )
+        device = current_devices.pop()
+
+    def needs_storage(weight: object, shape: tuple[int, ...]) -> bool:
+        return not (
+            isinstance(weight, torch.Tensor)
+            and weight.shape == shape
+            and weight.dtype == act_dtype
+            and weight.device == device
+        )
+
+    pre_w_uv = (
+        torch.empty(w_uv_shape, dtype=act_dtype, device=device)
+        if needs_storage(current_w_uv, w_uv_shape)
+        else None
+    )
+    pre_w_uk_t = (
+        torch.empty(w_uk_t_shape, dtype=act_dtype, device=device)
+        if needs_storage(current_w_uk_t, w_uk_t_shape)
+        else None
+    )
+    return pre_w_uv, pre_w_uk_t
+
+
+def _can_use_b12x_dcp_prefill_workspace(
+    *,
+    enabled: bool,
+    project_before_merge: bool,
+    dcp_use_b12x: bool,
+    num_tokens: int,
+    max_num_tokens: int,
+    non_dbo_workspace: bool,
+    is_sparse_impl: bool,
+    backend_name: str,
+    is_capturing: bool,
+) -> bool:
+    """Gate the B12X eager-prefill workspace contract."""
+    return (
+        enabled
+        and project_before_merge
+        and not dcp_use_b12x
+        and 1025 <= num_tokens <= max_num_tokens
+        and non_dbo_workspace
+        and is_sparse_impl
+        and backend_name == "B12X_MLA_SPARSE"
+        and not is_capturing
+    )
+
+
+def _estimate_dcp_ag_rs_transient_bytes(
+    *,
+    num_tokens: int,
+    local_heads: int,
+    dcp_world_size: int,
+    q_head_dim: int,
+    output_head_dim: int,
+    kv_lora_rank: int,
+    v_head_dim: int,
+    project_before_merge: bool,
+) -> int:
+    """Upper-bound simultaneously live eager DCP AG/RS attention tensors."""
+    if num_tokens <= 0 or local_heads <= 0 or dcp_world_size <= 1:
+        return 0
+
+    bf16_bytes = 2
+    fp32_bytes = 4
+    global_heads = local_heads * dcp_world_size
+
+    gathered_query = num_tokens * global_heads * q_head_dim * bf16_bytes
+    attention_output = num_tokens * global_heads * output_head_dim * bf16_bytes
+    # CUDA communicator materializes a head-major contiguous RS input, then an
+    # output and its token-major contiguous return while attention_output lives.
+    reduce_scatter = attention_output + (
+        2 * num_tokens * local_heads * output_head_dim * bf16_bytes
+    )
+    gathered_lse = (dcp_world_size + 1) * num_tokens * global_heads * fp32_bytes
+    gathered_w_uv = (
+        global_heads * kv_lora_rank * v_head_dim * bf16_bytes
+        if project_before_merge
+        else 0
+    )
+    return (
+        gathered_query
+        + attention_output
+        + reduce_scatter
+        + gathered_lse
+        + gathered_w_uv
+    )
+
+
+def _should_allocate_sparse_profile_workspace(workspace_bytes: int) -> bool:
+    return workspace_bytes > 0 and not is_vllm_cudagraph_capture_active()
+
+
+def _extract_single_layer_index(layer_name: str) -> int | None:
+    int_vals = [int(part) for part in layer_name.split(".") if part.isdecimal()]
+    return int_vals[0] if len(int_vals) == 1 else None
+
+
+def _match_merge_strides(
+    prefix_output: torch.Tensor, suffix_output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give both partial-attention outputs identical strides.
+
+    The merge_attn_states CUDA kernel computes one source offset from the
+    prefix strides and reads BOTH prefix and suffix with it. The FA prefill
+    backend returns padded-V views (head stride > head_size) while merged
+    chunk outputs are contiguous, so once the chunked-context loop runs more
+    than one iteration (context > workspace, i.e. > 64k tokens) the two
+    sides disagree and the kernel reads the suffix at wrong offsets.
+    """
+    if prefix_output.stride() != suffix_output.stride():
+        if not prefix_output.is_contiguous():
+            prefix_output = prefix_output.contiguous()
+        if not suffix_output.is_contiguous():
+            suffix_output = suffix_output.contiguous()
+    return prefix_output, suffix_output
 
 
 def _detect_output_quant_key(
@@ -333,7 +567,16 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
-    if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+    if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "nvfp4_ds_mla":
+        # B12X reads the packed 432B NVFP4 MLA record natively; do NOT coerce
+        # it to fp8_ds_mla. [nvfp4_reader_port]
+        return "nvfp4_ds_mla"
+    if backend_name in (
+        "FLASHMLA_SPARSE",
+        "B12X_MLA_SPARSE",
+    ) and is_quantized_kv_cache(kv_cache_dtype):
+        # NOTE: nvfp4_ds_mla deliberately falls through to fp8_ds_mla for
+        # FLASHMLA_SPARSE (no NVFP4 reader there).
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
         "auto",
@@ -507,6 +750,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.use_safe_mla_query_bmm = getattr(
+            self.impl, "use_safe_mla_query_bmm", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -548,6 +794,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     v_head_dim=self.v_head_dim,
                     vllm_config=vllm_config,
                 )
+        if self.prefill_backend is not None and not getattr(
+            self.impl, "supports_mha_prefill", True
+        ):
+            # Backends like B12X_MLA_SPARSE consume prefill inside their own
+            # MQA/extend kernels and never validated the dense-MHA cache read.
+            self.prefill_backend = None
 
         self.kv_cache = torch.tensor([])
 
@@ -559,6 +811,62 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and _vllm_config.parallel_config.decode_context_parallel_size > 1
             and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
+        self.dcp_b12x = (
+            self.dcp_a2a
+            and envs.VLLM_USE_B12X_DCP_A2A
+            and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
+            # The B12X PCIe DCP channel only exists for world sizes 2/4/8;
+            # other DCP sizes (e.g. TP6 with DCP3/DCP6) use NCCL collectives.
+            and _vllm_config is not None
+            and _vllm_config.parallel_config.decode_context_parallel_size in (2, 4, 8)
+        )
+        configured_dcp_world_size = (
+            _vllm_config.parallel_config.decode_context_parallel_size
+            if _vllm_config is not None
+            else 1
+        )
+        self.dcp_project_before_merge = (
+            configured_dcp_world_size > 1
+            and envs.VLLM_DCP_PROJECT_BEFORE_MERGE
+            and getattr(self.impl, "supports_dcp_project_before_merge", False)
+        )
+        self.dcp_project_before_merge_min_prefill_tokens = (
+            envs.VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS
+        )
+        if self.dcp_project_before_merge_min_prefill_tokens < 0:
+            raise ValueError(
+                "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS must be "
+                "non-negative, got "
+                f"{self.dcp_project_before_merge_min_prefill_tokens}."
+            )
+        max_capture_size = max(compilation_config.cudagraph_capture_sizes, default=0)
+        if (
+            self.dcp_project_before_merge
+            and self.dcp_project_before_merge_min_prefill_tokens < max_capture_size
+        ):
+            raise ValueError(
+                "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS "
+                f"({self.dcp_project_before_merge_min_prefill_tokens}) must "
+                "be at least the maximum cudagraph capture size "
+                f"({max_capture_size})."
+            )
+        self.dcp_max_batch_size = (
+            int(_vllm_config.scheduler_config.max_num_batched_tokens)
+            if _vllm_config is not None
+            else 0
+        )
+        # Hybrid DCP dispatch: the one-shot A2A/B12X exchange is
+        # latency-optimal for small decode batches but loses to pipelined
+        # NCCL collectives on large prefill/extend batches. Batches with more
+        # tokens than the cap take VLLM_DCP_A2A_LARGE_BACKEND instead
+        # (0 = uncapped, pure A2A).
+        self.dcp_a2a_max_tokens = envs.VLLM_DCP_A2A_MAX_TOKENS if self.dcp_a2a else 0
+        self.dcp_a2a_large_backend = envs.VLLM_DCP_A2A_LARGE_BACKEND
+        if self.dcp_a2a and self.dcp_a2a_large_backend not in ("ag_rs", "a2a"):
+            raise ValueError(
+                "VLLM_DCP_A2A_LARGE_BACKEND must be 'ag_rs' or 'a2a', got "
+                f"{self.dcp_a2a_large_backend!r}."
+            )
 
         # Initialize q/k/v range constants.
         self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
@@ -586,6 +894,78 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             static=True,
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
+        )
+
+    def _get_sparse_memory_profile_bytes(self) -> int:
+        if (
+            not envs.VLLM_MEMORY_PROFILE_INCLUDE_ATTN
+            or self.attn_backend.get_name() != "B12X_MLA_SPARSE"
+            or self.impl.dcp_world_size <= 1
+        ):
+            return 0
+
+        max_tokens = int(getattr(self.impl, "_max_batched", 0))
+        if max_tokens <= 0:
+            return 0
+
+        # Pure A2A does not enter the allocating NCCL AG/RS path. Hybrid A2A
+        # enters it immediately above the configured small-batch cap.
+        if self.dcp_a2a:
+            if self.dcp_a2a_max_tokens <= 0 or self.dcp_a2a_large_backend == "a2a":
+                return 0
+            first_ag_rs_row = self.dcp_a2a_max_tokens + 1
+        else:
+            first_ag_rs_row = 1
+
+        project_threshold = self.dcp_project_before_merge_min_prefill_tokens
+        workspace_start = max(1025, project_threshold + 1)
+        workspace_eligible = (
+            workspace_start <= max_tokens
+            and _can_use_b12x_dcp_prefill_workspace(
+                enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
+                project_before_merge=self.dcp_project_before_merge,
+                dcp_use_b12x=False,
+                num_tokens=workspace_start,
+                max_num_tokens=max_tokens,
+                non_dbo_workspace=getattr(self.impl, "dcp_workspace_non_dbo", False),
+                is_sparse_impl=self.impl.is_sparse,
+                backend_name=self.attn_backend.get_name(),
+                is_capturing=False,
+            )
+        )
+        last_ag_rs_row = (
+            min(max_tokens, workspace_start - 1) if workspace_eligible else max_tokens
+        )
+        if first_ag_rs_row > last_ag_rs_row:
+            return 0
+
+        candidates: list[tuple[int, bool]] = []
+        if not self.dcp_project_before_merge:
+            candidates.append((last_ag_rs_row, False))
+        else:
+            unprojected_rows = min(last_ag_rs_row, project_threshold)
+            if unprojected_rows >= first_ag_rs_row:
+                candidates.append((unprojected_rows, False))
+            if last_ag_rs_row > project_threshold:
+                candidates.append((last_ag_rs_row, True))
+
+        return max(
+            (
+                _estimate_dcp_ag_rs_transient_bytes(
+                    num_tokens=num_tokens,
+                    local_heads=self.num_heads,
+                    dcp_world_size=self.impl.dcp_world_size,
+                    q_head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+                    output_head_dim=(
+                        self.v_head_dim if projected else self.kv_lora_rank
+                    ),
+                    kv_lora_rank=self.kv_lora_rank,
+                    v_head_dim=self.v_head_dim,
+                    project_before_merge=projected,
+                )
+                for num_tokens, projected in candidates
+            ),
+            default=0,
         )
 
     @property
@@ -684,6 +1064,77 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return output
 
+    def _try_fused_mla_query(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Fuse a qualified BF16/MXFP8 query BMM with query assembly."""
+        if self.is_aiter_triton_fp4_bmm_enabled or self.is_aiter_triton_fp8_bmm_enabled:
+            return None
+
+        num_heads, num_tokens, nope_dim = q_nope.shape
+        output_dtype = self._fused_mla_query_output_dtype
+        if getattr(self, "_use_b12x_absorb_bmm", False):
+            weight = self._b12x_absorb_uk_rhs
+            if not can_implement_mxfp8_mla_query(
+                num_heads=num_heads,
+                max_m=num_tokens,
+                nope_dim=nope_dim,
+                latent_dim=self.kv_lora_rank,
+                output_dtype=output_dtype,
+                device=q_nope.device,
+            ):
+                return None
+            runner = run_mxfp8_mla_query
+        else:
+            weight = getattr(self, "W_UK_T", None)
+            if not isinstance(weight, torch.Tensor) or not can_implement_bf16_mla_query(
+                num_heads=num_heads,
+                max_m=num_tokens,
+                nope_dim=nope_dim,
+                latent_dim=self.kv_lora_rank,
+                output_dtype=output_dtype,
+                device=q_nope.device,
+            ):
+                return None
+            runner = run_bf16_mla_query
+
+        workspace_getter = getattr(self.impl, "get_fused_mla_query_output", None)
+        if callable(workspace_getter):
+            output = workspace_getter(num_tokens, num_heads, output_dtype)
+            # DCP1 can return the final query workspace. DCP and padded
+            # virtual-TP layouts return None and use a graph-owned local query
+            # tensor that their established gather/copy path consumes.
+            if output is None:
+                output = torch.empty(
+                    (
+                        num_tokens,
+                        num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=output_dtype,
+                    device=q_nope.device,
+                )
+        else:
+            output = torch.empty(
+                (
+                    num_tokens,
+                    num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=output_dtype,
+                device=q_nope.device,
+            )
+        runner(
+            q_nope,
+            weight,
+            q_pe,
+            self._q_scale,
+            output,
+        )
+        return output
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -720,18 +1171,38 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            if not self.impl.is_sparse:
+                # During the profile run try to simulate to worse case output
+                # size for `self.kv_b_proj(kv_c_normed)` in
+                # `_compute_prefill_context` since this can be large. Sparse
+                # MLA never takes the dense chunked-prefill context path, so
+                # skip the allocation to keep the profile peak accurate.
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
+            else:
+                profile_workspace_bytes = self._get_sparse_memory_profile_bytes()
+                # This synthetic allocation models eager runtime workspace for
+                # KV sizing. attn_metadata is also None during CUDA graph
+                # capture, where allocating it again only consumes capture-time
+                # memory and can OOM after KV cache allocation.
+                if _should_allocate_sparse_profile_workspace(profile_workspace_bytes):
+                    _ = torch.empty(
+                        (profile_workspace_bytes,),
+                        device=k_c_normed.device,
+                        dtype=torch.uint8,
+                    )
+                    logger.info_once(
+                        "Including %.2f MiB of B12X sparse DCP transient "
+                        "memory in the profile peak",
+                        profile_workspace_bytes / (1 << 20),
+                    )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -760,7 +1231,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         assert (
@@ -770,6 +1241,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         num_mqa_tokens = attn_metadata.num_decode_tokens
         num_mha_tokens = q.size(0) - num_mqa_tokens
+        is_sparse_impl = self.impl.is_sparse
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             prefill = getattr(attn_metadata, "prefill", None)
@@ -794,6 +1266,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_mqa_tokens = q.size(0)
                 num_mha_tokens = 0
 
+        ondemand_w_uv_capable = (
+            getattr(self, "dcp_project_before_merge", False)
+            and self.impl.dcp_world_size > 1
+            and is_sparse_impl
+            and getattr(self.impl, "supports_dcp_project_before_merge", False)
+            and (
+                (hasattr(self, "W_UV") and self.W_UV.dtype == torch.bfloat16)
+                or getattr(self, "_use_b12x_absorb_bmm", False)
+            )
+        )
+        project_before_merge_min_tokens = getattr(
+            self,
+            "dcp_project_before_merge_min_prefill_tokens",
+            1024,
+        )
+        use_ondemand_w_uv = (
+            ondemand_w_uv_capable
+            and attn_metadata.max_query_len > 1
+            and num_mqa_tokens > project_before_merge_min_tokens
+        )
         mha_use_quant_output = (
             quant_key is not None
             and self.prefill_backend is not None
@@ -851,7 +1343,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_aiter_triton_fp4_bmm_enabled:
+            fused_mqa_q = (
+                None
+                if qrep_decode
+                else self._try_fused_mla_query(mqa_q_nope, mqa_q_pe)
+            )
+
+            if fused_mqa_q is not None:
+                mqa_q = fused_mqa_q
+            elif self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
@@ -874,9 +1374,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
-                W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
-                assert W_UK_T is not None
-                _, _, L = W_UK_T.shape
+                if getattr(self, "_use_b12x_absorb_bmm", False):
+                    L = self.kv_lora_rank
+                else:
+                    W_UK_T = (
+                        self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
+                    )
+                    assert W_UK_T is not None
+                    _, _, L = W_UK_T.shape
 
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
@@ -885,68 +1390,320 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                if getattr(self, "_use_b12x_absorb_bmm", False):
+                    if B <= _B12X_ABSORB_BMM_MAX_M:
+                        run_b12x_mxfp8_bmm(
+                            mqa_q_nope,
+                            self._b12x_absorb_uk_rhs,
+                            mqa_ql_nope,
+                            b_major="n",
+                        )
+                    else:
+                        _run_mla_query_bmm(
+                            mqa_q_nope,
+                            self._dequant_b12x_absorbed_pair()[0],
+                            mqa_ql_nope,
+                            use_safe_op=self.use_safe_mla_query_bmm,
+                        )
+                else:
+                    _run_mla_query_bmm(
+                        mqa_q_nope,
+                        W_UK_T,
+                        mqa_ql_nope,
+                        use_safe_op=self.use_safe_mla_query_bmm,
+                    )
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
-                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
-            else:
-                mqa_q = (mqa_ql_nope, mqa_q_pe)
-            # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
-            if self.impl.dcp_world_size > 1:
-                if self.use_pcp:
-                    if self.impl.dcp_world_size > self.impl.pcp_world_size:
-                        if isinstance(mqa_q, tuple):
-                            mqa_q = torch.cat(mqa_q, dim=-1)
-                        mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
+            if fused_mqa_q is None:
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+                    assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
                 else:
+                    mqa_q = (mqa_ql_nope, mqa_q_pe)
+            dcp_use_a2a = False
+            project_before_merge = False
+            workspace_gather_used = False
+            ckv_gather_used = False
+            if self.impl.dcp_world_size > 1 and self.use_pcp:
+                if self.impl.dcp_world_size > self.impl.pcp_world_size:
                     if isinstance(mqa_q, tuple):
-                        # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                         mqa_q = torch.cat(mqa_q, dim=-1)
-                    if not qrep_decode:
-                        # mqa_q do allgather in head dim.
-                        mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                    mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
+            elif self.impl.dcp_world_size > 1:
+                ckv_gather_selector = getattr(
+                    self.impl, "dcp_prefill_ckv_gather_eligible", None
+                )
+                ckv_gather_used = bool(
+                    not qrep_decode
+                    and callable(ckv_gather_selector)
+                    and ckv_gather_selector(attn_metadata, num_mqa_tokens)
+                )
+                if not ckv_gather_used:
+                    if not self.impl.can_return_lse_for_decode:
+                        raise NotImplementedError(
+                            f"{type(self.impl).__name__} cannot use DCP because it "
+                            "does not return decode softmax LSE."
+                        )
+                    self.impl.need_to_return_lse_for_decode = True
+                # A fused BF16 query is also a single tensor. Only an actual
+                # FP8 query requires the backend's DCP quant-input contract.
+                if (
+                    fp8_attention
+                    and isinstance(mqa_q, torch.Tensor)
+                    and mqa_q.dtype == _FP8_DTYPE
+                    and not getattr(self.impl, "supports_dcp_quant_query_input", False)
+                ):
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} does not declare support for "
+                        "DCP with FP8 KV cache and pre-quantized query input."
+                    )
+                # Hybrid dispatch on the per-step token count. This is
+                # CUDA-graph safe: under capture the branch sees the padded
+                # capture size, so every graph bakes in one path, and eager
+                # prefill re-evaluates per step. All DCP ranks run the same
+                # batch, so the choice is uniform across the group.
+                dcp_small_batch = (
+                    self.dcp_a2a_max_tokens <= 0
+                    or num_mqa_tokens <= self.dcp_a2a_max_tokens
+                )
+                dcp_use_b12x = self.dcp_b12x and dcp_small_batch and not qrep_decode
+                dcp_use_a2a = self.dcp_a2a and not qrep_decode and (
+                    dcp_small_batch or self.dcp_a2a_large_backend != "ag_rs"
+                )
+                # The project-before path currently targets eager AG/RS
+                # prefill. A2A retains its established merge-then-project path.
+                project_before_merge = (
+                    use_ondemand_w_uv
+                    and not dcp_use_a2a
+                    and not ckv_gather_used
+                    and not qrep_decode
+                )
+                workspace_gather_eligible = _can_use_b12x_dcp_prefill_workspace(
+                    enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
+                    project_before_merge=project_before_merge,
+                    dcp_use_b12x=dcp_use_b12x,
+                    num_tokens=num_mqa_tokens,
+                    max_num_tokens=getattr(self.impl, "_max_batched", 0),
+                    non_dbo_workspace=getattr(
+                        self.impl, "dcp_workspace_non_dbo", False
+                    ),
+                    is_sparse_impl=is_sparse_impl,
+                    backend_name=self.attn_backend.get_name(),
+                    is_capturing=torch.cuda.is_current_stream_capturing(),
+                )
+                if (
+                    isinstance(mqa_q, tuple)
+                    and not workspace_gather_eligible
+                    and not ckv_gather_used
+                ):
+                    mqa_q = torch.cat(mqa_q, dim=-1)
+                if ckv_gather_used:
+                    logger.info_once(
+                        "Keeping local query heads for transient full-CKV "
+                        "B12X sparse MLA prefill"
+                    )
+                elif qrep_decode:
+                    pass
+                elif dcp_use_b12x:
+                    mqa_q = dcp_b12x_all_gather_heads(
+                        mqa_q,
+                        get_dcp_group(),
+                        max_batch_size=self.dcp_max_batch_size,
+                        output_head_dim=(
+                            self.v_head_dim
+                            if project_before_merge
+                            else self.kv_lora_rank
+                        ),
+                    )
+                elif workspace_gather_eligible:
+                    workspace_gather = getattr(
+                        self.impl, "dcp_all_gather_query_in_workspace", None
+                    )
+                    if not getattr(
+                        self.impl,
+                        "supports_dcp_gather_query_in_workspace",
+                        False,
+                    ) or not callable(workspace_gather):
+                        raise RuntimeError(
+                            f"{type(self.impl).__name__} does not support the "
+                            "enabled workspace DCP query gather"
+                        )
+                    mqa_q = workspace_gather(mqa_q)
+                    workspace_gather_used = True
+                    logger.info_once(
+                        "Using borrowed B12X workspaces for sparse MLA DCP prefill"
+                    )
+                else:
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
+            if ckv_gather_used:
+                ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
+                if callable(ckv_setter):
+                    ckv_setter(k_c_normed, k_pe)
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
-                assert lse is not None
-                if self.dcp_a2a:
-                    attn_out = dcp_a2a_lse_reduce(
-                        attn_out,
-                        lse,
-                        get_dcp_group(),
-                        is_lse_base_on_e=self.impl.lse_base_on_e,
+            if self.impl.dcp_world_size > 1 and not ckv_gather_used:
+                if lse is None:
+                    raise RuntimeError(
+                        f"{type(self.impl).__name__} did not return decode "
+                        "softmax LSE required by DCP."
                     )
-                elif self.use_pcp:
+                valid_counts = None
+                if project_before_merge:
+                    valid_counts_tensor = getattr(
+                        attn_metadata, "nsa_cache_seqlens", None
+                    )
+                    if (
+                        not isinstance(valid_counts_tensor, torch.Tensor)
+                        or valid_counts_tensor.ndim != 1
+                        or valid_counts_tensor.numel() < num_mqa_tokens
+                        or valid_counts_tensor.dtype != torch.int32
+                        or valid_counts_tensor.device != attn_out.device
+                    ):
+                        raise RuntimeError(
+                            "Projected DCP merge requires a one-dimensional "
+                            f"int32 nsa_cache_seqlens tensor with at least "
+                            f"{num_mqa_tokens} rows on {attn_out.device}."
+                        )
+                    valid_counts = valid_counts_tensor[:num_mqa_tokens]
+                    if not valid_counts.is_contiguous():
+                        raise RuntimeError(
+                            "Projected DCP valid counts must be contiguous."
+                        )
+                    local_w_uv = (
+                        self._dequant_b12x_absorbed_pair()[1].contiguous()
+                        if getattr(self, "_use_b12x_absorb_bmm", False)
+                        else self.W_UV.contiguous()
+                    )
+                    w_uv_dcp = get_dcp_group().all_gather(local_w_uv, dim=0)
+                    expected_shape = (
+                        self.num_heads * get_dcp_group().world_size,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                    )
+                    if (
+                        w_uv_dcp.shape != expected_shape
+                        or w_uv_dcp.dtype != local_w_uv.dtype
+                        or w_uv_dcp.device != local_w_uv.device
+                        or not w_uv_dcp.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "Invalid rank-major DCP W_UV gather: expected "
+                            f"contiguous {expected_shape} on "
+                            f"{local_w_uv.device}/{local_w_uv.dtype}, got "
+                            f"{tuple(w_uv_dcp.shape)} on "
+                            f"{w_uv_dcp.device}/{w_uv_dcp.dtype}."
+                        )
+                    if workspace_gather_used:
+                        workspace_project = getattr(
+                            self.impl,
+                            "dcp_project_before_merge_in_workspace",
+                            None,
+                        )
+                        if not getattr(
+                            self.impl,
+                            "supports_dcp_project_before_merge_in_workspace",
+                            False,
+                        ) or not callable(workspace_project):
+                            raise RuntimeError(
+                                f"{type(self.impl).__name__} does not support "
+                                "workspace DCP projection"
+                            )
+                        attn_out = workspace_project(attn_out, lse, w_uv_dcp)
+                    else:
+                        projected = attn_out.new_empty(
+                            attn_out.shape[0], attn_out.shape[1], self.v_head_dim
+                        )
+                        self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
+                        attn_out = projected
+                if self.use_pcp:
                     attn_out = cp_lse_ag_out_ar(
                         attn_out,
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=self.impl.lse_base_on_e,
                     )
-                else:
-                    attn_out = cp_lse_ag_out_rs(
+                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+                elif dcp_use_a2a:
+                    attn_out = dcp_a2a_lse_reduce(
                         attn_out,
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=self.impl.lse_base_on_e,
+                        use_b12x=dcp_use_b12x,
+                        b12x_max_batch_size=self.dcp_max_batch_size,
+                        b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
                     )
-                if self.use_pcp:
-                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+                else:
+                    if project_before_merge:
+                        sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
+                    if workspace_gather_used:
+                        workspace_output = getattr(
+                            self.impl,
+                            "dcp_reduce_scatter_output_in_workspace",
+                            None,
+                        )
+                        if not getattr(
+                            self.impl,
+                            "supports_dcp_reduce_scatter_output_in_workspace",
+                            False,
+                        ) or not callable(workspace_output):
+                            raise RuntimeError(
+                                f"{type(self.impl).__name__} does not support "
+                                "workspace DCP reduce-scatter output"
+                            )
+                        attn_out = cp_lse_ag_out_rs_into(
+                            attn_out,
+                            lse,
+                            get_dcp_group(),
+                            output_provider=workspace_output,
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                        )
+                    else:
+                        attn_out = cp_lse_ag_out_rs(
+                            attn_out,
+                            lse,
+                            get_dcp_group(),
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                            head_major_output=not qrep_decode,
+                        )
 
-            # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
+            if project_before_merge:
+                if workspace_gather_used:
+                    expected_shape = (
+                        num_mqa_tokens,
+                        self.num_heads,
+                        self.v_head_dim,
+                    )
+                    expected_stride = (
+                        self.v_head_dim,
+                        num_mqa_tokens * self.v_head_dim,
+                        1,
+                    )
+                    if (
+                        tuple(attn_out.shape) != expected_shape
+                        or tuple(attn_out.stride()) != expected_stride
+                        or not attn_out.movedim(0, 1).is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "Workspace DCP reduce-scatter returned an invalid "
+                            f"layout: shape={tuple(attn_out.shape)}, "
+                            f"stride={tuple(attn_out.stride())}"
+                        )
+                    mqa_output_slice.view(expected_shape).copy_(attn_out)
+                else:
+                    mqa_output_slice.copy_(attn_out.reshape(mqa_output_slice.shape))
+            else:
+                self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
@@ -991,7 +1748,128 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             output_padded[num_actual_toks:].zero_()
         return output_padded
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
+    def _prepare_b12x_absorb_bmm(self, act_dtype: torch.dtype) -> bool:
+        for name in ("_b12x_absorb_uk_rhs", "_b12x_absorb_uv_rhs"):
+            if hasattr(self, name):
+                delattr(self, name)
+        if not _b12x_absorb_bmm_enabled():
+            return False
+        if self.dcp_q_replicate:
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 is incompatible with DCP query "
+                "replication; falling back to replicated materialized weights."
+            )
+            return False
+        if (
+            act_dtype != torch.bfloat16
+            or self.is_aiter_triton_fp4_bmm_enabled
+            or self.is_aiter_triton_fp8_bmm_enabled
+        ):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 requires BF16 MLA projections; "
+                "falling back to the materialized absorbed weights."
+            )
+            return False
+
+        weight = getattr(self.kv_b_proj, "weight", None)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        head_stride = self.qk_nope_head_dim + self.v_head_dim
+        expected_weight_shape = (
+            self.num_heads * head_stride,
+            self.kv_lora_rank,
+        )
+        expected_scale_shape = (
+            self.num_heads * head_stride,
+            self.kv_lora_rank // 32,
+        )
+        if (
+            not isinstance(weight, torch.Tensor)
+            or not isinstance(weight_scale, torch.Tensor)
+            or weight.dtype != torch.float8_e4m3fn
+            or weight_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu)
+            or tuple(weight.shape) != expected_weight_shape
+            or tuple(weight_scale.shape) != expected_scale_shape
+            or not weight.is_contiguous()
+            or not weight_scale.is_contiguous()
+        ):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 requires a contiguous ModelOpt MXFP8 "
+                "kv_b_proj pack; falling back to the materialized absorbed weights."
+            )
+            return False
+
+        values = weight.view(self.num_heads, head_stride, self.kv_lora_rank)
+        scales = weight_scale.view(
+            self.num_heads,
+            head_stride,
+            self.kv_lora_rank // 32,
+        )
+        uk_rhs = (
+            values[:, : self.qk_nope_head_dim, :],
+            scales[:, : self.qk_nope_head_dim, :],
+        )
+        uv_rhs = (
+            values[:, self.qk_nope_head_dim :, :],
+            scales[:, self.qk_nope_head_dim :, :],
+        )
+        uk_supported = can_implement_b12x_mxfp8_bmm(
+            batch=self.num_heads,
+            max_m=_B12X_ABSORB_BMM_MAX_M,
+            n=self.kv_lora_rank,
+            k=self.qk_nope_head_dim,
+            b_major="n",
+            device=weight.device,
+        )
+        uv_supported = can_implement_b12x_mxfp8_bmm(
+            batch=self.num_heads,
+            max_m=_B12X_ABSORB_BMM_MAX_M,
+            n=self.v_head_dim,
+            k=self.kv_lora_rank,
+            b_major="k",
+            device=weight.device,
+        )
+        if not (uk_supported and uv_supported):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 but the MLA geometry is outside the "
+                "sparkinfer.gemm.bmm envelope; falling back to the materialized "
+                "absorbed weights."
+            )
+            return False
+
+        self._b12x_absorb_uk_rhs = uk_rhs
+        self._b12x_absorb_uv_rhs = uv_rhs
+        for name in ("W_UK_T", "W_UV"):
+            if hasattr(self, name):
+                delattr(self, name)
+        logger.info_once(
+            "Serving MLA absorbed projections directly from the B12X MXFP8 pack."
+        )
+        return True
+
+    def _dequant_b12x_absorbed_pair(self) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self.kv_b_proj.weight
+        weight_scale = self.kv_b_proj.weight_scale
+        if weight_scale.dtype != torch.float8_e8m0fnu:
+            weight_scale = weight_scale.view(torch.float8_e8m0fnu)
+        dequant = weight.to(torch.bfloat16) * weight_scale.to(
+            torch.bfloat16
+        ).repeat_interleave(32, dim=-1)
+        kv_b = dequant.T.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        w_uk, w_uv = kv_b.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        return w_uk.permute(1, 2, 0), w_uv.transpose(0, 1)
+
+    def _process_materialized_absorbed_weights(self, act_dtype: torch.dtype):
+        pre_w_uv = pre_w_uk_t = None
+        if not (
+            self.is_aiter_triton_fp4_bmm_enabled or self.is_aiter_triton_fp8_bmm_enabled
+        ):
+            # Seat persistent weights before the transient dequantization scratch.
+            pre_w_uv, pre_w_uk_t = _preallocate_absorbed_mla_weights(self, act_dtype)
+
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
@@ -1091,9 +1969,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            w_uv = W_UV.transpose(0, 1)
+            if pre_w_uv is not None:
+                pre_w_uv.copy_(w_uv)
+                w_uv = pre_w_uv
+            replace_parameter(self, "W_UV", w_uv, prefer_copy=True)
             # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            w_uk_t = W_UK.permute(1, 2, 0)
+            if pre_w_uk_t is not None:
+                pre_w_uk_t.copy_(w_uk_t)
+                w_uk_t = pre_w_uk_t
+            replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
             if self.dcp_q_replicate:
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                     self.W_UK_T.contiguous(), dim=0
@@ -1102,6 +1988,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
         # for more details.
+        quant_method = (
+            self.quant_config.get_quant_method(self, prefix=self.layer_name)
+            if self.quant_config
+            else None
+        )
+        if not should_load_quant_weights(quant_method):
+            set_default_quant_scales(self, register_buffer=False)
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        self._use_b12x_absorb_bmm = self._prepare_b12x_absorb_bmm(act_dtype)
+        self._fused_mla_query_output_dtype = (
+            current_platform.fp8_dtype()
+            if is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.impl.supports_quant_query_input
+            else torch.bfloat16
+        )
+        if not self._use_b12x_absorb_bmm:
+            self._process_materialized_absorbed_weights(act_dtype)
+            return
+
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
             if self.quant_config
@@ -1141,6 +2047,38 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        layer_id = _extract_single_layer_index(self.layer_name)
+        num_hidden_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        shard_draft = os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        dcp_replicated = (
+            not shard_draft
+            and layer_id is not None
+            and num_hidden_layers is not None
+            and layer_id >= int(num_hidden_layers)
+        )
+        model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        target_model_config = getattr(speculative_config, "target_model_config", None)
+        target_model_type = (
+            getattr(target_model_config.hf_config, "model_type", None)
+            if target_model_config is not None
+            else None
+        )
+        glm_model_or_mtp = bool(
+            model_type == "glm_moe_dsa"
+            or (model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa")
+        )
+        glm_fp8_rope = bool(
+            os.environ.get("KV_FP8_ROPE", "0") == "1"
+            and self.kv_cache_dtype == "nvfp4_ds_mla"
+            and glm_model_or_mtp
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1149,6 +2087,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+            model_version="glm_fp8_rope" if glm_fp8_rope else None,
+            dcp_replicated=dcp_replicated,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -1171,9 +2111,99 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             x = rocm_aiter_ops.triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
             )
+        elif getattr(self, "_use_b12x_absorb_bmm", False):
+            if x.shape[1] <= _B12X_ABSORB_BMM_MAX_M:
+                run_b12x_mxfp8_bmm(
+                    x,
+                    self._b12x_absorb_uv_rhs,
+                    out.transpose(0, 1),
+                    b_major="k",
+                )
+            else:
+                torch.bmm(
+                    x,
+                    self._dequant_b12x_absorbed_pair()[1],
+                    out=out.transpose(0, 1),
+                )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    def _v_up_proj_bmm(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Project BF16 DCP partials with rank-major gathered W_UV."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError("DCP projection expects rank-three tensors.")
+        num_tokens, num_heads, latent_dim = x.shape
+        expected_out_shape = (num_tokens, num_heads, self.v_head_dim)
+        expected_weight_shape = (
+            num_heads,
+            self.kv_lora_rank,
+            self.v_head_dim,
+        )
+        if (
+            latent_dim != self.kv_lora_rank
+            or out.shape != expected_out_shape
+            or w_uv.shape != expected_weight_shape
+        ):
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        if (
+            x.dtype != torch.bfloat16
+            or out.dtype != x.dtype
+            or w_uv.dtype != x.dtype
+            or out.device != x.device
+            or w_uv.device != x.device
+            or not w_uv.is_contiguous()
+        ):
+            raise ValueError(
+                "DCP projection requires contiguous BF16 weights and matching "
+                "BF16 inputs/outputs on one device."
+            )
+        x_head_major = x.transpose(0, 1).contiguous()
+        projected_head_major = torch.empty(
+            (num_heads, num_tokens, self.v_head_dim),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        torch.bmm(x_head_major, w_uv, out=projected_head_major)
+        out.copy_(projected_head_major.transpose(0, 1))
+
+    def _v_up_proj_bmm_chunked(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Bound temporary BF16 DCP projection storage to 144 MiB."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError(
+                "DCP projection expects rank-three tensors: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        num_tokens, num_heads, latent_dim = x.shape
+        if latent_dim != self.kv_lora_rank or w_uv.shape[0] != num_heads:
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, w_uv={tuple(w_uv.shape)}."
+            )
+
+        temp_budget_bytes = 144 * 1024 * 1024
+        temp_bytes_per_token = (
+            num_heads * (self.kv_lora_rank + self.v_head_dim) * x.element_size()
+        )
+        max_chunk_tokens = max(1, temp_budget_bytes // temp_bytes_per_token)
+        for start in range(0, num_tokens, max_chunk_tokens):
+            end = min(start + max_chunk_tokens, num_tokens)
+            self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
 
 
 def unified_mla_kv_cache_update(
@@ -2405,6 +3435,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 output = attn_output
                 output_lse = attn_softmax_lse
             else:
+                output, attn_output = _match_merge_strides(output, attn_output)
                 if merge_output is None:
                     merge_output = torch.empty_like(output)
                     merge_output_lse = torch.empty_like(output_lse)
@@ -2562,6 +3593,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 output = attn_output
                 output_lse = attn_softmax_lse
             else:
+                output, attn_output = _match_merge_strides(output, attn_output)
                 if merge_output is None:
                     merge_output = torch.empty_like(output)
                     merge_output_lse = torch.empty_like(output_lse)
@@ -2650,6 +3682,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             suffix_output = suffix_output[..., : self.v_head_dim]
 
             output = output.view(-1, self.num_heads, self.v_head_dim)
+            context_output, suffix_output = _match_merge_strides(
+                context_output, suffix_output
+            )
             merge_attn_states(
                 output=output,
                 prefix_output=context_output,
