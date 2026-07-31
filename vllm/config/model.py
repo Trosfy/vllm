@@ -223,9 +223,10 @@ class ModelConfig:
     determine the data type of the weights."""
     quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None
     """User-facing quantization configuration. Carries per-layer-kind specs
-    (linear, moe) and ignore patterns; see :class:`QuantizationConfigArgs`.
-    Auto-populated from the matching online shorthand when `quantization` is
-    one of the values in `ONLINE_QUANT_SHORTHAND_NAMES`."""
+    (linear, moe, shared_experts) and ignore patterns; see
+    :class:`QuantizationConfigArgs`. Auto-populated from the matching online
+    shorthand when `quantization` is one of the values in
+    `ONLINE_QUANT_SHORTHAND_NAMES`."""
     allow_deprecated_quantization: bool = False
     """Whether to allow deprecated quantization methods."""
     enforce_eager: bool = False
@@ -1134,6 +1135,13 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                # Rank-sliced EXL3 checkpoints retain a ModelOpt dispatch tag
+                # for backward compatibility, so EXL3 must inspect metadata
+                # before the ModelOpt overrides claim them.
+                "exl3",
+                # Must precede modelopt_fp4: hybrid checkpoints are
+                # modelopt-tagged NVFP4 plus a hybrid_bit_map.
+                "nvfp4_nf3_hybrid",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",
