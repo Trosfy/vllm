@@ -413,6 +413,17 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None:
+                # DFlash checkpoints declare 0-based target layer ids; the
+                # captured aux ids are shifted by one (hidden_states[0] is the
+                # embedding output), matching eagle3_utils.
+                dflash_config = (
+                    getattr(self.draft_model_config.hf_config, "dflash_config", None)
+                    or {}
+                )
+                target_layer_ids = dflash_config.get("target_layer_ids")
+                if target_layer_ids is not None:
+                    layer_ids = [int(i) + 1 for i in target_layer_ids]
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -808,6 +819,38 @@ class SpeculativeConfig:
         parts = model.split(".")
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
+    def _inherit_target_revision_for_mtp(self) -> None:
+        """Pin an in-checkpoint MTP draft to the target model revision."""
+        target = self.target_model_config
+        if self.method != "mtp" or target is None or self.model != target.model:
+            return
+        if self.revision is None:
+            self.revision = target.revision
+        if self.code_revision is None:
+            self.code_revision = target.code_revision
+
+    def _cap_same_model_draft_position_embeddings(self) -> bool:
+        """Cap an in-checkpoint draft to the target's effective RoPE table."""
+        target = self.target_model_config
+        draft = self.draft_model_config
+        if target is None or draft is None or draft.model != target.model:
+            return False
+
+        target_hf = target.hf_text_config
+        draft_hf = draft.hf_text_config
+        target_max = getattr(target_hf, "max_position_embeddings", None)
+        draft_max = getattr(draft_hf, "max_position_embeddings", None)
+        if target_max is None or draft_max is None or target_max >= draft_max:
+            return False
+
+        draft_hf.max_position_embeddings = target_max
+        logger.info(
+            "Capped same-model draft max_position_embeddings from %d to %d.",
+            draft_max,
+            target_max,
+        )
+        return True
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
@@ -959,6 +1002,7 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                self._inherit_target_revision_for_mtp()
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject
@@ -998,6 +1042,8 @@ class SpeculativeConfig:
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
                 )
+
+                self._cap_same_model_draft_position_embeddings()
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to

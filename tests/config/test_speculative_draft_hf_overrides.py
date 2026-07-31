@@ -12,6 +12,7 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+from types import SimpleNamespace
 
 import pytest
 from transformers import PretrainedConfig
@@ -132,3 +133,98 @@ def test_composed_override_is_picklable():
 
     out = composed(_make_hf_config())
     assert out.num_hidden_layers == 1
+
+
+@pytest.mark.cpu_test
+def test_mtp_same_model_inherits_target_revisions():
+    spec = SimpleNamespace(
+        method="mtp",
+        model="org/model",
+        revision=None,
+        code_revision=None,
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            revision="weights-commit",
+            code_revision="code-commit",
+        ),
+    )
+
+    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
+
+    assert spec.revision == "weights-commit"
+    assert spec.code_revision == "code-commit"
+
+
+@pytest.mark.cpu_test
+def test_mtp_explicit_draft_revisions_are_preserved():
+    spec = SimpleNamespace(
+        method="mtp",
+        model="org/model",
+        revision="draft-weights",
+        code_revision="draft-code",
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            revision="target-weights",
+            code_revision="target-code",
+        ),
+    )
+
+    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
+
+    assert spec.revision == "draft-weights"
+    assert spec.code_revision == "draft-code"
+
+
+@pytest.mark.cpu_test
+def test_same_model_draft_inherits_smaller_target_position_limit():
+    target_text = SimpleNamespace(max_position_embeddings=600_000)
+    draft_text = SimpleNamespace(max_position_embeddings=1_000_000)
+    spec = SimpleNamespace(
+        model="org/model",
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            hf_config=SimpleNamespace(),
+            hf_text_config=target_text,
+        ),
+        draft_model_config=SimpleNamespace(
+            model="org/model",
+            hf_config=SimpleNamespace(),
+            hf_text_config=draft_text,
+        ),
+    )
+
+    changed = SpeculativeConfig._cap_same_model_draft_position_embeddings(spec)
+
+    assert changed is True
+    assert draft_text.max_position_embeddings == 600_000
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("draft_model", "draft_max"),
+    [
+        ("org/other-draft", 1_000_000),
+        ("org/model", 500_000),
+    ],
+)
+def test_draft_position_limit_is_not_increased_or_applied_cross_model(
+    draft_model: str,
+    draft_max: int,
+):
+    draft_text = SimpleNamespace(max_position_embeddings=draft_max)
+    spec = SimpleNamespace(
+        model=draft_model,
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            hf_text_config=SimpleNamespace(max_position_embeddings=600_000),
+        ),
+        draft_model_config=SimpleNamespace(
+            model=draft_model,
+            hf_text_config=draft_text,
+        ),
+    )
+
+    changed = SpeculativeConfig._cap_same_model_draft_position_embeddings(spec)
+
+    assert changed is False
+    assert draft_text.max_position_embeddings == draft_max
