@@ -1789,6 +1789,10 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            for i, token_id in enumerate(generated_token_ids):
+                if token_id < 0:
+                    del generated_token_ids[i:]
+                    break
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
+from vllm.compilation.b12x_capture import (
+    b12x_cuda_graph_prewarm_enabled,
+    guard_b12x_kernel_resolution,
+)
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -29,6 +35,7 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -54,6 +61,7 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
+    max_req_tokens: int | None = None
     num_active_loras: int = 0
 
 
@@ -75,6 +83,7 @@ def _is_compatible(
     num_tokens: int,
     uniform_token_count: int | None,
     num_active_loras: int,
+    max_req_tokens: int,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -83,6 +92,7 @@ def _is_compatible(
             desc.uniform_token_count is None
             or desc.uniform_token_count == uniform_token_count
         )
+        and (desc.max_req_tokens is None or desc.max_req_tokens >= max_req_tokens)
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
@@ -113,6 +123,7 @@ class CudaGraphManager:
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
+        varlen_spec_decode: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -121,6 +132,7 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        self.varlen_spec_decode = varlen_spec_decode
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -137,6 +149,9 @@ class CudaGraphManager:
         self._graphs_captured = False
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        self._exact_uniform_candidates: dict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
 
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
@@ -193,6 +208,9 @@ class CudaGraphManager:
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
+        exact_uniform_descs: defaultdict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = defaultdict(list)
 
         # When using Dynamic SD, num_speculative_tokens is the max number of
         # draft tokens. The scheduler might use a smaller number so we need
@@ -200,12 +218,15 @@ class CudaGraphManager:
         speculative_config = self.vllm_config.speculative_config
         if (
             speculative_config
-            and speculative_config.uses_dynamic_speculative_decoding()
+            and speculative_config.uses_batch_size_dynamic_speculative_decoding()
         ):
             num_spec_per_batch_size = (
                 speculative_config.num_speculative_tokens_per_batch_size
             )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
+            # uses_batch_size_dynamic_speculative_decoding() guarantees this
+            # is set. Acceptance-length adaptation takes the else branch: it
+            # replays the max-depth graphs and pads unscheduled draft slots
+            # with -1 placeholders that rejection sampling discards.
             assert num_spec_per_batch_size is not None
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step
@@ -214,43 +235,107 @@ class CudaGraphManager:
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
             # Each entry is (range_start, range_end, num_speculative_tokens).
+            # K=0 disables drafting at that concurrency; no draft graph is
+            # needed, and a zero query length would break capture bucketing.
+            decode_query_lens = sorted(
+                {
+                    x[2] + num_new_sampled_tokens_per_step
+                    for x in num_spec_per_batch_size
+                    if x[2] + num_new_sampled_tokens_per_step > 0
+                }
+            )
+        elif (
+            speculative_config
+            and speculative_config.uses_acceptance_length_adaptation()
+        ):
+            # Acceptance-length adaptation selects any depth in [1, K] at
+            # runtime; capture a uniform-decode graph per depth so a reduced
+            # depth verifies fewer tokens instead of replaying padded
+            # max-depth graphs.
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
             decode_query_lens = [
-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+                n + num_new_sampled_tokens_per_step
+                for n in range(1, self.vllm_config.num_speculative_tokens + 1)
+            ]
+        elif (
+            speculative_config
+            and speculative_config.use_dspark()
+            and envs.VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH
+        ):
+            # The confidence-capacity controller selects the next physical
+            # DSpark width on the worker. Capture every K so dispatch can
+            # avoid computing and then slicing the unused draft suffix.
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            decode_query_lens = [
+                n + num_new_sampled_tokens_per_step
+                for n in range(1, self.vllm_config.num_speculative_tokens + 1)
             ]
         else:
             decode_query_lens = [self.decode_query_len]
 
+        def decode_descs(
+            num_tokens: int,
+            num_active_loras: int,
+        ):
+            if self.varlen_spec_decode:
+                if num_tokens > max_decode_tokens or num_tokens > max_cg_capture_size:
+                    return
+                max_requests = min(num_tokens, self.max_num_reqs)
+                min_requests = (num_tokens + self.decode_query_len - 1) // (
+                    self.decode_query_len
+                )
+                request_counts = {
+                    min_requests,
+                    (max_requests + 1) // 2,
+                    (3 * max_requests + 3) // 4,
+                    max_requests,
+                }
+                for num_reqs in sorted(request_counts):
+                    if num_reqs * self.decode_query_len < num_tokens:
+                        continue
+                    yield BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        max_req_tokens=self.decode_query_len,
+                        num_active_loras=num_active_loras,
+                    )
+                return
+
+            for decode_query_len in decode_query_lens:
+                rounded_num_tokens = round_up(num_tokens, decode_query_len)
+                rounded_num_reqs = rounded_num_tokens // decode_query_len
+
+                if (
+                    rounded_num_tokens > max_decode_tokens
+                    or rounded_num_tokens > max_cg_capture_size
+                    or rounded_num_reqs > self.max_num_reqs
+                ):
+                    continue
+
+                yield BatchExecutionDescriptor(
+                    cg_mode=decode_mode,
+                    num_tokens=rounded_num_tokens,
+                    num_reqs=rounded_num_reqs,
+                    uniform_token_count=decode_query_len,
+                    num_active_loras=num_active_loras,
+                )
+
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
         ):
-            # Capture uniform decode specfifc graphs if required
-            #  (i.e. separate decode routine)
             if separate_decode_routine and decode_mode:
-                for decode_query_len in decode_query_lens:
-                    rounded_num_tokens = round_up(num_tokens, decode_query_len)
-                    rounded_num_reqs = rounded_num_tokens // decode_query_len
-
-                    if (
-                        rounded_num_tokens > max_decode_tokens
-                        or rounded_num_tokens > max_cg_capture_size
-                        or rounded_num_reqs > self.max_num_reqs
-                    ):
+                for desc in decode_descs(num_tokens, num_active_loras):
+                    if desc in descs_by_mode[desc.cg_mode]:
                         continue
-
-                    desc = BatchExecutionDescriptor(
-                        cg_mode=decode_mode,
-                        num_tokens=rounded_num_tokens,
-                        num_reqs=rounded_num_reqs,
-                        uniform_token_count=decode_query_len,
-                        num_active_loras=num_active_loras,
+                    descs_by_mode[desc.cg_mode].append(desc)
+                    descs_by_token_lora[(desc.num_tokens, num_active_loras)].append(
+                        desc
                     )
-
-                    # avoid duplicate graphs
-                    if desc not in descs_by_mode[decode_mode]:
-                        descs_by_mode[decode_mode].append(desc)
-                        descs_by_token_lora[
-                            (rounded_num_tokens, num_active_loras)
-                        ].append(desc)
 
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
@@ -270,8 +355,68 @@ class CudaGraphManager:
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
 
+        # Capacity-based DSpark uses generic varlen target graphs once the
+        # batch is large enough to benefit from compaction. Below that knee,
+        # the capacity manager deliberately bypasses compaction and verifies
+        # the full draft width. Capture exact uniform graphs for that range so
+        # the bypass does not replay a more expensive varlen graph. Keep them
+        # out of the generic token buckets: adding their intermediate token
+        # counts there would split varlen padding ranges and force eager runs.
+        # Dispatch checks this exact-match map before the generic candidates.
+        capacity_activation_batch_size = envs.VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE
+        if (
+            separate_decode_routine
+            and decode_mode
+            and self.varlen_spec_decode
+            and capacity_activation_batch_size > 1
+        ):
+            max_uniform_reqs = min(
+                self.max_num_reqs,
+                capacity_activation_batch_size - 1,
+            )
+            for num_reqs in range(1, max_uniform_reqs + 1):
+                num_tokens = self.decode_query_len * num_reqs
+                if num_tokens > max_decode_tokens or num_tokens > max_cg_capture_size:
+                    continue
+                for num_active_loras in self.lora_capture_cases:
+                    desc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        uniform_token_count=self.decode_query_len,
+                        num_active_loras=num_active_loras,
+                    )
+                    if desc not in descs_by_mode[decode_mode]:
+                        descs_by_mode[decode_mode].append(desc)
+                        exact_uniform_descs[(num_tokens, num_active_loras)].append(desc)
+
+        # Guarantee the small-request grid for every selectable decode query
+        # length, independent of the configured capture-size list: a missing
+        # (depth, num_reqs) point would otherwise pad requests or fall off
+        # the FULL-graph path.
+        if separate_decode_routine and decode_mode and not self.varlen_spec_decode:
+            for decode_query_len, num_reqs in product(
+                decode_query_lens, range(1, min(self.max_num_reqs, 32) + 1)
+            ):
+                num_tokens = decode_query_len * num_reqs
+                if num_tokens > max_decode_tokens or num_tokens > max_cg_capture_size:
+                    continue
+                for num_active_loras in self.lora_capture_cases:
+                    desc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        uniform_token_count=decode_query_len,
+                        num_active_loras=num_active_loras,
+                    )
+                    if desc not in descs_by_mode[decode_mode]:
+                        descs_by_mode[decode_mode].append(desc)
+                        descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
+
         if not descs_by_token_lora:
             return
+
+        self._exact_uniform_candidates = dict(exact_uniform_descs)
 
         all_token_counts = sorted({k[0] for k in descs_by_token_lora})
         current_range_start = 0
@@ -292,6 +437,12 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def clear(self) -> None:
+        """Release captured graphs and reset this manager for a later capture."""
+        self.graphs.clear()
+        self._graphs_captured = False
+        self.breakable_cg_runner = None
+
     @torch.inference_mode()
     def capture(
         self,
@@ -307,7 +458,11 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
-        with graph_capture(device=self.device):
+        # Keep event handles created by descriptor warmups alive together with
+        # the graph artifacts captured below. Some multi-stream custom ops run
+        # on joined auxiliary streams where CUDA's per-current-stream capture
+        # query is false even though later graph nodes retain those handles.
+        with graph_capture(device=self.device), vllm_cudagraph_capture_scope():
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -343,6 +498,12 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
+                        if b12x_cuda_graph_prewarm_enabled():
+                            # B12X kernels use caller-owned scratch views in
+                            # the CuTe launcher contract. Re-warm the exact
+                            # fresh state that FULL capture will use, so CUDA
+                            # graph capture only records resolved launches.
+                            forward_fn(CUDAGraphMode.NONE)
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
@@ -351,7 +512,13 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with torch.cuda.graph(graph, self.pool):
+                        with (
+                            guard_b12x_kernel_resolution(
+                                "vLLM full CUDA graph capture after B12X warmup"
+                            ),
+                            vllm_cudagraph_capture_scope(),
+                            torch.cuda.graph(graph, self.pool),
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -368,19 +535,32 @@ class CudaGraphManager:
         num_tokens: int,
         uniform_token_count: int | None,
         num_active_loras: int,
+        max_req_tokens: int = 0,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
-        if self._graphs_captured and num_tokens > 0 and key in self._candidates:
-            for desc in self._candidates[key]:
+        if self._graphs_captured and num_tokens > 0:
+            if uniform_token_count is not None:
+                for desc in getattr(self, "_exact_uniform_candidates", {}).get(key, ()):
+                    if _is_compatible(
+                        desc,
+                        num_reqs,
+                        num_tokens,
+                        uniform_token_count,
+                        effective_loras,
+                        max_req_tokens,
+                    ):
+                        return desc
+            for desc in self._candidates.get(key, ()):
                 if _is_compatible(
                     desc,
                     num_reqs,
                     num_tokens,
                     uniform_token_count,
                     effective_loras,
+                    max_req_tokens,
                 ):
                     return desc
         return BatchExecutionDescriptor(
@@ -396,6 +576,8 @@ class CudaGraphManager:
             f"Expected FULL mode, got {desc.cg_mode}"
         )
         assert desc in self.graphs, f"No cudagraph for {desc}"
+        if os.getenv("VLLM_DEBUG_B12X_MINIMAX_M3_MSA", "0") == "1":
+            logger.warning("Replaying FULL CUDA graph: %s", desc)
         # Sync offloader before replay - needed when transitioning from
         # eager/piecewise to full cudagraph (e.g., prefill → decode).
         # The previous eager iteration's start_prefetch may have queued
@@ -410,6 +592,11 @@ class CudaGraphManager:
             self.breakable_cg_runner = BreakableCUDAGraphWrapper(
                 model, self.vllm_config
             )
+            # Disposable memory profiling temporarily replaces the manager's
+            # graph pool. A runner created during that capture must allocate
+            # from the same pool so cleanup can release the profiled graphs.
+            if self.pool is not None:
+                self.breakable_cg_runner.graph_pool = self.pool
 
     def run_pw_graph(self, model: nn.Module, model_inputs: dict[str, Any]) -> Any:
         if not self.use_breakable_cg:
@@ -429,6 +616,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
+        varlen_spec_decode: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -436,6 +624,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             cudagraph_mode,
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
+            varlen_spec_decode=varlen_spec_decode,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -499,6 +688,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                max_req_tokens=desc.max_req_tokens,
             )
 
             # Capture with dummy rows marked as padding.
@@ -565,6 +755,12 @@ class ModelCudaGraphManager(CudaGraphManager):
 
         super().capture(create_forward_fn, progress_bar_desc)
 
+    def clear(self) -> None:
+        super().clear()
+        self.hidden_states = None
+        self.aux_hidden_states.clear()
+        self.intermediate_tensors = None
+
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
@@ -590,8 +786,14 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
+    max_req_tokens: int | None = None,
 ) -> AttentionState:
-    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    input_batch = InputBatch.make_dummy(
+        num_reqs,
+        num_tokens,
+        input_buffers,
+        max_req_tokens=max_req_tokens,
+    )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
