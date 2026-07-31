@@ -373,7 +373,9 @@ class StructuredOutputManager:
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
                 request.structured_output_request.reasoning_ended = (
-                    reasoner.is_reasoning_end(request.prompt_token_ids or [])
+                    reasoner.is_reasoning_end_for_prompt(
+                        request.prompt_token_ids or []
+                    )
                 )
             return request.structured_output_request.reasoning_ended
         return True
@@ -405,19 +407,14 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             return True
 
-        # Check if reasoning ends in *this* step.
-        # When the caller passes new_token_ids (the tokens that were just
-        # appended this step), use it directly as the delta window. The
-        # placeholder-derived fallback assumes num_output_placeholders ==
-        # len(new_token_ids), which breaks under async scheduling + spec
-        # decode when some drafts are rejected (#43388): the placeholder
-        # count remains > 0 after the step and the computed delta window
-        # starts past the reasoning-end marker.
+        # Check if reasoning ends in *this* step. Prefer the caller's actual
+        # new_token_ids over reconstructing the step window from scheduler
+        # counters: with speculative decoding, num_computed_tokens is already
+        # advanced past the accepted draft tokens when this runs, so the
+        # counter-derived window can miss the reasoning-end marker.
         all_token_ids = request.all_token_ids
-        if new_token_ids:
-            # The tokens were already appended this step, so the step window
-            # starts exactly len(new_token_ids) from the end.
-            start = len(all_token_ids) - len(new_token_ids)
+        if new_token_ids is not None:
+            start = max(len(all_token_ids) - len(new_token_ids), 0)
             delta_ids: Iterable[int] = new_token_ids
         else:
             delta_from = request.num_computed_tokens - request.num_output_placeholders
@@ -431,9 +428,9 @@ class StructuredOutputManager:
             structured_req.reasoning_ended = True
 
             # Record the boundary so the scheduler can exclude reasoning tokens.
-            end_index = self._find_reasoning_end_index(reasoner, all_token_ids, start)
-
-            structured_req.reasoning_end_token_index = end_index
+            structured_req.reasoning_end_token_index = self._find_reasoning_end_index(
+                reasoner, all_token_ids, start
+            )
             return True
 
         return False
