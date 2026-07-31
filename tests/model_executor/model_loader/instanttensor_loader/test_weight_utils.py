@@ -86,5 +86,29 @@ def test_instanttensor_honors_tensor_to_shard_index(tmp_path):
     assert weights["model.expert.weight"].tolist() == [3.0, 3.0, 3.0]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="InstantTensor requires NVIDIA GPUs",
+)
+def test_instanttensor_falls_back_for_tensor_larger_than_ring(
+    tmp_path, monkeypatch
+):
+    shard = tmp_path / "model.safetensors"
+    small = torch.arange(256 * 1024, dtype=torch.float32)
+    large = torch.arange(9 * 256 * 1024, dtype=torch.float32)
+    save_file({"model.small": small, "model.large": large}, shard)
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(8 * 1024 * 1024))
+
+    weights = {
+        name: tensor.cpu()
+        for name, tensor in instanttensor_weights_iterator(
+            [str(shard)], use_tqdm_on_load=False
+        )
+    }
+
+    torch.testing.assert_close(weights["model.small"], small)
+    torch.testing.assert_close(weights["model.large"], large)
+
+
 if __name__ == "__main__":
     test_instanttensor_model_loader()

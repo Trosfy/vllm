@@ -1260,7 +1260,23 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
-    restrict_before_io = indexed_tensor_files is not None or bool(weight_name_prefixes)
+    configured_buffer_size = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
+    max_gpu_tensor_size = None
+    if configured_buffer_size is not None:
+        try:
+            max_gpu_tensor_size = int(configured_buffer_size)
+        except ValueError as e:
+            raise ValueError(
+                "INSTANTTENSOR_BUFFER_SIZE must be an integer number of bytes"
+            ) from e
+        if max_gpu_tensor_size <= 0:
+            raise ValueError("INSTANTTENSOR_BUFFER_SIZE must be greater than zero")
+
+    restrict_before_io = (
+        indexed_tensor_files is not None
+        or bool(weight_name_prefixes)
+        or max_gpu_tensor_size is not None
+    )
     instant_open = instanttensor.safe_open(
         list(hf_weights_files),
         framework="pt",
@@ -1273,28 +1289,50 @@ def instanttensor_weights_iterator(
         # a consumer-stream event before reusing its ring-buffer storage.
         copy=False,
     )
+    cpu_fallback_weights: list[tuple[str, str]] = []
     if restrict_before_io:
-        _restrict_instanttensor_to_selected_ranges(
+        cpu_fallback_weights = _restrict_instanttensor_to_selected_ranges(
             instant_open,
             indexed_tensor_files=indexed_tensor_files,
             weight_name_prefixes=weight_name_prefixes,
+            max_tensor_size=max_gpu_tensor_size,
         )
 
-    with instant_open as f:
-        for name, tensor in tqdm(
-            f.tensors(),
-            desc="Loading safetensors using InstantTensor loader",
-            disable=not enable_tqdm(use_tqdm_on_load),
-            bar_format=_BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-            total=len(f.keys()),
-            mininterval=1.0,
-        ):
-            if weight_name_prefixes and not _matches_weight_name_prefixes(
-                name, weight_name_prefixes
+    if instant_open.ordered_tensor_metadatas:
+        with instant_open as f:
+            for name, tensor in tqdm(
+                f.tensors(),
+                desc="Loading safetensors using InstantTensor loader",
+                disable=not enable_tqdm(use_tqdm_on_load),
+                bar_format=_BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+                total=len(f.keys()),
+                mininterval=1.0,
             ):
-                continue
-            yield name, tensor
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
+                yield name, tensor
+            # A generator frame retains its last loop value. Drop the final
+            # DLPack view before closing InstantTensor so the ring-buffer
+            # allocation cannot outlive the streaming phase.
+            del tensor
+
+    if cpu_fallback_weights:
+        logger.info_once(
+            "Loading %d tensors larger than the %d-byte InstantTensor ring "
+            "through CPU safetensors",
+            len(cpu_fallback_weights),
+            max_gpu_tensor_size,
+        )
+        fallback_by_file: dict[str, list[str]] = defaultdict(list)
+        for name, filename in cpu_fallback_weights:
+            fallback_by_file[filename].append(name)
+        for filename, names in fallback_by_file.items():
+            with safe_open(filename, framework="pt", device="cpu") as fallback_file:
+                for name in names:
+                    yield name, fallback_file.get_tensor(name)
 
 
 def _restrict_instanttensor_to_selected_ranges(
@@ -1302,7 +1340,8 @@ def _restrict_instanttensor_to_selected_ranges(
     *,
     indexed_tensor_files: dict[str, str] | None,
     weight_name_prefixes: Sequence[str] | None,
-) -> None:
+    max_tensor_size: int | None = None,
+) -> list[tuple[str, str]]:
     """Replace an unopened InstantTensor layout with selected physical ranges.
 
     InstantTensor 0.1.9 exposes the metadata and offset arrays used by its C++
@@ -1336,6 +1375,7 @@ def _restrict_instanttensor_to_selected_ranges(
     selected_filenames: list[str] = []
     selected_metadata: list[tuple[str, dict[str, object]]] = []
     selected_offsets: list[tuple[int, int]] = []
+    cpu_fallback_weights: list[tuple[str, str]] = []
     metadata_pos = 0
     offset_pos = 0
 
@@ -1359,14 +1399,25 @@ def _restrict_instanttensor_to_selected_ranges(
             )
 
         keep = []
-        for name in physical_names:
+        for item_index, name in enumerate(physical_names):
             indexed_here = indexed_tensor_files is None or (
                 indexed_tensor_files.get(name) == filename_abs
             )
             prefix_matches = not weight_name_prefixes or _matches_weight_name_prefixes(
                 name, weight_name_prefixes
             )
-            keep.append(indexed_here and prefix_matches)
+            selected_here = indexed_here and prefix_matches
+            tensor_size = int(file_offsets[item_index + 1][1]) - int(
+                file_offsets[item_index][1]
+            )
+            use_cpu_fallback = (
+                selected_here
+                and max_tensor_size is not None
+                and tensor_size > max_tensor_size
+            )
+            keep.append(selected_here and not use_cpu_fallback)
+            if use_cpu_fallback:
+                cpu_fallback_weights.append((name, filename))
 
         run_start = 0
         while run_start < tensor_count:
@@ -1395,9 +1446,6 @@ def _restrict_instanttensor_to_selected_ranges(
         raise RuntimeError(
             "InstantTensor layout contains unaccounted metadata or offsets"
         )
-    if not selected_metadata:
-        raise RuntimeError("InstantTensor index/prefix selection matched no tensors")
-
     selected_names = [name for name, _ in selected_metadata]
     if len(selected_names) != len(set(selected_names)):
         raise RuntimeError(
@@ -1407,6 +1455,12 @@ def _restrict_instanttensor_to_selected_ranges(
         int(item["data_offsets"][1]) - int(item["data_offsets"][0])
         for _, item in selected_metadata
     ]
+    fallback_names = [name for name, _ in cpu_fallback_weights]
+    if len(fallback_names) != len(set(fallback_names)):
+        raise RuntimeError(
+            "InstantTensor CPU fallback selection contains duplicate tensor names"
+        )
+
     instant_open.filename = selected_filenames
     instant_open.ordered_tensor_metadatas = selected_metadata
     instant_open.tensor_name_to_index = {
@@ -1416,7 +1470,11 @@ def _restrict_instanttensor_to_selected_ranges(
     instant_open.tensor_sizes = selected_sizes
     instant_open.total_tensor_size = sum(selected_sizes)
     # Recompute the ring buffer against selected tensors and their I/O layout.
-    instant_open._determine_buffer_size(None)
+    if selected_metadata:
+        instant_open._determine_buffer_size(None)
+    elif not cpu_fallback_weights:
+        raise RuntimeError("InstantTensor index/prefix selection matched no tensors")
+    return cpu_fallback_weights
 
 
 def pt_weights_iterator(
