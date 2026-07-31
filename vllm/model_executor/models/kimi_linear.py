@@ -54,7 +54,14 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
-from .interfaces import HasInnerState, IsHybrid, MixtureOfExperts, SupportsPP
+from .interfaces import (
+    EagleModelMixin,
+    HasInnerState,
+    IsHybrid,
+    MixtureOfExperts,
+    SupportsEagle3,
+    SupportsPP,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -677,7 +684,7 @@ class KimiDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class KimiLinearModel(nn.Module):
+class KimiLinearModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -778,7 +785,7 @@ class KimiLinearModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -789,6 +796,13 @@ class KimiLinearModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        aux_hidden_states: list[torch.Tensor] = []
+        if self.start_layer in self.aux_hidden_state_layers:
+            if self.use_attn_res or residual is None:
+                aux_hidden_states.append(hidden_states)
+            else:
+                aux_hidden_states.append(hidden_states + residual)
 
         prefix_sum = None
         if self.use_attn_res:
@@ -817,7 +831,8 @@ class KimiLinearModel(nn.Module):
                 flush=True,
             )
         for _li, layer in enumerate(
-            self.layers[self.start_layer : self.end_layer]
+            self.layers[self.start_layer : self.end_layer],
+            start=self.start_layer,
         ):
             hidden_states, prefix_sum, residual = layer(
                 positions=positions,
@@ -825,6 +840,14 @@ class KimiLinearModel(nn.Module):
                 residual=residual,
                 prefix_sum=prefix_sum,
             )
+            if (_li + 1) in self.aux_hidden_state_layers:
+                if self.use_attn_res:
+                    assert prefix_sum is not None
+                    aux_hidden_state = prefix_sum + hidden_states
+                else:
+                    assert residual is not None
+                    aux_hidden_state = hidden_states + residual
+                aux_hidden_states.append(aux_hidden_state)
             if _dbg and (_li < 6 or _li % 8 == 0 or _li >= 90):
                 _h = hidden_states.float().norm(dim=-1).mean().item()
                 _p = (
@@ -880,6 +903,8 @@ class KimiLinearModel(nn.Module):
                 f"{hidden_states.float().norm(dim=-1).mean().item():.4f}",
                 flush=True,
             )
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -941,8 +966,7 @@ class KimiLinearModel(nn.Module):
             if em is not None and expert_params_mapping:
                 eprefix, eid, wkey, esuffix = em.groups()
                 mapped = (
-                    f"{eprefix}."
-                    f"{'w13_' if wkey in ('w1', 'w3') else 'w2_'}{esuffix}"
+                    f"{eprefix}.{'w13_' if wkey in ('w1', 'w3') else 'w2_'}{esuffix}"
                 )
                 if is_pp_missing_parameter(mapped, self):
                     continue
@@ -1086,7 +1110,7 @@ class KimiLinearForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
@@ -1142,7 +1166,12 @@ class KimiLinearForCausalLM(
 
 
 class KimiK3ForConditionalGeneration(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsEagle3,
 ):
     """Text-only Kimi K3 model."""
 
@@ -1169,7 +1198,7 @@ class KimiK3ForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         return self.language_model(
             input_ids=input_ids,
             positions=positions,
