@@ -446,6 +446,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   if(VLLM_GPU_LANG STREQUAL "CUDA")
+    list(APPEND VLLM_STABLE_EXT_SRC
+      "csrc/libtorch_stable/attention/mla/safe_query_bmm.cu")
+
     SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
     # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
@@ -1154,6 +1157,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    find_library(VLLM_CUBLAS_LIBRARY cublas
+      PATHS "/usr/local/cuda/lib64" "/usr/local/cuda/lib" NO_DEFAULT_PATH)
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      find_library(VLLM_CUBLAS_LIBRARY cublas)
+    endif()
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      message(FATAL_ERROR "safe_mla_query_bmm requires libcublas")
+    endif()
+    target_link_libraries(_C_stable_libtorch PRIVATE ${VLLM_CUBLAS_LIBRARY})
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_COOPERATIVE_TOPK=1)
