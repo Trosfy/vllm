@@ -102,6 +102,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
+    is_quantized_kv_cache,
 )
 
 
@@ -739,6 +740,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        self._fp8_kv = is_quantized_kv_cache(self.kv_cache_dtype)
         # MiniMax-M3 sparse attention owns its KV-cache insert/read path instead
         # of wrapping the generic Attention module. Keep the same runtime scale
         # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
@@ -906,7 +908,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             (num_tokens, self.index_q_size),
             dtype=self.indexer.index_cache.dtype,
         )
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        insert_via_fused = not torch.compiler.is_compiling() and not self._fp8_kv
+        kv_cache_dummy_dep = None
+        _run_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,

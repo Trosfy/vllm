@@ -463,6 +463,7 @@ def test_minimax_m3_sparse_attention_compile_path_avoids_python_slot_mapping(
     layer.q_size = 4
     layer.index_q_size = 3
     layer.hidden_size = 4
+    layer.kv_cache_dtype = "auto"
     layer._fp8_kv = False
     layer.q_norm = SimpleNamespace(
         weight=torch.empty(layer.head_dim),
@@ -479,6 +480,7 @@ def test_minimax_m3_sparse_attention_compile_path_avoids_python_slot_mapping(
         index_cache=SimpleNamespace(
             prefix="layers.3.self_attn.index_cache",
             kv_cache=torch.empty(1, 2, layer.idx_head_dim),
+            dtype=torch.float32,
         )
     )
     layer.kv_cache = torch.empty(1, 2, 2, layer.num_kv_heads, layer.head_dim)
