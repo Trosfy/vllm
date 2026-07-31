@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the sparse MLA backends and utilities."""
 
+import importlib.util
 import math
 from types import MethodType, SimpleNamespace
 
@@ -35,7 +36,14 @@ if not current_platform.is_cuda():
     )
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xMLASparseBackend,
+    B12xMLASparseImpl,
+    B12xMLASparseMetadataBuilder,
+    _global_causal_lens_for_ckv_gather,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+    FlashInferMLASparseSM120Backend,
     FlashInferMLASparseTRTLLMBackend,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -71,6 +79,613 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("global_seq_lens", "query_start_loc", "req_ids", "expected"),
+    [
+        ([8], [0, 4], [0, 0, 0, 0], [5, 6, 7, 8]),
+        ([5, 10], [0, 2, 5], [0, 0, 1, 1, 1], [4, 5, 8, 9, 10]),
+    ],
+)
+def test_ckv_gather_uses_global_per_token_causal_lens(
+    global_seq_lens: list[int],
+    query_start_loc: list[int],
+    req_ids: list[int],
+    expected: list[int],
+) -> None:
+    device = torch.device(DEVICE_TYPE)
+    result = _global_causal_lens_for_ckv_gather(
+        torch.tensor(global_seq_lens, dtype=torch.int32, device=device),
+        torch.tensor(query_start_loc, dtype=torch.int32, device=device),
+        torch.tensor(req_ids, dtype=torch.int32, device=device),
+        len(req_ids),
+    )
+
+    assert result.dtype == torch.int32
+    assert result.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    ("batch_spec", "local_seq_lens", "expected_req_ids", "expected_token_lens"),
+    [
+        (BatchSpec(seq_lens=[5, 8], query_lens=[1, 1]), [2, 4], [0, 1], [2, 4]),
+        (BatchSpec(seq_lens=[5], query_lens=[2]), [2], [0, 0], [2, 2]),
+    ],
+)
+def test_b12x_sparse_dcp_metadata_uses_local_causal_lens(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_spec: BatchSpec,
+    local_seq_lens: list[int],
+    expected_req_ids: list[int],
+    expected_token_lens: list[int],
+) -> None:
+    from vllm.distributed import parallel_state
+
+    class FakeDCPGroup:
+        rank_in_group = 1
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
+
+    hf_config = SimpleNamespace(
+        index_topk=2048,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=4,
+            max_num_seqs=4,
+        ),
+    )
+    metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=64,
+        device=torch.device(DEVICE_TYPE),
+    )
+    metadata.dcp_local_seq_lens = torch.tensor(
+        local_seq_lens, dtype=torch.int32, device=DEVICE_TYPE
+    )
+    builder = B12xMLASparseMetadataBuilder(
+        SimpleNamespace(block_size=64),
+        ["placeholder"],
+        vllm_config,
+        torch.device(DEVICE_TYPE),
+    )
+
+    result = builder.build(0, metadata)
+
+    assert result.req_id_per_token is not None
+    assert result.req_id_per_token.tolist() == expected_req_ids
+    assert result.cache_seq_lens_per_req.tolist() == local_seq_lens
+    assert result.cache_seq_lens_per_token.tolist() == expected_token_lens
+    assert result.page_table_1 is not None
+    assert result.nsa_cache_seqlens is not None
+
+
+def test_b12x_sparse_dcp1_metadata_uses_exact_gpu_positions() -> None:
+    batch_spec = BatchSpec(seq_lens=[5, 8], query_lens=[2, 3])
+    hf_config = SimpleNamespace(
+        index_topk=512,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8,
+            max_num_seqs=2,
+        ),
+    )
+    metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=64,
+        device=torch.device(DEVICE_TYPE),
+    )
+    metadata.positions = torch.tensor(
+        [3, 4, 5, 6, 7], dtype=torch.int64, device=DEVICE_TYPE
+    )
+    # Async scheduling may expose a stale conservative CPU bound after a request
+    # slot is recycled. It must not become the verifier's causal attention mask.
+    metadata.seq_lens_cpu_upper_bound = torch.tensor([500, 800], dtype=torch.int32)
+    builder = B12xMLASparseMetadataBuilder(
+        SimpleNamespace(block_size=64),
+        ["placeholder"],
+        vllm_config,
+        torch.device(DEVICE_TYPE),
+    )
+
+    result = builder.build(0, metadata)
+
+    assert metadata.positions is not None
+    assert result.cache_seq_lens_per_token.tolist() == [4, 5, 6, 7, 8]
+    assert result.req_id_per_token is None
+    assert result.page_table_1 is None
+    assert result.nsa_cache_seqlens is None
+
+
+@pytest.mark.parametrize(
+    ("dcp_world_size", "output_physical_slots", "expected_output"),
+    [
+        (1, False, "physical"),
+        (2, True, "logical"),
+    ],
+)
+def test_b12x_sparse_rejects_incompatible_indexer_output(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_world_size: int,
+    output_physical_slots: bool,
+    expected_output: str,
+) -> None:
+    from vllm.distributed import parallel_state
+
+    class FakeDCPGroup:
+        world_size = dcp_world_size
+        rank_in_group = 0
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
+    default_vllm_config.parallel_config.decode_context_parallel_size = dcp_world_size
+    indexer = SimpleNamespace(
+        topk_indices_buffer=torch.empty((1, 2048), dtype=torch.int32),
+        output_physical_slots=output_physical_slots,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"requires {expected_output} sparse-indexer output",
+    ):
+        B12xMLASparseImpl(
+            num_heads=8,
+            head_size=576,
+            scale=1.0 / math.sqrt(576),
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8_ds_mla",
+            logits_soft_cap=None,
+            attn_type="decoder",
+            kv_sharing_target_layer_name=None,
+            indexer=indexer,
+            kv_lora_rank=512,
+            qk_nope_head_dim=512,
+            qk_rope_head_dim=64,
+            v_head_dim=512,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_rows"),
+    [("0", 2), ("auto", 8), ("1", 16)],
+)
+def test_b12x_sparse_spec_decode_scratch_capacity(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+    mode: str,
+    expected_rows: int,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
+
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 64
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+    default_vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    monkeypatch.setenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", mode)
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+
+    impl = B12xMLASparseImpl(
+        num_heads=8,
+        head_size=576,
+        scale=1.0 / math.sqrt(576),
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=torch.zeros(
+            (64, 2048), dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+
+    assert impl._decode_max_rows == expected_rows
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "kernel_num_heads"), [(8, 8), (11, 16), (24, 24)]
+)
+def test_b12x_sparse_glm_uses_8_head_alignment(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+    num_heads: int,
+    kernel_num_heads: int,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
+
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 2
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+
+    topk_indices = torch.zeros((2, 2048), dtype=torch.int32, device=DEVICE_TYPE)
+    impl = B12xMLASparseImpl(
+        num_heads=num_heads,
+        head_size=576,
+        scale=1.0 / math.sqrt(576),
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=topk_indices,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+
+    # TP=8 keeps GLM's 8 local heads native; virtual TP=6 exposes 11 local
+    # heads and pads only the kernel-facing tail to the next 8-head boundary.
+    assert impl._kernel_num_heads == kernel_num_heads
+    assert impl._pad_heads is (num_heads != kernel_num_heads)
+    assert impl._decode_plan.caps.num_q_heads == kernel_num_heads
+    assert impl._extend_plan.caps.num_q_heads == kernel_num_heads
+
+    captured: dict[str, tuple[int, ...]] = {}
+    real_decode_forward = impl._sparse_mla_decode_forward
+
+    def fake_decode_forward(*, binding, **kwargs):
+        captured["q_shape"] = tuple(binding.q.shape)
+        if num_heads == 8:
+            return real_decode_forward(binding=binding, **kwargs)
+        output = binding.scratch.output_buffer[: binding.q.shape[0]]
+        output.zero_()
+        return output
+
+    impl._sparse_mla_decode_forward = fake_decode_forward
+    q_nope = torch.zeros((1, num_heads, 512), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    q_rope = torch.zeros((1, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv_cache = torch.zeros((1, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
+    metadata = SimpleNamespace(
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=DEVICE_TYPE),
+        block_size=64,
+        cache_seq_lens_per_token=torch.full(
+            (1,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        cache_seq_lens_per_req=torch.full(
+            (1,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        max_query_len=1,
+        num_reqs=1,
+    )
+
+    output, lse = impl.forward_mqa((q_nope, q_rope), kv_cache, metadata, layer=None)
+    assert captured["q_shape"] == (1, kernel_num_heads, 576)
+    assert output.shape == (1, num_heads, 512)
+    assert lse is None
+
+    if num_heads == 8:
+        import sparkinfer.attention._shared.mla.kernel as b12x_mla_kernel
+
+        torch.accelerator.synchronize()
+        assert torch.isfinite(output).all()
+        assert b12x_mla_kernel.LAST_DECODE_PLAN.get("native_glm_h8") is True
+
+        q_nope = torch.zeros(
+            (2, num_heads, 512), dtype=torch.bfloat16, device=DEVICE_TYPE
+        )
+        q_rope = torch.zeros(
+            (2, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE
+        )
+        metadata.cache_seq_lens_per_token = torch.full(
+            (2,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        )
+        metadata.max_query_len = 2
+        output, lse = impl.forward_mqa((q_nope, q_rope), kv_cache, metadata, layer=None)
+        torch.accelerator.synchronize()
+        assert output.shape == (2, 8, 512)
+        assert torch.isfinite(output).all()
+        assert lse is None
+
+
+def test_b12x_sparse_nvfp4_uses_kernel_format_not_scratch_caps(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
+
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 2
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+
+    impl = B12xMLASparseImpl(
+        num_heads=8,
+        head_size=576,
+        scale=1.0 / math.sqrt(576),
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="nvfp4_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=torch.zeros(
+            (2, 2048), dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+
+    # Scratch shape depends on query/output geometry, not the packed KV record.
+    # NVFP4 specialization belongs on every kernel call instead.
+    assert not hasattr(impl._decode_plan.caps, "kv_cache_dtype")
+    assert not hasattr(impl._extend_plan.caps, "kv_cache_dtype")
+    assert impl._b12x_kernel_format_kwargs(0.75) == {
+        "latent_scale": 0.75,
+        "scale_format": 2,
+    }
+
+
+def test_b12x_sparse_glm_dcp_expands_heads_and_converts_topk(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
+
+    from vllm.distributed import parallel_state
+
+    class FakeDCPGroup:
+        world_size = 2
+        rank_in_group = 1
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
+    default_vllm_config.parallel_config.decode_context_parallel_size = 2
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 2
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+
+    local_heads = 8
+    gathered_heads = 16
+    kernel_heads = 16
+    topk = 2048
+    topk_indices = torch.zeros((2, topk), dtype=torch.int32, device=DEVICE_TYPE)
+    topk_indices[0] = torch.arange(
+        1, 2 * topk, 2, dtype=torch.int32, device=DEVICE_TYPE
+    )
+    impl = B12xMLASparseImpl(
+        num_heads=local_heads,
+        head_size=576,
+        scale=1.0 / math.sqrt(576),
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=topk_indices,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+
+    assert impl._input_num_heads == gathered_heads
+    assert impl._kernel_num_heads == kernel_heads
+    assert impl._decode_plan.caps.num_q_heads == kernel_heads
+    assert impl._extend_plan.caps.num_q_heads == kernel_heads
+
+    q = torch.zeros((1, gathered_heads, 576), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv_cache = torch.zeros((1, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.zeros((1,), dtype=torch.int32, device=DEVICE_TYPE),
+        page_table_1=torch.empty((1, topk), dtype=torch.int32, device=DEVICE_TYPE),
+        nsa_cache_seqlens=torch.empty((1,), dtype=torch.int32, device=DEVICE_TYPE),
+        block_table=torch.arange(32, dtype=torch.int32, device=DEVICE_TYPE).view(1, 32),
+        block_size=64,
+        cache_seq_lens_per_token=torch.full(
+            (1,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        cache_seq_lens_per_req=torch.full(
+            (1,), 64, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        max_query_len=1,
+        num_reqs=1,
+    )
+
+    output, lse = impl.forward_mqa(q, kv_cache, metadata, layer=None)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(
+        metadata.page_table_1[0, :64],
+        torch.arange(64, dtype=torch.int32, device=DEVICE_TYPE),
+    )
+    assert torch.count_nonzero(metadata.page_table_1[0, 64:] != -1) == 0
+    assert metadata.nsa_cache_seqlens.item() == 64
+    assert output.shape == (1, gathered_heads, 512)
+    assert torch.isfinite(output).all()
+    assert lse is not None
+    assert lse.shape == (1, gathered_heads)
+    assert torch.isfinite(lse).all()
+
+
+def test_b12x_sparse_glm_dcp_matches_unsharded_gpu(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+) -> None:
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
+
+    from vllm.distributed import parallel_state
+
+    dcp_group = SimpleNamespace(world_size=2, rank_in_group=0)
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(
+        B12xMLASparseImpl,
+        "_prewarm_extend_kernels_once",
+        lambda self, max_batched: None,
+    )
+    default_vllm_config.scheduler_config.max_num_batched_tokens = 2
+    default_vllm_config.scheduler_config.max_num_seqs = 2
+
+    num_tokens = 128
+    local_heads = 8
+    gathered_heads = local_heads * dcp_group.world_size
+    topk = 2048
+    logical_topk = torch.full((2, topk), -1, dtype=torch.int32, device=DEVICE_TYPE)
+    logical_topk[0, :num_tokens] = torch.arange(
+        num_tokens, dtype=torch.int32, device=DEVICE_TYPE
+    )
+
+    torch.manual_seed(7)
+    q = torch.randn((1, gathered_heads, 576), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv_c = torch.randn((num_tokens, 512), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    k_pe = torch.randn((num_tokens, 64), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    full_kv_cache = torch.zeros((2, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
+    ops.concat_and_cache_mla(
+        kv_c,
+        k_pe,
+        full_kv_cache,
+        torch.arange(num_tokens, dtype=torch.long, device=DEVICE_TYPE),
+        kv_cache_dtype="fp8_ds_mla",
+        scale=torch.ones((), dtype=torch.float32, device=DEVICE_TYPE),
+    )
+
+    def make_impl(num_heads: int, topk_indices: torch.Tensor) -> B12xMLASparseImpl:
+        return B12xMLASparseImpl(
+            num_heads=num_heads,
+            head_size=576,
+            scale=1.0 / math.sqrt(576),
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8_ds_mla",
+            logits_soft_cap=None,
+            attn_type="decoder",
+            kv_sharing_target_layer_name=None,
+            topk_indices_buffer=topk_indices,
+            kv_lora_rank=512,
+            qk_nope_head_dim=512,
+            qk_rope_head_dim=64,
+            v_head_dim=512,
+        )
+
+    def make_metadata(local_seq_len: int, block_table: torch.Tensor):
+        return SimpleNamespace(
+            req_id_per_token=torch.zeros((1,), dtype=torch.int32, device=DEVICE_TYPE),
+            page_table_1=torch.empty((1, topk), dtype=torch.int32, device=DEVICE_TYPE),
+            nsa_cache_seqlens=torch.empty((1,), dtype=torch.int32, device=DEVICE_TYPE),
+            block_table=block_table,
+            block_size=64,
+            cache_seq_lens_per_token=torch.full(
+                (1,), local_seq_len, dtype=torch.int32, device=DEVICE_TYPE
+            ),
+            cache_seq_lens_per_req=torch.full(
+                (1,), local_seq_len, dtype=torch.int32, device=DEVICE_TYPE
+            ),
+            max_query_len=1,
+            num_reqs=1,
+        )
+
+    default_vllm_config.parallel_config.decode_context_parallel_size = 2
+    rank_outputs = []
+    rank_lses = []
+    full_kv_flat = full_kv_cache.view(num_tokens, 656)
+    for rank in range(dcp_group.world_size):
+        dcp_group.rank_in_group = rank
+        impl = make_impl(local_heads, logical_topk)
+        local_kv_cache = full_kv_flat[rank::2].contiguous().view(1, 64, 656)
+        metadata = make_metadata(
+            64,
+            torch.zeros((1, 1), dtype=torch.int32, device=DEVICE_TYPE),
+        )
+        output, lse = impl.forward_mqa(q, local_kv_cache, metadata, layer=None)
+        assert lse is not None
+        rank_outputs.append(output.float().clone())
+        rank_lses.append(lse.float().clone())
+
+    default_vllm_config.parallel_config.decode_context_parallel_size = 1
+    dcp_group.world_size = 1
+    dcp_group.rank_in_group = 0
+    unsharded_impl = make_impl(gathered_heads, logical_topk)
+    unsharded_metadata = make_metadata(
+        num_tokens,
+        torch.arange(2, dtype=torch.int32, device=DEVICE_TYPE).view(1, 2),
+    )
+    expected, lse = unsharded_impl.forward_mqa(
+        q, full_kv_cache, unsharded_metadata, layer=None
+    )
+    assert lse is None
+
+    lses = torch.stack(rank_lses)
+    weights = torch.softmax(lses, dim=0).unsqueeze(-1)
+    actual = (weights * torch.stack(rank_outputs)).sum(dim=0)
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(actual, expected.float(), rtol=0.03, atol=0.03)
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
@@ -180,8 +795,12 @@ def _quantize_dequantize_fp8_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseTRTLLMBackend],
-    ids=["FlashMLA", "FlashInferTRTLLM"],
+    [
+        FlashMLASparseBackend,
+        FlashInferMLASparseTRTLLMBackend,
+        B12xMLASparseBackend,
+    ],
+    ids=["FlashMLA", "FlashInferTRTLLM", "B12x"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_ds_mla"])
@@ -229,6 +848,16 @@ def test_sparse_backend_decode_correctness(
             device_capability
         ):
             pytest.skip("FlashInferMLASparseTRTLLMBackend requires SM 10.x capability")
+    elif backend_cls in (B12xMLASparseBackend, FlashInferMLASparseSM120Backend):
+        if not current_platform.has_device_capability(120):
+            pytest.skip(f"{backend_cls.get_name()} requires SM 12.0")
+        if (
+            backend_cls is B12xMLASparseBackend
+            and importlib.util.find_spec("sparkinfer") is None
+        ):
+            pytest.skip("sparkinfer package not available")
+        if kv_cache_dtype != "fp8_ds_mla":
+            pytest.skip("SM120 sparse MLA is validated with the fp8_ds_mla cache")
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
@@ -246,7 +875,14 @@ def test_sparse_backend_decode_correctness(
     qk_rope_head_dim = 64
     v_head_dim = 128
     head_size = kv_lora_rank + qk_rope_head_dim
-    topk_tokens = 128
+    # GLM 5.2 selects 2048 rows. Keep the shared backend test small for other
+    # implementations, but validate b12x at the model's real contract instead of
+    # relying on a smaller kernel-supported regime.
+    topk_tokens = (
+        2048
+        if backend_cls in (B12xMLASparseBackend, FlashInferMLASparseSM120Backend)
+        else 128
+    )
 
     max_seqlen = max(batch_spec.seq_lens)
     total_cache_tokens = sum(batch_spec.seq_lens)
@@ -271,7 +907,11 @@ def test_sparse_backend_decode_correctness(
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
-        model_type="deepseek_v2",
+        model_type=(
+            "glm4_moe"
+            if backend_cls in (B12xMLASparseBackend, FlashInferMLASparseSM120Backend)
+            else "deepseek_v2"
+        ),
     )
     model_config.dtype = dtype
     model_config.get_num_attention_heads = MethodType(
@@ -366,13 +1006,24 @@ def test_sparse_backend_decode_correctness(
         k_pe_full = torch.rand(s_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
 
         if use_fp8_ds_mla_quantization:
-            is_sm100 = torch.cuda.get_device_capability()[0] >= 10
+            # The SM100 FlashInfer/FlashMLA kernels read ue8m0 (power-of-2) block
+            # scales, so the reference truncates scales to match. SparkInfer's
+            # GLM_NSA
+            # kernel instead keeps the raw e4m3 K with the inline arbitrary-FP32
+            # group scale (it is incompatible with ue8m0 block-scaling), so for
+            # B12x the reference must dequantize with the true FP32 scales.
+            uses_pow2_scales = torch.cuda.get_device_capability()[
+                0
+            ] >= 10 and backend_cls not in (
+                B12xMLASparseBackend,
+                FlashInferMLASparseSM120Backend,
+            )
             kv_c_full, k_pe_squeezed = _quantize_dequantize_fp8_ds_mla(
                 kv_c_full,
                 k_pe_full.squeeze(1),
                 block_size=block_size,
                 scale=kv_cache_scale,
-                simulate_sm100_e8m0_scales=is_sm100,
+                simulate_sm100_e8m0_scales=uses_pow2_scales,
             )
             k_pe_full = k_pe_squeezed.unsqueeze(1)
 
@@ -471,8 +1122,27 @@ def test_sparse_backend_decode_correctness(
         common_prefix_len=0, common_attn_metadata=common_attn_metadata
     )
 
-    # Use the pre-computed sparse_indices for the mock indexer
-    mock_indexer = SimpleNamespace(topk_indices_buffer=sparse_indices)
+    # B12X owns both ends of the GLM sparse-attention pipeline, so its indexer
+    # buffer already contains native physical cache slots. Other backends retain
+    # the request-relative sparse-index contract exercised by this shared test.
+    backend_sparse_indices = sparse_indices
+    output_physical_slots = backend_cls is B12xMLASparseBackend
+    if output_physical_slots:
+        req_ids = torch.repeat_interleave(
+            torch.arange(batch_spec.batch_size, dtype=torch.int32, device=device),
+            torch.tensor(query_lens, dtype=torch.int64, device=device),
+        )
+        backend_sparse_indices = triton_convert_req_index_to_global_index(
+            req_ids,
+            common_attn_metadata.block_table_tensor,
+            sparse_indices,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_tokens,
+        )
+    mock_indexer = SimpleNamespace(
+        topk_indices_buffer=backend_sparse_indices,
+        output_physical_slots=output_physical_slots,
+    )
 
     kv_b_proj_weight = torch.cat([W_UK, W_UV], dim=-1)
     kv_b_proj_weight = kv_b_proj_weight.view(
@@ -552,6 +1222,140 @@ def test_sparse_backend_decode_correctness(
         )
     else:
         torch.testing.assert_close(backend_output, sdpa_reference, rtol=0.01, atol=0.01)
+
+
+@pytest.mark.parametrize(
+    ("batch_name", "mode", "is_prefilling", "expected_path"),
+    [
+        ("spec_decode_small", "0", False, "extend"),
+        ("spec_decode_small", "auto", False, "decode"),
+        ("spec_decode_medium", "auto", False, "decode"),
+        ("spec_decode_small", "auto", True, "extend"),
+        ("spec_decode_small", "1", True, "decode"),
+    ],
+)
+def test_b12x_sparse_spec_decode_causality(
+    default_vllm_config,
+    dist_init,
+    workspace_init,
+    monkeypatch: pytest.MonkeyPatch,
+    batch_name: str,
+    mode: str,
+    is_prefilling: bool,
+    expected_path: str,
+) -> None:
+    """Both verifier paths must match token-wise causal SDPA."""
+    if not current_platform.has_device_capability(120):
+        pytest.skip("B12xMLASparseBackend requires SM 12.0 (consumer Blackwell)")
+
+    sparse_mla = pytest.importorskip("sparkinfer.attention.sparse_mla")
+    calls = {"decode": 0, "extend": 0}
+
+    def track_path(name, fn):
+        def wrapped(*args, **kwargs):
+            calls[name] += 1
+            return fn(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(
+        sparse_mla,
+        "run_decode",
+        track_path("decode", sparse_mla.run_decode),
+    )
+    monkeypatch.setattr(
+        sparse_mla,
+        "run_extend",
+        track_path("extend", sparse_mla.run_extend),
+    )
+    monkeypatch.setenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", mode)
+    monkeypatch.setitem(SPARSE_BACKEND_BATCH_SPECS, batch_name, BATCH_SPECS[batch_name])
+
+    batch_spec = BATCH_SPECS[batch_name]
+    original_create_vllm_config = create_vllm_config
+    original_create_common_attn_metadata = create_common_attn_metadata
+
+    def create_spec_vllm_config(*args, **kwargs):
+        config = original_create_vllm_config(*args, **kwargs)
+        config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=max(batch_spec.query_lens) - 1
+        )
+        return config
+
+    def create_spec_common_attn_metadata(*args, **kwargs):
+        metadata = original_create_common_attn_metadata(*args, **kwargs)
+        metadata.is_prefilling = torch.full(
+            (metadata.num_reqs,), is_prefilling, dtype=torch.bool
+        )
+        return metadata
+
+    monkeypatch.setitem(globals(), "create_vllm_config", create_spec_vllm_config)
+    monkeypatch.setitem(
+        globals(), "create_common_attn_metadata", create_spec_common_attn_metadata
+    )
+
+    test_sparse_backend_decode_correctness(
+        default_vllm_config=default_vllm_config,
+        dist_init=dist_init,
+        backend_cls=B12xMLASparseBackend,
+        batch_name=batch_name,
+        kv_cache_dtype="fp8_ds_mla",
+        tensor_parallel_size=8,
+        block_size=64,
+        workspace_init=workspace_init,
+        q_scale=1.0,
+        k_scale=1.0,
+    )
+
+    assert calls[expected_path] > 0
+    assert calls["decode" if expected_path == "extend" else "extend"] == 0
+
+
+@pytest.mark.parametrize("batch_name", ["spec_decode_small", "spec_decode_medium"])
+def test_flashinfer_sm120_sparse_spec_decode_causality(
+    default_vllm_config,
+    dist_init,
+    workspace_init,
+    monkeypatch: pytest.MonkeyPatch,
+    batch_name: str,
+) -> None:
+    """FlashInfer's flattened verifier rows must remain token-wise causal."""
+    if not current_platform.has_device_capability(120):
+        pytest.skip("FlashInferMLASparseSM120Backend requires SM 12.0")
+
+    from vllm.utils import flashinfer as flashinfer_utils
+
+    calls = []
+    original_decode = flashinfer_utils.flashinfer_trtllm_batch_decode_with_kv_cache_mla
+
+    def track_decode(*args, **kwargs):
+        calls.append(kwargs)
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(
+        flashinfer_utils,
+        "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
+        track_decode,
+    )
+    monkeypatch.setitem(SPARSE_BACKEND_BATCH_SPECS, batch_name, BATCH_SPECS[batch_name])
+
+    test_sparse_backend_decode_correctness(
+        default_vllm_config=default_vllm_config,
+        dist_init=dist_init,
+        backend_cls=FlashInferMLASparseSM120Backend,
+        batch_name=batch_name,
+        kv_cache_dtype="fp8_ds_mla",
+        tensor_parallel_size=8,
+        block_size=64,
+        workspace_init=workspace_init,
+        q_scale=1.0,
+        k_scale=1.0,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["query"].shape[1] == 1
+    assert calls[0]["block_tables"].shape[1] == 1
+    assert calls[0]["seq_lens"] is None
 
 
 def _triton_convert_reference_impl(
