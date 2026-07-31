@@ -18,6 +18,15 @@ def test_kimi_k3_advertises_eagle3_support():
     assert supports_eagle3(KimiK3ForConditionalGeneration)
 
 
+def test_kimi_k3_exposes_language_model_for_speculative_decoding():
+    target = object.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(target)
+    language_model = torch.nn.Module()
+    object.__setattr__(target, "language_model", language_model)
+
+    assert target.get_language_model() is language_model
+
+
 def test_kimi_k3_uses_shared_eagle3_layer_configuration():
     target = object.__new__(KimiK3ForConditionalGeneration)
     torch.nn.Module.__init__(target)

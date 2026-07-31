@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import json
+import os
+import threading
 from collections.abc import Iterable
+from pathlib import Path
 
 import regex
 import torch
@@ -78,6 +83,242 @@ logger = init_logger(__name__)
 _EXPERT_TENSOR_RE = regex.compile(r"^(.*\.experts)\.(\d+)\.(w[123])\.(.+)$")
 
 
+def _resolve_expert_parameter_name(
+    params_dict: dict[str, nn.Parameter],
+    *,
+    expert_prefix: str,
+    weight_key: str,
+    suffix: str,
+) -> str | None:
+    """Resolve a per-expert checkpoint tensor to its fused parameter.
+
+    ``FusedMoE`` now owns weights below an explicit ``routed_experts`` module,
+    while older layouts registered them directly below ``experts``.  Keep the
+    O(1) K3 loader fast path compatible with both layouts.
+    """
+    fused_name = f"{'w13_' if weight_key in ('w1', 'w3') else 'w2_'}{suffix}"
+    for mapped in (
+        f"{expert_prefix}.routed_experts.{fused_name}",
+        f"{expert_prefix}.{fused_name}",
+    ):
+        if mapped in params_dict:
+            return mapped
+    return None
+
+
+def _parse_int_ranges(value: str, *, name: str) -> frozenset[int]:
+    """Parse comma-separated integers and inclusive ranges."""
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            left, right = item.split("-", 1)
+            start, end = int(left), int(right)
+            if start > end:
+                raise ValueError(f"{name} range must be ascending: {item!r}")
+            result.update(range(start, end + 1))
+        else:
+            result.add(int(item))
+    return frozenset(result)
+
+
+class _KimiCorrectnessTrace:
+    """Small, eager-only tensor trace for Kimi correctness investigations."""
+
+    _DIR_ENV = "KIMI_CORRECTNESS_TRACE_DIR"
+    _LAYERS_ENV = "KIMI_CORRECTNESS_TRACE_LAYERS"
+    _RANKS_ENV = "KIMI_CORRECTNESS_TRACE_RANKS"
+    _START_CALL_ENV = "KIMI_CORRECTNESS_TRACE_START_CALL"
+    _MAX_CALLS_ENV = "KIMI_CORRECTNESS_TRACE_MAX_CALLS"
+    _MAX_TOKENS_ENV = "KIMI_CORRECTNESS_TRACE_MAX_TOKENS"
+    _TOKEN_WINDOW_ENV = "KIMI_CORRECTNESS_TRACE_TOKEN_WINDOW"
+
+    def __init__(
+        self,
+        output_dir: Path | None,
+        *,
+        layers: frozenset[int] = frozenset(),
+        ranks: frozenset[int] = frozenset({0}),
+        start_call: int = 0,
+        max_calls: int = 1,
+        max_tokens: int = 16,
+        token_window: str = "tail",
+    ) -> None:
+        if start_call < 0:
+            raise ValueError("trace start_call must be non-negative")
+        if max_calls <= 0:
+            raise ValueError("trace max_calls must be positive")
+        if max_tokens <= 0:
+            raise ValueError("trace max_tokens must be positive")
+        if token_window not in {"head", "tail"}:
+            raise ValueError("trace token_window must be 'head' or 'tail'")
+        self.output_dir = output_dir
+        self.layers = layers
+        self.ranks = ranks
+        self.start_call = start_call
+        self.max_calls = max_calls
+        self.max_tokens = max_tokens
+        self.token_window = token_window
+        self._calls: dict[tuple[int, str], int] = {}
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_env(cls) -> "_KimiCorrectnessTrace":
+        raw_dir = os.environ.get(cls._DIR_ENV)
+        if not raw_dir:
+            return cls(None)
+        raw_layers = os.environ.get(cls._LAYERS_ENV)
+        if not raw_layers:
+            raise ValueError(
+                f"{cls._LAYERS_ENV} is required when {cls._DIR_ENV} is set"
+            )
+        return cls(
+            Path(raw_dir).expanduser().resolve(),
+            layers=_parse_int_ranges(raw_layers, name=cls._LAYERS_ENV),
+            ranks=_parse_int_ranges(
+                os.environ.get(cls._RANKS_ENV, "0"),
+                name=cls._RANKS_ENV,
+            ),
+            start_call=int(os.environ.get(cls._START_CALL_ENV, "0")),
+            max_calls=int(os.environ.get(cls._MAX_CALLS_ENV, "1")),
+            max_tokens=int(os.environ.get(cls._MAX_TOKENS_ENV, "16")),
+            token_window=os.environ.get(cls._TOKEN_WINDOW_ENV, "tail"),
+        )
+
+    def enabled_for(self, layer_idx: int) -> bool:
+        return self.output_dir is not None and layer_idx in self.layers
+
+    def require_eager(self, layer_idx: int, *, enforce_eager: bool) -> None:
+        if self.enabled_for(layer_idx) and not enforce_eager:
+            raise ValueError(
+                f"{self._DIR_ENV} requires --enforce-eager; correctness tracing "
+                "does CPU synchronization and file I/O inside model forwards"
+            )
+
+    def capture(
+        self,
+        layer_idx: int,
+        stage: str,
+        tensor: torch.Tensor | None,
+    ) -> None:
+        if tensor is None or not self.enabled_for(layer_idx):
+            return
+        tp_rank = get_tensor_model_parallel_rank()
+        if tp_rank not in self.ranks:
+            return
+        key = (layer_idx, stage)
+        with self._lock:
+            call_idx = self._calls.get(key, 0)
+            self._calls[key] = call_idx + 1
+        if not self.start_call <= call_idx < self.start_call + self.max_calls:
+            return
+
+        original_shape = list(tensor.shape)
+        saved = tensor.detach()
+        if saved.ndim:
+            if self.token_window == "head":
+                saved = saved[: self.max_tokens]
+            else:
+                saved = saved[-self.max_tokens :]
+        saved = saved.contiguous().cpu()
+        digest_bytes = saved.view(torch.uint8).numpy().tobytes()
+        metadata = {
+            "schema_version": 1,
+            "layer": layer_idx,
+            "stage": stage,
+            "call": call_idx,
+            "tp_rank": tp_rank,
+            "tp_world_size": get_tensor_model_parallel_world_size(),
+            "original_shape": original_shape,
+            "saved_shape": list(saved.shape),
+            "token_window": self.token_window,
+            "dtype": str(saved.dtype),
+            "source_device": str(tensor.device),
+            "sha256": hashlib.sha256(digest_bytes).hexdigest(),
+        }
+
+        assert self.output_dir is not None
+        rank_dir = self.output_dir / f"tp-rank-{tp_rank:03d}"
+        rank_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"layer-{layer_idx:03d}.call-{call_idx:06d}.{stage}"
+        destination = rank_dir / f"{stem}.pt"
+        temporary = rank_dir / f".{stem}.{os.getpid()}.tmp"
+        torch.save({"metadata": metadata, "tensor": saved}, temporary)
+        os.replace(temporary, destination)
+
+        manifest = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "tp_rank": tp_rank,
+            "tp_world_size": get_tensor_model_parallel_world_size(),
+            "layers": sorted(self.layers),
+            "ranks": sorted(self.ranks),
+            "start_call": self.start_call,
+            "max_calls": self.max_calls,
+            "max_tokens": self.max_tokens,
+            "token_window": self.token_window,
+        }
+        manifest_path = rank_dir / "manifest.json"
+        manifest_tmp = rank_dir / f".manifest.{os.getpid()}.{threading.get_ident()}.tmp"
+        manifest_tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        os.replace(manifest_tmp, manifest_path)
+
+
+_KIMI_CORRECTNESS_TRACE = _KimiCorrectnessTrace.from_env()
+
+
+def _canonical_grouped_topk(
+    router_logits: torch.Tensor,
+    *,
+    top_k: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference K3 routing with canonical, sorted expert ordering."""
+    if scoring_func == "softmax":
+        scores = torch.softmax(router_logits, dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = router_logits.sigmoid()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    selection_scores = scores
+    if correction_bias is not None:
+        selection_scores = scores + correction_bias.unsqueeze(0)
+        group_scores = (
+            selection_scores.view(scores.shape[0], num_expert_group, -1)
+            .topk(2, dim=-1, sorted=True)
+            .values.sum(dim=-1)
+        )
+    else:
+        group_scores = (
+            selection_scores.view(scores.shape[0], num_expert_group, -1)
+            .max(dim=-1)
+            .values
+        )
+    selected_groups = group_scores.topk(topk_group, dim=-1, sorted=True).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, selected_groups, True)
+    expert_mask = (
+        group_mask.unsqueeze(-1)
+        .expand_as(selection_scores.view(scores.shape[0], num_expert_group, -1))
+        .reshape_as(selection_scores)
+    )
+    masked_scores = selection_scores.masked_fill(~expert_mask, float("-inf"))
+    topk_ids = masked_scores.topk(top_k, dim=-1, sorted=True).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.float(), topk_ids.int()
+
+
 class KimiColumnParallelGate(ColumnParallelLinear):
     """TP-sharded K3 router with globally ordered FP32 logits.
 
@@ -126,9 +367,17 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
     zero-fill via pad_or_narrow and the gathered output is sliced back.
     """
 
-    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+        *,
+        trace_layer_idx: int | None = None,
+    ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         self._logical_output_size = output_size
+        self._trace_layer_idx = trace_layer_idx
         padded = -(-output_size // tp_size) * tp_size
         super().__init__(
             input_size,
@@ -143,7 +392,12 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
         out, bias = super().forward(x)
         out = out[..., : self._logical_output_size]
         # b12x MoE launches require contiguous inputs; the slice is a view.
-        return out.contiguous(), bias
+        out = out.contiguous()
+        if self._trace_layer_idx is not None:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self._trace_layer_idx, "routed_latent_input", out
+            )
+        return out, bias
 
 
 class KimiPaddedRowParallelLinear(RowParallelLinear):
@@ -184,8 +438,12 @@ class KimiMLP(nn.Module):
         prefix: str = "",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
+        trace_layer_idx: int | None = None,
+        trace_stage: str | None = None,
     ) -> None:
         super().__init__()
+        self._trace_layer_idx = trace_layer_idx
+        self._trace_stage = trace_stage
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -219,6 +477,8 @@ class KimiMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        if self._trace_layer_idx is not None and self._trace_stage is not None:
+            _KIMI_CORRECTNESS_TRACE.capture(self._trace_layer_idx, self._trace_stage, x)
         return x
 
 
@@ -240,6 +500,12 @@ class KimiMoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
+        self._trace_enabled = _KIMI_CORRECTNESS_TRACE.enabled_for(layer_idx)
+        self._top_k = config.num_experts_per_token
+        self._num_expert_group = config.num_expert_group
+        self._topk_group = config.topk_group
+        self._scoring_func = config.moe_router_activation_func
+        self._renormalize = config.moe_renormalize
         routed_expert_hidden_size = config.routed_expert_hidden_size
         self.moe_hidden_size = routed_expert_hidden_size or hidden_size
 
@@ -270,6 +536,8 @@ class KimiMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
+                trace_layer_idx=layer_idx if self._trace_enabled else None,
+                trace_stage="shared_output_partial",
             )
         else:
             self.shared_experts = None
@@ -283,6 +551,7 @@ class KimiMoE(nn.Module):
                 hidden_size,
                 routed_expert_hidden_size,
                 prefix=f"{prefix}.routed_expert_down_proj",
+                trace_layer_idx=layer_idx if self._trace_enabled else None,
             )
             self.routed_expert_norm = (
                 RMSNorm(routed_expert_hidden_size, eps=config.rms_norm_eps)
@@ -297,6 +566,7 @@ class KimiMoE(nn.Module):
             self.routed_output_transform = KimiRoutedOutputTransform(
                 self.routed_expert_norm,
                 self.routed_expert_up_proj,
+                layer_idx=layer_idx,
             )
 
         self.experts = FusedMoE(
@@ -322,10 +592,36 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(self.layer_idx, "moe_input", hidden_states)
         router_logits, _ = self.gate(hidden_states)
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "router_logits", router_logits
+            )
+            topk_weights, topk_ids = _canonical_grouped_topk(
+                router_logits,
+                top_k=self._top_k,
+                num_expert_group=self._num_expert_group,
+                topk_group=self._topk_group,
+                scoring_func=self._scoring_func,
+                renormalize=self._renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+                correction_bias=self.gate.e_score_correction_bias,
+            )
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "canonical_topk_ids", topk_ids
+            )
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "canonical_topk_weights", topk_weights
+            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "moe_output", final_hidden_states
+            )
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -334,10 +630,14 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         norm: RMSNorm | None,
         up_proj: RowParallelLinear,
+        *,
+        layer_idx: int,
     ) -> None:
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
+        self.layer_idx = layer_idx
+        self._trace_enabled = _KIMI_CORRECTNESS_TRACE.enabled_for(layer_idx)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # The routed expert GEMM consumes TP-sharded intermediate channels and
@@ -345,11 +645,28 @@ class KimiRoutedOutputTransform(nn.Module):
         # latent RMSNorm, then let the row-parallel up projection emit a
         # hidden-width partial. FusedMoE's final TP all-reduce combines that
         # partial together with the shared-expert partial exactly once.
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "routed_latent_partial", hidden_states
+            )
         if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "routed_latent_reduced", hidden_states
+            )
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
-        return self.up_proj(hidden_states)[0]
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "routed_latent_normalized", hidden_states
+            )
+        output = self.up_proj(hidden_states)[0]
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "routed_output_partial", output
+            )
+        return output
 
 
 class KimiMLAAttention(nn.Module):
@@ -507,6 +824,11 @@ class KimiDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
+        _KIMI_CORRECTNESS_TRACE.require_eager(
+            self.layer_idx,
+            enforce_eager=vllm_config.model_config.enforce_eager,
+        )
+        self._trace_enabled = _KIMI_CORRECTNESS_TRACE.enabled_for(self.layer_idx)
 
         self.is_moe = config.is_moe
         layer_idx = self.layer_idx
@@ -560,6 +882,8 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
+                trace_layer_idx=layer_idx if self._trace_enabled else None,
+                trace_stage="dense_mlp_output",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -664,6 +988,21 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        if self._trace_enabled and self.use_attn_res:
+            assert prefix_sum is not None
+            assert residual is not None
+            layer_input = (
+                prefix_sum
+                if hidden_states is None
+                else (prefix_sum + hidden_states).to(prefix_sum.dtype)
+            )
+            _KIMI_CORRECTNESS_TRACE.capture(self.layer_idx, "layer_input", layer_input)
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx,
+                "block_residual_input",
+                residual[:, : self.prev_valid_blocks, :],
+            )
+
         hidden_states, prefix_sum, residual = self._pre_attn_norm(
             hidden_states, residual, prefix_sum
         )
@@ -675,11 +1014,38 @@ class KimiDecoderLayer(nn.Module):
             output=attn_output,
         )
         hidden_states = attn_output
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "attention_output", hidden_states
+            )
 
         hidden_states, prefix_sum, residual = self._post_attn_norm(
             hidden_states, residual, prefix_sum
         )
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(self.layer_idx, "mlp_input", hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self._trace_enabled:
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "layer_hidden", hidden_states
+            )
+            _KIMI_CORRECTNESS_TRACE.capture(
+                self.layer_idx, "layer_prefix_sum", prefix_sum
+            )
+            _KIMI_CORRECTNESS_TRACE.capture(self.layer_idx, "layer_residual", residual)
+            if self.use_attn_res:
+                assert prefix_sum is not None
+                valid_blocks = self.prev_valid_blocks + int(self.is_block_write_layer)
+                _KIMI_CORRECTNESS_TRACE.capture(
+                    self.layer_idx,
+                    "layer_boundary",
+                    (prefix_sum + hidden_states).to(prefix_sum.dtype),
+                )
+                _KIMI_CORRECTNESS_TRACE.capture(
+                    self.layer_idx,
+                    "block_residual",
+                    residual[:, :valid_blocks, :],
+                )
         return hidden_states, prefix_sum, residual
 
 
@@ -912,6 +1278,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
+            (".qkv_proj", ".q_proj", 0),
+            (".qkv_proj", ".k_proj", 1),
+            (".qkv_proj", ".v_proj", 2),
         ]
         if self.config.q_lora_rank is not None:
             stacked_params_mapping.extend(
@@ -965,23 +1334,25 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             em = _EXPERT_TENSOR_RE.match(name)
             if em is not None and expert_params_mapping:
                 eprefix, eid, wkey, esuffix = em.groups()
-                mapped = (
-                    f"{eprefix}.{'w13_' if wkey in ('w1', 'w3') else 'w2_'}{esuffix}"
+                mapped = _resolve_expert_parameter_name(
+                    params_dict,
+                    expert_prefix=eprefix,
+                    weight_key=wkey,
+                    suffix=esuffix,
                 )
-                if is_pp_missing_parameter(mapped, self):
+                if mapped is not None:
+                    if is_pp_missing_parameter(mapped, self):
+                        continue
+                    eparam = params_dict[mapped]
+                    eparam.weight_loader(
+                        eparam,
+                        loaded_weight,
+                        mapped,
+                        expert_id=int(eid),
+                        shard_id=wkey,
+                    )
+                    loaded_params.add(mapped)
                     continue
-                eparam = params_dict.get(mapped)
-                if eparam is None:
-                    continue
-                eparam.weight_loader(
-                    eparam,
-                    loaded_weight,
-                    mapped,
-                    expert_id=int(eid),
-                    shard_id=wkey,
-                )
-                loaded_params.add(mapped)
-                continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
@@ -1001,7 +1372,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                name = name.replace(weight_name, param_name)
+                mapped_name = name.replace(weight_name, param_name)
+                # Kimi can mix KDA (fused QKV) and MLA (separate Q when
+                # q_lora_rank is absent) in one model.  Apply a packed mapping
+                # only when that packed parameter exists on this layer.
+                if mapped_name not in params_dict and not is_pp_missing_parameter(
+                    mapped_name, self
+                ):
+                    continue
+                name = mapped_name
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1187,6 +1566,9 @@ class KimiK3ForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    def get_language_model(self) -> nn.Module:
+        return self.language_model
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)
