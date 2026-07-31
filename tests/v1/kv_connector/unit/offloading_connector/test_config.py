@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
     is_store_reachable_swa_chunk,
 )
+from vllm.model_executor.layers.mla_cache_format import Nvfp4MlaCacheFormat
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -278,7 +279,7 @@ def test_zero_blocks_skips_tensor_layout_validation():
     assert offloading_config.worker_kv_bytes_per_block == 0
 
 
-def test_prefill_context_parallelism_does_not_scale_group_blocks():
+def test_prefill_context_parallelism_scales_attention_group_blocks():
     config = _make_vllm_config(
         extra_config={"block_size": 64},
         prefill_context_parallel_size=2,
@@ -286,9 +287,9 @@ def test_prefill_context_parallelism_does_not_scale_group_blocks():
 
     offloading_config = build_offloading_config(config, _make_kv_cache_config())
 
-    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (16,)
-    assert offloading_config.cache.tokens_per_hash == 16
-    assert offloading_config.cache.blocks_per_chunk == 4
+    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (32,)
+    assert offloading_config.cache.tokens_per_hash == 32
+    assert offloading_config.cache.blocks_per_chunk == 2
 
 
 def test_dcp_scales_attention_but_not_mamba_group_blocks():
@@ -323,6 +324,45 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
     ] == [1, 3]
 
 
+def test_dcp_does_not_scale_replicated_groups():
+    config = _make_vllm_config(
+        tensor_parallel_size=4,
+        decode_context_parallel_size=4,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=432,
+                    dtype=torch.uint8,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["indexer"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (
+        64,
+        64,
+    )
+
+
 def test_preserves_data_parallel_index():
     config = _make_vllm_config()
     config.parallel_config.data_parallel_index = 2
@@ -330,6 +370,56 @@ def test_preserves_data_parallel_index():
     offloading_config = build_offloading_config(config, _make_kv_cache_config())
 
     assert offloading_config.parallel.data_parallel_index == 2
+
+
+def test_carries_nvfp4_record_abi():
+    config = _make_vllm_config()
+    config.cache_config.cache_dtype = "nvfp4_ds_mla"
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=True,
+        fp8_rope=True,
+        scales_file="",
+    )
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config."
+        "NVFP4_MLA_CACHE_FORMAT",
+        cache_format,
+    ):
+        offloading_config = build_offloading_config(config, _make_kv_cache_config())
+
+    assert offloading_config.model.kv_cache_abi == (
+        "nvfp4_ds_mla:fp8-rope-368:dynamic-token-v1"
+    )
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.float16, torch.bfloat16, "auto"])
+def test_preserves_default_record_abi(cache_dtype):
+    config = _make_vllm_config()
+    config.cache_config.cache_dtype = cache_dtype
+
+    offloading_config = build_offloading_config(config, _make_kv_cache_config())
+
+    assert offloading_config.model.kv_cache_abi == "vllm-default-v1"
+
+
+def test_preserves_implicit_nvfp4_record_abi():
+    config = _make_vllm_config()
+    config.cache_config.cache_dtype = "nvfp4_ds_mla"
+    cache_format = Nvfp4MlaCacheFormat(
+        dynamic_scale=False,
+        fp8_rope=True,
+        scales_file="",
+    )
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config."
+        "NVFP4_MLA_CACHE_FORMAT",
+        cache_format,
+    ):
+        offloading_config = build_offloading_config(config, _make_kv_cache_config())
+
+    assert offloading_config.model.kv_cache_abi == "vllm-default-v1"
 
 
 def test_resolves_heterogeneous_hybrid_block_sizes():

@@ -4,11 +4,15 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+)
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     MLAAttentionSpec,
+    get_kv_cache_cp_shard_count,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -20,7 +24,7 @@ from vllm.v1.kv_offload.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
@@ -40,16 +44,18 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    def _tokens_per_block(kv_cache_spec: "KVCacheSpec") -> int:
+        if not isinstance(kv_cache_spec, AttentionSpec):
+            return kv_cache_spec.block_size
+        return kv_cache_spec.block_size * get_kv_cache_cp_shard_count(
+            kv_cache_spec,
+            parallel_config.decode_context_parallel_size,
+            parallel_config.prefill_context_parallel_size,
+        )
+
     groups = tuple(
         OffloadingGroupConfig(
-            tokens_per_block=(
-                group.kv_cache_spec.block_size
-                * (
-                    parallel_config.decode_context_parallel_size
-                    if isinstance(group.kv_cache_spec, AttentionSpec)
-                    else 1
-                )
-            ),
+            tokens_per_block=_tokens_per_block(group.kv_cache_spec),
             layer_names=tuple(group.layer_names),
         )
         for group in kv_cache_config.kv_cache_groups
@@ -163,6 +169,9 @@ def build_offloading_config(
         model=OffloadingModelConfig(
             name=vllm_config.model_config.model,
             dtype=str(cache_dtype).removeprefix("torch."),
+            kv_cache_abi=NVFP4_MLA_CACHE_FORMAT.record_abi(
+                str(vllm_config.cache_config.cache_dtype)
+            ),
         ),
         cache=OffloadingCacheConfig(
             tokens_per_hash=tokens_per_hash,
