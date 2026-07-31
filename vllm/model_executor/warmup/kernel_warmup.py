@@ -369,7 +369,10 @@ def kernel_warmup(worker: "Worker"):
     else:
         flashinfer_autotune(worker.model_runner)
 
-    if current_platform.has_device_capability(90):
+    if (
+        current_platform.has_device_capability(90)
+        and worker.vllm_config.kernel_config.enable_bf16x3_router_gemm
+    ):
         _warmup_ll_bf16_router_gemm()
 
     # FlashInfer attention warmup
