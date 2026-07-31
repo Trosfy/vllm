@@ -60,6 +60,12 @@ def _dsv4_b12x_page_nbytes(page_size: int) -> int:
     of the compressed-MLA payload.  Keeping it out of the exported view also
     supports standalone contiguous allocations, whose physical page stride is
     exactly ``page_size * 584`` bytes.
+
+    Args:
+        page_size: Number of tokens stored in one cache page.
+
+    Returns:
+        The logical compressed-MLA payload size in bytes.
     """
     return int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
 
@@ -73,6 +79,20 @@ def _b12x_cache_page_view(
 
     Preserve the physical page stride so both padded packed allocations and
     contiguous per-layer allocations follow the same runtime contract.
+
+    Args:
+        cache: Source paged cache tensor.
+        page_size: Number of tokens stored in one cache page.
+        name: Cache name used in validation errors.
+
+    Returns:
+        A logical byte view that preserves the source physical page stride.
+
+    Raises:
+        ValueError: If ``page_size`` is not positive.
+        RuntimeError: If the cache is not paged, a page cannot contain the
+            logical payload, pages overlap, or the payload within a page is
+            not contiguous.
     """
     page_nbytes = _dsv4_b12x_page_nbytes(page_size)
     if page_nbytes <= 0:
@@ -90,6 +110,11 @@ def _b12x_cache_page_view(
                 f"{name} page payload must be contiguous, got stride "
                 f"{tuple(byte_cache.stride())}"
             )
+        if int(byte_cache.stride(0)) < page_nbytes:
+            raise RuntimeError(
+                f"{name} page stride {int(byte_cache.stride(0))} is smaller than "
+                f"DSV4 page payload {page_nbytes}"
+            )
         return byte_cache[:, :page_nbytes]
 
     if byte_cache.ndim < 2:
@@ -104,6 +129,15 @@ def _b12x_cache_page_view(
             f"{name} page stride {page_stride_nbytes} is smaller than DSV4 page "
             f"payload {page_nbytes}"
         )
+
+    expected_stride = 1
+    for dim in range(byte_cache.ndim - 1, 0, -1):
+        if int(byte_cache.stride(dim)) != expected_stride:
+            raise RuntimeError(
+                f"{name} page payload must be contiguous, got stride "
+                f"{tuple(byte_cache.stride())}"
+            )
+        expected_stride *= int(byte_cache.shape[dim])
 
     # Packed DS4 KV cache views have a storage offset for this layer and a
     # larger per-block stride for the whole packed block. Expose only the
