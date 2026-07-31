@@ -40,9 +40,10 @@ case "${mode}" in
   off|mtp0|standard-mtp0) mode=mtp0 ;;
   mtp2|standard-mtp2) mode=mtp2 ;;
   mtp3|standard-mtp3) mode=mtp3 ;;
+  dspark-off|dspark-mtp0) mode=dspark-mtp0 ;;
   dspark) ;;
   *)
-    echo "MODE must be mtp0, mtp2, mtp3, or dspark; got '${mode}'" >&2
+    echo "MODE must be mtp0, mtp2, mtp3, dspark-mtp0, or dspark; got '${mode}'" >&2
     exit 2
     ;;
 esac
@@ -59,13 +60,13 @@ case "${backend}" in
 esac
 
 standard_model=${STANDARD_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
-dspark_model=${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
+dspark_model=${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
 standard_model_revision=${STANDARD_MODEL_REVISION:-60d8d70770c6776ff598c94bb586a859a38244f1}
-dspark_model_revision=${DSPARK_MODEL_REVISION:-62af8fffb2f7030cac4de2f0169f5b8d1101b646}
-if [[ "${mode}" == "dspark" ]]; then
+dspark_model_revision=${DSPARK_MODEL_REVISION:-9e165c30e2704aec5d9d593cce3eebd58bbef1cb}
+if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
   model=${MODEL_PATH:-${MODEL:-${dspark_model}}}
   spec_model=${SPEC_MODEL_PATH:-${model}}
-  served_model_name=${SERVED_MODEL_NAME:-DeepSeek-V4-Flash-DSpark}
+  served_model_name=${SERVED_MODEL_NAME:-DeepSeek-V4-Flash-0731}
   default_model_revision=${dspark_model_revision}
 else
   model=${MODEL_PATH:-${MODEL:-${standard_model}}}
@@ -88,9 +89,14 @@ fi
 host=${HOST:-0.0.0.0}
 port=${PORT:-8000}
 tp_size=${TP_SIZE:-${TP:-2}}
-dcp_size=${DCP_SIZE:-1}
-max_num_seqs=${MAX_NUM_SEQS:-64}
-max_model_len=${MAX_MODEL_LEN:-262144}
+dcp_size=${DCP_SIZE:-${DCP:-1}}
+if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
+  max_num_seqs=${MAX_NUM_SEQS:-16}
+  max_model_len=${MAX_MODEL_LEN:-131072}
+else
+  max_num_seqs=${MAX_NUM_SEQS:-64}
+  max_model_len=${MAX_MODEL_LEN:-262144}
+fi
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
@@ -246,6 +252,7 @@ esac
 spec_args=()
 spec_tokens=0
 graph_multiplier=4
+dspark_depth_mode=disabled
 if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
   if [[ "${mode}" == "mtp2" ]]; then spec_tokens=2; else spec_tokens=3; fi
   mtp_moe_json=
@@ -259,7 +266,7 @@ if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
   spec_args=(--speculative-config "${spec_json}")
   graph_multiplier=8
 elif [[ "${mode}" == "dspark" ]]; then
-  spec_tokens=${DSPARK_TOKENS:-5}
+  spec_tokens=${DSPARK_TOKENS:-${NUM_SPECULATIVE_TOKENS:-7}}
   require_positive_int DSPARK_TOKENS "${spec_tokens}"
   # Target verification schedules at most one sampled token plus K drafts per
   # request. Capturing beyond that physical row count only consumes graph
@@ -280,7 +287,25 @@ elif [[ "${mode}" == "dspark" ]]; then
     draft_attention_json=$(printf \
       ',"draft_attention_backend":"%s"' "${draft_attention_backend}")
   fi
-  dspark_capacity=$(bool_value DSPARK_CAPACITY "${DSPARK_CAPACITY:-0}")
+  dspark_depth_mode=${DSPARK_DEPTH_MODE:-fixed}
+  case "${dspark_depth_mode}" in
+    fixed)
+      default_dspark_capacity=0
+      default_dynamic_depth=0
+      default_activation_batch_size=0
+      ;;
+    dynamic)
+      default_dspark_capacity=1
+      default_dynamic_depth=1
+      default_activation_batch_size=1
+      ;;
+    *)
+      echo "DSPARK_DEPTH_MODE must be fixed or dynamic" >&2
+      exit 2
+      ;;
+  esac
+  dspark_capacity=$(bool_value DSPARK_CAPACITY \
+    "${DSPARK_CAPACITY:-${default_dspark_capacity}}")
   capacity_json=
   if [[ "${dspark_capacity}" == "1" ]]; then
     capacity_mode=${DSPARK_CAPACITY_VERIFICATION_MODE:-}
@@ -319,11 +344,14 @@ elif [[ "${mode}" == "dspark" ]]; then
     "${rejection_sample_method}" "${draft_attention_json}" "${capacity_json}")
   spec_args=(--speculative-config "${spec_json}")
   export VLLM_DSPARK_FP8_DRAFT_HEAD=$(bool_value DSPARK_FP8_DRAFT_HEAD "${DSPARK_FP8_DRAFT_HEAD:-0}")
-  export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH=$(bool_value DSPARK_DYNAMIC_DRAFT_DEPTH "${DSPARK_DYNAMIC_DRAFT_DEPTH:-0}")
+  dynamic_depth=${DSPARK_DYNAMIC_DRAFT_DEPTH:-${VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH:-${default_dynamic_depth}}}
+  export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH=$(bool_value \
+    DSPARK_DYNAMIC_DRAFT_DEPTH "${dynamic_depth}")
   export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW=${DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW:-8}
   require_positive_int DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW \
     "${VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW}"
-  export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE=${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-0}
+  activation_batch_size=${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-${default_activation_batch_size}}}
+  export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE=${activation_batch_size}
   require_nonnegative_int DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE \
     "${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE}"
   export VLLM_DSPARK_CAPACITY_LOG_INTERVAL=${DSPARK_CAPACITY_LOG_INTERVAL:-0}
@@ -358,8 +386,9 @@ if [[ "${sp_async_tp}" == "1" ]]; then
 fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
-  # The v10 profiler includes attention and FULL-graph allocations. These
-  # defaults preserve the 262k serving limit used by v9 after that accounting.
+  # The 0731 DSpark draft head is larger than the historical MTP head. Its
+  # B12X TP2 profile needs 0.97 to retain the default 131k serving limit after
+  # attention and FULL-graph allocations are accounted for.
   if [[ "${mode}" == "dspark" ]]; then
     if [[ "${backend}" == "lucifer-default" ]]; then
       # The default DeepGEMM MoE path retains more model/runtime memory than
@@ -377,7 +406,7 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     elif [[ "${backend}" == lucifer-* ]]; then
       gpu_memory_utilization=0.9465
     else
-      gpu_memory_utilization=0.95
+      gpu_memory_utilization=0.97
     fi
   elif [[ "${backend}" == lucifer-* \
     && ( "${mode}" == "mtp2" || "${mode}" == "mtp3" ) ]]; then
@@ -478,8 +507,9 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s model=%s\n' \
-  "${mode}" "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
+printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s model=%s\n' \
+  "${mode}" "${dspark_depth_mode}" \
+  "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
   "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" "${model}" >&2
 printf 'Command:' >&2
