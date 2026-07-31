@@ -145,9 +145,7 @@ def _maybe_save_b12x_moe_activation_amax() -> None:
 
 
 def _maybe_flush_kquant_capture() -> None:
-    capture = sys.modules.get(
-        "vllm.model_executor.layers.fused_moe.kquant_capture"
-    )
+    capture = sys.modules.get("vllm.model_executor.layers.fused_moe.kquant_capture")
     if capture is None:
         return
     maybe_flush = getattr(capture, "maybe_flush_kquant_capture", None)
@@ -870,9 +868,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # production cache. Keep the hook optional so backends without
             # cache-generation state pay no cost.
             impl = getattr(layer, "impl", None)
-            reset_binding_state = getattr(
-                impl, "reset_kv_cache_binding_state", None
-            )
+            reset_binding_state = getattr(impl, "reset_kv_cache_binding_state", None)
             if reset_binding_state is not None:
                 reset_binding_state()
             if hasattr(layer, "kv_cache"):
