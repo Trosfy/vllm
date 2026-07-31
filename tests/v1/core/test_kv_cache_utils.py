@@ -194,6 +194,38 @@ def new_mamba_spec(
     )
 
 
+def test_unify_kv_cache_spec_page_size_uses_lcm_for_non_divisible_pages():
+    mimo_spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=192,
+        head_size_v=128,
+        dtype=torch.float32,
+    )
+    dflash_spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.float32,
+    )
+
+    assert mimo_spec.page_size_bytes == 163840
+    assert dflash_spec.page_size_bytes == 65536
+    assert mimo_spec.page_size_bytes % dflash_spec.page_size_bytes != 0
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "model.layers.0.self_attn": mimo_spec,
+            "draft_model.layers.0.self_attn": dflash_spec,
+        }
+    )
+
+    assert {spec.page_size_bytes for spec in unified.values()} == {327680}
+    assert unified["model.layers.0.self_attn"].block_size == 128
+    assert unified["draft_model.layers.0.self_attn"].block_size == 320
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_none_hash(monkeypatch, hash_fn):
     import vllm.v1.core.kv_cache_utils
@@ -1603,6 +1635,577 @@ def test_get_max_concurrency_packed_kv_cache_config():
     ) == num_blocks / (1024 + 73)
 
 
+def _make_dsv4_vllm_config(dcp: int):
+    class _Dsv4VllmConfig(SimpleNamespace):
+        def validate_block_size(self):
+            pass
+
+    return _Dsv4VllmConfig(
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(
+            max_model_len=256000,
+            original_max_model_len=256000,
+            hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_batched_tokens=2048,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            block_size=None,
+            kv_cache_max_concurrency=None,
+            kv_cache_size_tokens=None,
+            num_gpu_blocks=None,
+            num_gpu_blocks_override=None,
+        ),
+        compilation_config=SimpleNamespace(
+            compilation_time=0,
+            encoder_compilation_time=0,
+        ),
+    )
+
+
+def _make_dsv4_heterogeneous_kv_cache_specs():
+    def full_mla_spec(compress_ratio: int):
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str="fp8_ds_mla",
+            compress_ratio=compress_ratio,
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
+    def indexer_spec():
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            compress_ratio=4,
+            alignment=576,
+        )
+
+    def swa_cache_spec():
+        return SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
+    def compressor_state_spec(compress_ratio: int):
+        overlap = compress_ratio == 4
+        return SlidingWindowMLASpec(
+            block_size=4 if overlap else 8,
+            num_kv_heads=1,
+            head_size=2 * (1 + overlap) * 512,
+            dtype=torch.float32,
+            sliding_window=(1 + overlap) * compress_ratio,
+            alignment=576,
+            dcp_sharded=True,
+        )
+
+    ratios = [128, 128] + [4, 128] * 29 + [4]
+    assert ratios.count(4) == 30
+    assert ratios.count(128) == 31
+
+    kv_cache_specs: dict[str, KVCacheSpec] = {}
+    for layer_idx, ratio in enumerate(ratios):
+        prefix = f"layers.{layer_idx}"
+        kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
+        kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
+        kv_cache_specs[f"{prefix}.compressor.state_cache"] = compressor_state_spec(
+            ratio
+        )
+        if ratio == 4:
+            kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
+            kv_cache_specs[f"{prefix}.indexer.compressor.state_cache"] = (
+                compressor_state_spec(ratio)
+            )
+
+    return kv_cache_specs
+
+
+def _make_dsv4_heterogeneous_kv_cache_groups():
+    kv_cache_specs = _make_dsv4_heterogeneous_kv_cache_specs()
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(kv_cache_specs)
+    assert grouped_specs is not None
+    return kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+
+
+def test_dsv4_max_concurrency_uses_per_group_block_counts():
+    kv_cache_groups = _make_dsv4_heterogeneous_kv_cache_groups()
+
+    for dcp in (5, 10):
+        vllm_config = _make_dsv4_vllm_config(dcp)
+        available_memory = 4_500_000_000
+        kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, available_memory=available_memory
+        )
+        expected_num_blocks = available_memory // kv_cache_utils._pool_bytes_per_block(
+            vllm_config, kv_cache_groups
+        )
+        assert kv_cache_config.num_blocks == expected_num_blocks
+        expected_request_blocks = sum(
+            kv_cache_utils.cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_groups
+        )
+        assert get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config
+        ) == pytest.approx(expected_num_blocks / expected_request_blocks)
+
+
+def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=64,
+            enable_prefix_caching=True,
+            prefix_match_unit=None,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float32,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    assert scheduler_block_size == 256
+    assert hash_block_size == 64
+
+
+def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=262144),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        kv_transfer_config=None,
+    )
+    specs: dict[str, KVCacheSpec] = {
+        f"target.{i}": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.uint8,
+            cache_dtype_str="nvfp4_ds_mla",
+        )
+        for i in range(3)
+    }
+    specs.update(
+        {
+            f"indexer.{i}": MLAAttentionSpec(
+                block_size=256,
+                num_kv_heads=1,
+                head_size=132,
+                dtype=torch.uint8,
+                dcp_replicated=True,
+            )
+            for i in range(2)
+        }
+    )
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(specs, 4, 1)
+    assert grouped_specs is not None
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+    )
+    assert kv_cache_utils._use_lockstep_mla_allocation(groups, 4, 1)
+
+    bytes_per_pool_block = 3 * (64 * 432) + 2 * (256 * 132)
+    request_blocks = 262144 // 256
+    required_memory = bytes_per_pool_block * request_blocks
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=required_memory * 2,
+    )
+
+    assert kv_cache_config.num_blocks == request_blocks * 2
+    assert all(tensor.block_stride == 0 for tensor in kv_cache_config.kv_cache_tensors)
+    assert sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors) == (
+        required_memory * 2
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == required_memory
+    )
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    ) == pytest.approx(2.0)
+
+
+def test_partial_replicated_mla_uses_lockstep_dcp8_layout():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    groups = [
+        KVCacheGroupSpec(["target"], target),
+        KVCacheGroupSpec(["indexer"], indexer),
+    ]
+
+    assert kv_cache_utils._use_lockstep_mla_allocation(groups, 8, 1)
+    assert target.block_size * 8 == indexer.block_size * 4 == 512
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer}, 8, 1
+    )
+    assert grouped_specs is not None
+    grouped = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert len(grouped) == 2
+    assert kv_cache_utils._use_lockstep_mla_allocation(grouped, 8, 1)
+    assert grouped[1].kv_cache_spec.page_size_bytes == indexer.page_size_bytes
+
+
+def test_partial_replicated_uniform_groups_use_global_block_size():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer}, 8, 1
+    )
+    assert grouped_specs is not None
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert len(groups) == 2
+    assert {
+        name for group in groups for name in group.kv_cache_spec.kv_cache_specs
+    } == {"target", "indexer"}
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+    )
+
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=64,
+            enable_prefix_caching=True,
+            prefix_match_unit=None,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    single_group_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[groups[0]],
+    )
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        single_group_config, vllm_config
+    ) == (512, 512)
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (512, 512)
+
+
+def test_partial_replicated_mla_groups_with_sliding_window_mla():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    sliding = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        sliding_window=4096,
+        dcp_sharded=True,
+    )
+
+    grouped = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer, "sliding": sliding}, 8, 1
+    )
+
+    assert grouped is not None
+    assert [set(group.kv_cache_specs) for group in grouped] == [
+        {"target"},
+        {"sliding"},
+        {"indexer"},
+    ]
+
+
+def test_lockstep_mla_predicate_rejects_nonmatching_layouts():
+    sharded = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    replicated = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    groups = [
+        KVCacheGroupSpec(["target"], sharded),
+        KVCacheGroupSpec(["indexer"], replicated),
+    ]
+    assert not kv_cache_utils._use_lockstep_mla_allocation(groups, 1, 1)
+
+    mismatched = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    mismatched_groups = [groups[0], KVCacheGroupSpec(["indexer"], mismatched)]
+    assert not kv_cache_utils._use_lockstep_mla_allocation(mismatched_groups, 4, 1)
+    assert (
+        kv_cache_utils.group_and_unify_kv_cache_specs(
+            {"target": sharded, "indexer": mismatched}, 4, 1
+        )
+        is None
+    )
+
+    non_mla = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    assert not kv_cache_utils._use_lockstep_mla_allocation(
+        [groups[0], KVCacheGroupSpec(["draft"], non_mla)], 4, 1
+    )
+
+
+def test_lockstep_mla_equal_page_sizes_use_distinct_tensors():
+    sharded = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    replicated = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=torch.bfloat16,
+        dcp_replicated=True,
+    )
+    assert sharded.page_size_bytes == replicated.page_size_bytes
+    groups = [
+        KVCacheGroupSpec(["target"], sharded),
+        KVCacheGroupSpec(["indexer"], replicated),
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    bytes_per_pool_block = sharded.page_size_bytes + replicated.page_size_bytes
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=3 * bytes_per_pool_block,
+    )
+
+    assert kv_cache_config.num_blocks == 3
+    assert [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors] == [
+        ["target"],
+        ["indexer"],
+    ]
+    assert [tensor.size for tensor in kv_cache_config.kv_cache_tensors] == [
+        3 * sharded.page_size_bytes,
+        3 * replicated.page_size_bytes,
+    ]
+
+
+def test_custom_cp_specs_with_same_block_size_stay_in_type_specific_groups():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+    )
+    replicated_full = FullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+    )
+    replicated_sink = SinkFullAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        dcp_replicated=True,
+        sink_len=4,
+    )
+
+    grouped = group_and_unify_kv_cache_specs(
+        {
+            "target": target,
+            "full": replicated_full,
+            "sink": replicated_sink,
+        },
+        dcp_world_size=4,
+    )
+
+    assert grouped is not None
+    assert len(grouped) == 3
+    assert [set(group.kv_cache_specs) for group in grouped] == [
+        {"target"},
+        {"full"},
+        {"sink"},
+    ]
+
+
+def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
+    from vllm.v1.engine.core import EngineCore
+
+    class FakeModelExecutor:
+        def __init__(self):
+            self.initialized_kv_cache_configs = None
+
+        def get_kv_cache_specs(self):
+            return [_make_dsv4_heterogeneous_kv_cache_specs()]
+
+        def determine_available_memory(self):
+            return [4_500_000_000]
+
+        def initialize_from_config(self, kv_cache_configs):
+            self.initialized_kv_cache_configs = kv_cache_configs
+
+        def compile_or_warm_up_model(self):
+            pass
+
+    class FakeEngineCore:
+        def __init__(self):
+            self.available_gpu_memory_for_kv_cache = -1
+            self.model_executor = FakeModelExecutor()
+
+        def collective_rpc(self, method, args=()):
+            raise AssertionError(f"unexpected collective_rpc({method}, {args})")
+
+    vllm_config = _make_dsv4_vllm_config(dcp=5)
+    engine_core = FakeEngineCore()
+
+    scheduler_kv_cache_config = EngineCore._initialize_kv_caches(
+        engine_core, vllm_config
+    )
+
+    initialized_kv_cache_configs = (
+        engine_core.model_executor.initialized_kv_cache_configs
+    )
+    assert initialized_kv_cache_configs is not None
+    worker_kv_cache_config = initialized_kv_cache_configs[0]
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in worker_kv_cache_config.kv_cache_groups
+    )
+    assert not any(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in scheduler_kv_cache_config.kv_cache_groups
+    )
+    scheduler_page_sizes = {
+        group.kv_cache_spec.page_size_bytes
+        for group in scheduler_kv_cache_config.kv_cache_groups
+    }
+    assert len(scheduler_page_sizes) > 1
+    expected_num_tokens, expected_max_concurrency = get_kv_cache_capacity(
+        vllm_config, worker_kv_cache_config
+    )
+    assert vllm_config.cache_config.kv_cache_max_concurrency == pytest.approx(
+        expected_max_concurrency
+    )
+    assert vllm_config.cache_config.kv_cache_size_tokens == expected_num_tokens
+
+
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
     block_size = 4
@@ -1935,8 +2538,9 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size,
-    # but can be aligned by padding the smaller physical page.
+    # Different hidden size and different type that cannot be aligned by using
+    # different block size, but can be aligned by padding the smaller physical
+    # page.
     swa_spec = new_sliding_window_spec(head_size=96, indexes_kv_by_block_stride=True)
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64, indexes_kv_by_block_stride=True),
@@ -2107,7 +2711,7 @@ def new_mla_spec(cache_dtype_str=None, block_size=16):
     )
 
 
-def new_swa_mla_spec(head_size=576, sliding_window=128):
+def new_bf16_swa_mla_spec(head_size=576, sliding_window=128):
     return SlidingWindowMLASpec(
         block_size=16,
         num_kv_heads=1,
@@ -2128,7 +2732,7 @@ def test_group_and_unify_kv_cache_specs_uniform_page_size_returns_none():
     # with a uniform page size must not fall into the DeepseekV4 tuple-packing
     # path; it should defer to the generic uniform-page-size grouping instead.
     mla_spec = new_mla_spec()
-    swa_spec = new_swa_mla_spec()
+    swa_spec = new_bf16_swa_mla_spec()
     assert mla_spec.page_size_bytes == swa_spec.page_size_bytes
     specs = {"mla.0": mla_spec, "mla.1": new_mla_spec(), "swa.0": swa_spec}
     assert group_and_unify_kv_cache_specs(specs) is None
@@ -2138,7 +2742,7 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
     # layers do require tuple packing, so grouping must still be produced.
     mla_spec = new_mla_spec()
-    swa_spec = new_swa_mla_spec(head_size=1024)
+    swa_spec = new_bf16_swa_mla_spec(head_size=1024)
     assert mla_spec.page_size_bytes != swa_spec.page_size_bytes
     specs = {"mla.0": mla_spec, "mla.1": new_mla_spec(), "swa.0": swa_spec}
     grouped = group_and_unify_kv_cache_specs(specs)
@@ -2165,6 +2769,10 @@ def _grouping_config():
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
     )
 
 
@@ -2859,6 +3467,51 @@ def test_unify_kv_cache_spec_page_size_mamba():
         "attn_layer": new_kv_cache_spec(),
     }
     assert kv_cache_utils.unify_kv_cache_spec_page_size(specs) == specs
+
+
+def new_swa_mla_spec(
+    kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+    cache_dtype_str="fp8_ds_mla",
+    sliding_window=128,
+):
+    # DeepSeek-V4 SWA MLA layer: head_size stays semantic (512),
+    # fp8_ds_mla determines the real per-token byte layout.
+    return SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+        kv_quant_mode=kv_quant_mode,
+        cache_dtype_str=cache_dtype_str,
+        sliding_window=sliding_window,
+        model_version="deepseek_v4",
+    )
+
+
+def test_sliding_window_mla_spec_merge_preserves_kv_quant_mode():
+    # DeepSeek-V4 fp8_ds_mla layers must keep kv_quant_mode through merge(),
+    # otherwise the reshape path falls back to the "auto" (unquantized) shape.
+    specs = [new_swa_mla_spec(), new_swa_mla_spec()]
+    merged = SlidingWindowMLASpec.merge(specs)
+    assert merged.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert merged.cache_dtype_str == "fp8_ds_mla"
+
+
+def test_unify_hybrid_preserves_swa_mla_kv_quant_mode():
+    # When the hybrid KV cache manager is disabled, SlidingWindowMLASpec is
+    # converted to MLAAttentionSpec. kv_quant_mode must survive the conversion
+    # so DeepSeek-V4 fp8_ds_mla layers keep the 584-byte layout on reshape.
+    kv_cache_spec = {
+        "full": new_mla_spec(cache_dtype_str="fp8_ds_mla"),
+        "swa_mla": new_swa_mla_spec(),
+        "swa": new_sliding_window_spec(sliding_window=1024),
+    }
+    kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    converted = kv_cache_spec["swa_mla"]
+    assert isinstance(converted, MLAAttentionSpec)
+    assert converted.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert converted.cache_dtype_str == "fp8_ds_mla"
 
 
 def test_hma_not_disabled_when_kv_events_enabled():

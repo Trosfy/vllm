@@ -11,6 +11,8 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    _use_lockstep_mla_allocation,
+    is_deepseek_v4_hybrid_kv_cache_config,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -118,6 +120,11 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        self.lockstep_mla_allocations = _use_lockstep_mla_allocation(
+            kv_cache_config.kv_cache_groups,
+            dcp_world_size,
+            pcp_world_size,
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -163,31 +170,37 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        blocks_by_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
+                blocks_by_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_local_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
+                blocks_by_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_local_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
-        return num_blocks_to_allocate
+        if self.lockstep_mla_allocations:
+            return max(blocks_by_group, default=0)
+        return sum(blocks_by_group)
 
     def allocate_new_computed_blocks(
         self,
@@ -228,12 +241,49 @@ class KVCacheCoordinator(ABC):
                 num_external_computed_tokens,
             )
         if num_external_computed_tokens > 0:
-            for manager in self.single_type_managers:
-                manager.allocate_external_computed_blocks(
+            if not self.lockstep_mla_allocations:
+                for manager in self.single_type_managers:
+                    manager.allocate_external_computed_blocks(
+                        request_id,
+                        num_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+            else:
+                managers = self.single_type_managers
+                assert all(
+                    manager.block_size == managers[0].block_size
+                    for manager in managers[1:]
+                ), "Lockstep MLA managers must use one effective block size"
+
+                # Every lockstep group is MLA (i.e. full attention), so no group
+                # skips tokens and every manager would allocate the same blocks.
+                # Allocate each physical destination block exactly once: the
+                # connector loads every logical KV group into the same block
+                # index, but into that group's distinct KV tensors.
+                old_len = len(managers[0].req_to_blocks[request_id])
+                managers[0].allocate_external_computed_blocks(
                     request_id,
                     num_local_computed_tokens,
                     num_external_computed_tokens,
                 )
+                shared_external_blocks = managers[0].req_to_blocks[request_id][old_len:]
+
+                # One request reference is required per logical manager. The
+                # primary allocation owns the first; touch once for each peer.
+                for manager in managers[1:]:
+                    self.block_pool.touch(shared_external_blocks)
+                    manager.req_to_blocks[request_id].extend(shared_external_blocks)
+
+        if self.lockstep_mla_allocations:
+            group_blocks = [
+                manager.req_to_blocks[request_id]
+                for manager in self.single_type_managers
+            ]
+            block_ids = [block.block_id for block in group_blocks[0]]
+            assert all(
+                [block.block_id for block in blocks] == block_ids
+                for blocks in group_blocks[1:]
+            )
 
     def allocate_new_blocks(
         self,
@@ -259,16 +309,57 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
-        return tuple(
-            manager.allocate_new_blocks(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+        if not self.lockstep_mla_allocations:
+            return tuple(
+                manager.allocate_new_blocks(
+                    request_id,
+                    num_encoder_tokens
+                    if isinstance(manager, CrossAttentionManager)
+                    else num_tokens,
+                    num_tokens_main_model,
+                )
+                for manager in self.single_type_managers
             )
-            for manager in self.single_type_managers
+
+        managers = self.single_type_managers
+        primary_ids = [
+            block.block_id for block in managers[0].req_to_blocks[request_id]
+        ]
+        assert all(
+            [block.block_id for block in manager.req_to_blocks[request_id]]
+            == primary_ids
+            for manager in managers[1:]
         )
+
+        cow_block_idx = managers[0].pending_cow_block_index(request_id)
+        new_blocks = managers[0].allocate_new_blocks(
+            request_id,
+            num_tokens,
+            num_tokens_main_model,
+        )
+        blocks_to_append = new_blocks
+        cow_block = None
+        if cow_block_idx is not None:
+            cow_block = managers[0].req_to_blocks[request_id][cow_block_idx]
+            assert new_blocks and new_blocks[0] is cow_block
+            blocks_to_append = new_blocks[1:]
+
+        for manager in managers[1:]:
+            peer_cow_idx = manager.pending_cow_block_index(request_id)
+            assert peer_cow_idx == cow_block_idx
+            if cow_block_idx is not None:
+                assert cow_block is not None
+                manager.apply_lockstep_cow(request_id, cow_block_idx, cow_block)
+            if blocks_to_append:
+                self.block_pool.touch(blocks_to_append)
+                manager.req_to_blocks[request_id].extend(blocks_to_append)
+
+        final_ids = [block.block_id for block in managers[0].req_to_blocks[request_id]]
+        assert all(
+            [block.block_id for block in manager.req_to_blocks[request_id]] == final_ids
+            for manager in managers[1:]
+        )
+        return tuple(list(new_blocks) for _ in managers)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
@@ -557,25 +648,53 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+        self.has_dcp_replicated_group = any(
+            getattr(group.kv_cache_spec, "dcp_replicated", False)
+            for group in kv_cache_config.kv_cache_groups
+        )
+        # Prefix caching under DCP is unsafe for hybrid layouts whose groups do
+        # not advance from exactly the same cached prefix. Keep the historical
+        # DeepSeek V4 MLA/SWA guard. DFlash is different: the draft KV cache is
+        # replicated and window-bounded under DCP, so prefix-cache hits are safe
+        # as long as the draft group can materialize its local sliding-window
+        # tail and older context slots remain padded.
+        self.disable_prefix_cache_for_dcp_hybrid = (
+            enable_caching
+            and dcp_world_size > 1
+            and pcp_world_size == 1
+            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+        )
         group_block_sizes = [
             manager.block_size for manager in self.single_type_managers
         ]
-        assert all(
-            block_size % hash_block_size == 0 for block_size in group_block_sizes
-        ), (
-            "Each KV cache group's real block_size must be divisible by "
-            f"hash_block_size. block_sizes={group_block_sizes}, "
-            f"hash_block_size={hash_block_size}"
-        )
+        if not self.disable_prefix_cache_for_dcp_hybrid:
+            assert all(
+                block_size % hash_block_size == 0 for block_size in group_block_sizes
+            ), (
+                "Each KV cache group's real block_size must be divisible by "
+                f"hash_block_size. block_sizes={group_block_sizes}, "
+                f"hash_block_size={hash_block_size}"
+            )
+        assert (
+            dcp_world_size == 1
+            or not is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+            or self.disable_prefix_cache_for_dcp_hybrid
+        ), "DCP prefix caching unsupported for the DeepseekV4 MLA/SWA hybrid."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
             # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
+            # state. Sliding-window groups are allowed only when replicated
+            # (DFlash draft KV), and the DeepseekV4 MLA/SWA hybrid is handled
+            # via disable_prefix_cache_for_dcp_hybrid above.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                assert (
+                    isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                    or getattr(g.kv_cache_spec, "dcp_replicated", False)
+                    or is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
+                    "full-attention, Mamba, and dcp_replicated groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Partial hash hits are limited to full-attention + mamba ("align")
@@ -649,7 +768,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
 
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        if (
+            self.dcp_world_size > 1
+            and self.pcp_world_size == 1
+            and self.has_dcp_replicated_group
+        ):
+            # This value drives cascade attention metadata, not prefix-cache
+            # lookup. A DFlash hybrid has sharded target KV plus replicated
+            # sliding-window draft KV. Reporting target common-prefix blocks
+            # while the draft group reports zero can enable cascade attention
+            # for only part of the hybrid execution. Prefix-cache reuse remains
+            # handled by find_longest_cache_hit(), where each group returns the
+            # concrete blocks it can safely replay (including draft tail blocks
+            # and null padding for evicted context).
+            return [0] * len(self.kv_cache_config.kv_cache_groups)
+        return super().get_num_common_prefix_blocks(running_request_id)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        if self.disable_prefix_cache_for_dcp_hybrid:
+            return
+
         if self.enable_partial_hash_hits:
             aligned_num_computed_tokens = num_computed_tokens
         else:
@@ -706,6 +845,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - ``num_uncached_common_prefix_tokens``: a shared prefix that a
                   sparse-retention group has not cached yet (0 unless hybrid).
         """
+        if self.disable_prefix_cache_for_dcp_hybrid:
+            empty_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+                [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
+            )
+            return empty_blocks, 0, 0
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length

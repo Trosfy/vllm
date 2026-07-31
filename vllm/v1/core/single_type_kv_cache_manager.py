@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    get_kv_cache_cp_shard_count,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -75,8 +76,16 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+        # Under (D)CP a request's cache is sharded across ranks, so one local
+        # block of `block_size` slots covers `block_size * cp` tokens of the
+        # global sequence -- scale the scheduler-visible block size to match.
+        # dcp_replicated groups (e.g. the DFlash draft) instead keep the full
+        # cache on every rank, so one block covers exactly `block_size` global
+        # tokens and must not be scaled.
+        if dcp_world_size * pcp_world_size > 1:
+            self.block_size *= get_kv_cache_cp_shard_count(
+                kv_cache_spec, dcp_world_size, pcp_world_size
+            )
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
@@ -402,6 +411,31 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_partial_tail_offloads = []
         return pending
 
+    def pending_cow_block_index(self, request_id: str) -> int | None:
+        """Return the pending partial-hit CoW index without consuming it."""
+        partial_hit = self._partial_hit_reqs.get(request_id)
+        return partial_hit[0] if partial_hit is not None else None
+
+    def apply_lockstep_cow(
+        self,
+        request_id: str,
+        block_idx: int,
+        cow_block: KVCacheBlock,
+    ) -> None:
+        """Mirror a peer manager's CoW substitution using the same block ID.
+
+        The primary manager owns the physical copy operation. A lockstep peer
+        only transfers its request reference from the shared source block to
+        the already allocated destination block.
+        """
+        pending_idx, source_block = self._partial_hit_reqs.pop(request_id)
+        assert pending_idx == block_idx
+        req_blocks = self.req_to_blocks[request_id]
+        assert req_blocks[block_idx] is source_block
+        self.block_pool.touch([cow_block])
+        req_blocks[block_idx] = cow_block
+        self.block_pool.free_blocks([source_block])
+
     def _apply_cow(
         self,
         request_id: str,
@@ -698,10 +732,13 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1:
-            # DCP shards each block's KV across ranks; hashes must be viewed at
-            # the sharded block size.
-            block_size *= dcp_world_size
+        if dcp_world_size * pcp_world_size > 1:
+            # DCP/PCP shard each block's KV across ranks; hashes must be
+            # viewed at the sharded (scaled) block size. Replicated groups
+            # keep the model block size on every rank.
+            block_size *= get_kv_cache_cp_shard_count(
+                kv_cache_spec, dcp_world_size, pcp_world_size
+            )
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -909,8 +946,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        assert dcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "DCP only supports sliding-window KV when it is dcp_replicated."
+        )
+        assert pcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "PCP only supports sliding-window KV when it is dcp_replicated."
+        )
         # Fine-grained partial hits are not supported for sliding window now
         assert alignment_tokens % kv_cache_spec.block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"
@@ -1858,22 +1899,34 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
-    # SlidingWindow / ChunkedLocalAttention managers recycle blocks;
-    # the runtime admission cap must match the recycling-aware bound the
-    # startup pool sizer uses (single source of truth: the spec method).
+    # SlidingWindow / ChunkedLocalAttention managers recycle blocks across
+    # chunks; the runtime admission cap must match the recycling-aware bound
+    # the startup pool sizer uses (single source of truth: the spec method).
     # R-SWA also recycles gap blocks but peak physical KV still fits the
     # full-attention bound (prefix + window <= max_model_len), so it inherits
     # FullAttentionSpec sizing without a separate admission cap.
-    if isinstance(
-        kv_cache_spec,
-        (SlidingWindowSpec, ChunkedLocalAttentionSpec),
-    ):
-        kwargs["max_admission_blocks_per_request"] = (
-            kv_cache_spec.max_admission_blocks_per_request(
-                max_in_flight_tokens=max_in_flight_tokens,
-                max_model_len=max_model_len,
+    if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+        if (
+            isinstance(kv_cache_spec, SlidingWindowMLASpec)
+            and kv_cache_spec.dcp_sharded
+        ):
+            dcp_world_size = kwargs.get("dcp_world_size", 1)
+            pcp_world_size = kwargs.get("pcp_world_size", 1)
+            block_size = kv_cache_spec.block_size * dcp_world_size * pcp_world_size
+            num_tokens = min(
+                kv_cache_spec.sliding_window - 1 + max_in_flight_tokens,
+                max_model_len,
             )
-        )
+            kwargs["max_admission_blocks_per_request"] = (
+                cdiv(num_tokens, block_size) + 1
+            )
+        else:
+            kwargs["max_admission_blocks_per_request"] = (
+                kv_cache_spec.max_admission_blocks_per_request(
+                    max_in_flight_tokens=max_in_flight_tokens,
+                    max_model_len=max_model_len,
+                )
+            )
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
 

@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_cp_shard_count,
+    has_nondefault_kv_cp_layout,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -623,6 +625,26 @@ def hash_block_tokens(
     )
 
 
+def _effective_kv_cache_block_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int,
+) -> int:
+    is_attention_group = isinstance(spec, AttentionSpec) or (
+        isinstance(spec, UniformTypeKVCacheSpecs)
+        and bool(spec.kv_cache_specs)
+        and all(
+            isinstance(inner_spec, AttentionSpec)
+            for inner_spec in spec.kv_cache_specs.values()
+        )
+    )
+    if not is_attention_group:
+        return spec.block_size
+    return spec.block_size * get_kv_cache_cp_shard_count(
+        spec, dcp_world_size, pcp_world_size
+    )
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -644,17 +666,16 @@ def resolve_kv_cache_block_sizes(
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
+    pcp = vllm_config.parallel_config.prefill_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        bs = cache_config.block_size * dcp
+        spec = groups[0].kv_cache_spec
+        bs = _effective_kv_cache_block_size(spec, dcp, pcp)
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
+        _effective_kv_cache_block_size(g.kv_cache_spec, dcp, pcp) for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
@@ -686,6 +707,36 @@ def resolve_kv_cache_block_sizes(
             f"Got group block sizes={group_block_sizes}."
         )
     return scheduler_block_size, hash_block_size
+
+
+def is_deepseek_v4_hybrid_kv_cache_config(
+    kv_cache_config: KVCacheConfig,
+) -> bool:
+    """Return whether the KV layout is DeepSeek V4's MLA/SWA hybrid layout."""
+    if len(kv_cache_config.kv_cache_groups) <= 1:
+        return False
+
+    flattened_specs: list[KVCacheSpec] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            flattened_specs.extend(spec.kv_cache_specs.values())
+        else:
+            flattened_specs.append(spec)
+
+    if not flattened_specs:
+        return False
+    has_deepseek_v4_swa = any(
+        isinstance(spec, SlidingWindowMLASpec)
+        and getattr(spec, "model_version", None) == "deepseek_v4"
+        for spec in flattened_specs
+    )
+    if not has_deepseek_v4_swa:
+        return False
+    return all(
+        isinstance(spec, MLAAttentionSpec | SlidingWindowMLASpec)
+        for spec in flattened_specs
+    )
 
 
 def get_request_block_hasher(
@@ -948,13 +999,29 @@ def get_max_concurrency_for_kv_cache_config(
     a representative per-layer spec (scheduler config), so both capacity
     call sites agree.
     """
-    num_blocks_per_request = sum(
-        cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
-        )
-        for group in kv_cache_config.kv_cache_groups
+    groups = kv_cache_config.kv_cache_groups
+    parallel_config = vllm_config.parallel_config
+    use_pool_memory_math = _use_lockstep_mla_allocation(
+        groups,
+        parallel_config.decode_context_parallel_size,
+        parallel_config.prefill_context_parallel_size,
     )
+    if use_pool_memory_math:
+        max_memory_usage_per_request = _max_memory_usage_bytes_from_groups(
+            vllm_config, groups
+        )
+        memory_per_block = _pool_bytes_per_block(vllm_config, groups)
+        num_blocks_per_request = cdiv(
+            max_memory_usage_per_request, memory_per_block
+        )
+    else:
+        num_blocks_per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in groups
+        )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
@@ -978,6 +1045,16 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
+    parallel_config = vllm_config.parallel_config
+    if _use_lockstep_mla_allocation(
+        kv_cache_groups,
+        parallel_config.decode_context_parallel_size,
+        parallel_config.prefill_context_parallel_size,
+    ):
+        return sum(
+            page_size
+            for page_size, _ in _get_lockstep_mla_tensor_slots(kv_cache_groups)
+        )
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1072,15 +1149,14 @@ def unify_kv_cache_spec_page_size(
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
-    are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Two
-    cases cannot be unified by block size alone and pad their physical page to
-    the maximum instead: Mamba layers, whose page size comes from state shapes
-    and is independent of block size; and attention layers whose page does not
-    evenly divide the maximum and whose backend opts in via
-    ``AttentionSpec.indexes_kv_by_block_stride`` (the padded page is read through
-    a strided view, which not every backend handles). Raise NotImplementedError
-    if failed to unify the page size.
+    are the same, return the original KVCacheSpec. If all specs are the same KV
+    cache type, use the least common multiple as a common page size and scale
+    block sizes. For heterogeneous groups, target the maximum page size. Mamba
+    layers, whose page size is independent of block size, pad their physical
+    page to the target. Attention layers whose page does not evenly divide the
+    target may also pad their physical page when the backend opts in via
+    ``AttentionSpec.indexes_kv_by_block_stride``. Raise NotImplementedError if
+    the page sizes cannot be unified.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1093,10 +1169,13 @@ def unify_kv_cache_spec_page_size(
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
 
-    max_page_size = max(page_sizes)
+    if UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
+        target_page_size = math.lcm(*page_sizes)
+    else:
+        target_page_size = max(page_sizes)
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        if layer_spec.page_size_bytes == target_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         elif isinstance(layer_spec, MambaSpec):
             # MambaSpec's page size is determined by its state shapes and does
@@ -1105,29 +1184,31 @@ def unify_kv_cache_spec_page_size(
             # with the main model's attention page size; it is needed here
             # when another layer (e.g. from a draft model) has a larger page
             # than the already-aligned Mamba page.
-            new_spec: KVCacheSpec = replace(layer_spec, page_size_padded=max_page_size)
-            assert new_spec.page_size_bytes == max_page_size
+            new_spec: KVCacheSpec = replace(
+                layer_spec, page_size_padded=target_page_size
+            )
+            assert new_spec.page_size_bytes == target_page_size
             new_kv_cache_spec[layer_name] = new_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size == 0:
-                ratio = max_page_size // layer_page_size
+            if target_page_size % layer_page_size == 0:
+                ratio = target_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 new_spec = replace(layer_spec, block_size=new_block_size)
             elif (
                 isinstance(layer_spec, AttentionSpec)
                 and layer_spec.indexes_kv_by_block_stride
             ):
-                new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                new_spec = replace(layer_spec, page_size_padded=target_page_size)
             else:
                 raise NotImplementedError(
                     f"Layer {layer_name}: page size is not divisible by the "
-                    "maximum page size and cannot be padded. Padding is only "
+                    "target page size and cannot be padded. Padding is only "
                     "supported for attention layers whose backend indexes KV "
                     "pages by the block stride (indexes_kv_by_block_stride is "
                     "True)."
                 )
-            assert new_spec.page_size_bytes == max_page_size
+            assert new_spec.page_size_bytes == target_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 
@@ -1305,10 +1386,94 @@ def _get_packed_kv_cache_layout(
     return block_stride, layers_by_offset
 
 
+def _is_lockstep_mla_spec_layout(
+    kv_cache_specs: Iterable[KVCacheSpec],
+    dcp_world_size: int,
+    pcp_world_size: int,
+) -> bool:
+    specs = list(kv_cache_specs)
+    if (
+        len(specs) < 2
+        or not isinstance(dcp_world_size, int)
+        or not isinstance(pcp_world_size, int)
+    ):
+        return False
+    cp_world_size = dcp_world_size * pcp_world_size
+    if cp_world_size <= 1:
+        return False
+    if not all(isinstance(spec, MLAAttentionSpec) for spec in specs):
+        return False
+
+    shard_counts = {
+        get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+        for spec in specs
+    }
+    global_block_sizes = {
+        spec.block_size
+        * get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+        for spec in specs
+    }
+    return len(shard_counts) > 1 and len(global_block_sizes) == 1
+
+
+def _use_lockstep_mla_allocation(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    dcp_world_size: int,
+    pcp_world_size: int,
+) -> bool:
+    """Return whether mixed MLA groups can share one block-ID namespace."""
+    if len(kv_cache_groups) < 2:
+        return False
+
+    layer_specs: list[KVCacheSpec] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        group_layer_specs = (
+            list(group_spec.kv_cache_specs.values())
+            if isinstance(group_spec, UniformTypeKVCacheSpecs)
+            else [group_spec]
+        )
+        group_layouts = {
+            get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+            for spec in group_layer_specs
+        }
+        if len(group_layouts) != 1:
+            return False
+        layer_specs.extend(group_layer_specs)
+
+    return _is_lockstep_mla_spec_layout(layer_specs, dcp_world_size, pcp_world_size)
+
+
+def _get_lockstep_mla_tensor_slots(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[tuple[int, list[str]]]:
+    slots: list[tuple[int, list[str]]] = []
+    for group in kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            slots.extend(
+                (group_spec.kv_cache_specs[layer_name].page_size_bytes, [layer_name])
+                for layer_name in group.layer_names
+            )
+        else:
+            slots.extend(
+                (group_spec.page_size_bytes, [layer_name])
+                for layer_name in group.layer_names
+            )
+    return slots
+
+
 def _use_packed_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> bool:
+    parallel_config = vllm_config.parallel_config
+    if _use_lockstep_mla_allocation(
+        kv_cache_groups,
+        parallel_config.decode_context_parallel_size,
+        parallel_config.prefill_context_parallel_size,
+    ):
+        return True
     is_dsv4 = all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
@@ -1334,11 +1499,26 @@ def _get_kv_cache_config_packed(
 ) -> tuple[int, list[KVCacheTensor]]:
     """Plan a packed per-block KV cache tensor layout.
 
-    Cache groups use dense, overlapping layouts within one block slab. Each
-    emitted tensor aliases the same physical backing allocation.
+    Cache groups normally use dense, overlapping layouts within one block
+    slab. Lockstep MLA groups instead get distinct contiguous tensors because
+    their block IDs intentionally coincide.
     """
-    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
+    parallel_config = vllm_config.parallel_config
+    if _use_lockstep_mla_allocation(
+        kv_cache_groups,
+        parallel_config.decode_context_parallel_size,
+        parallel_config.prefill_context_parallel_size,
+    ):
+        tensor_slots = _get_lockstep_mla_tensor_slots(kv_cache_groups)
+        total_num_bytes_per_block = sum(page_size for page_size, _ in tensor_slots)
+        num_blocks = available_memory // total_num_bytes_per_block
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        return num_blocks, [
+            KVCacheTensor(size=page_size * num_blocks, shared_by=slot)
+            for page_size, slot in tensor_slots
+        ]
 
+    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
     num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
@@ -1429,9 +1609,9 @@ def get_kv_cache_config_from_groups(
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+            for group in kv_cache_groups:
+                if i < len(group.layer_names):
+                    shared_by.append(group.layer_names[i])
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
@@ -1493,11 +1673,13 @@ def _promote_local_kv_cache_specs(
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
+                    kv_quant_mode=spec.kv_quant_mode,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
                     cache_dtype_str=spec.cache_dtype_str,
                     alignment=spec.alignment,
                     compress_ratio=spec.compress_ratio,
                     model_version=spec.model_version,
+                    dcp_replicated=spec.dcp_replicated,
                 )
             elif isinstance(spec, SlidingWindowSpec):
                 block_size = full_attention_block_size or spec.block_size
@@ -1510,6 +1692,7 @@ def _promote_local_kv_cache_specs(
                     kv_quant_mode=spec.kv_quant_mode,
                     sliding_window=spec.sliding_window,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
+                    dcp_replicated=spec.dcp_replicated,
                 )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 block_size = full_attention_block_size or spec.block_size
@@ -1591,45 +1774,92 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
 
 def group_and_unify_kv_cache_specs(
     kv_cache_spec: dict[str, KVCacheSpec],
+    dcp_world_size: int = 1,
+    pcp_world_size: int = 1,
 ) -> list[UniformTypeKVCacheSpecs] | None:
     """
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
-    if not any(
+    has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
-    ):
+    )
+    # Sliding-window and other cache types are grouped independently below.
+    # Detect lockstep only across full MLA/indexer specs so those unrelated
+    # groups cannot hide a valid partial-replication layout.
+    lockstep_mla_layout = _is_lockstep_mla_spec_layout(
+        (spec for spec in kv_cache_spec.values() if isinstance(spec, MLAAttentionSpec)),
+        dcp_world_size,
+        pcp_world_size,
+    )
+    # Any non-default CP layout needs a group separate from normally sharded
+    # layers because token ownership and block-table semantics differ.
+    has_custom_cp = any(
+        has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size)
+        and (not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout)
+        for spec in kv_cache_spec.values()
+    )
+    if not (has_swa or has_custom_cp):
         return None
 
-    # SlidingWindowMLASpec models with uniform page sizes don't need tuple packing.
+    # Other uniform page layouts do not need tuple packing.
     page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
-    if len(page_sizes) <= 1:
+    if len(page_sizes) <= 1 and not lockstep_mla_layout:
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
+    grouped_swa_mla_specs: dict[tuple[int, int, bool, bool], dict[str, KVCacheSpec]] = (
+        defaultdict(dict)
+    )
+    # Keep incompatible custom-CP types and page layouts separate. This
+    # includes DFlash drafts and partially/fully replicated MLA indexer caches.
+    grouped_repl_specs: dict[tuple[Any, ...], dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
-    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
-    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
-    # be fragile with only block_size and sliding_window as keys, but fine for now.
+    # NOTE: Here we group SWA layers by (block_size, sliding_window,
+    # dcp_replicated, dcp_sharded), which separates SWA layers, C4I+C4A
+    # layers, C128A layers, and replicated compressor-state groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_swa_mla_specs[
+                (
+                    spec.block_size,
+                    spec.sliding_window,
+                    spec.dcp_replicated,
+                    spec.dcp_sharded,
+                )
+            ][name] = spec
+        elif has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size) and (
+            not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout
+        ):
+            key = (
+                (
+                    type(spec).__name__,
+                    spec.block_size,
+                    spec.page_size_bytes,
+                    get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size),
+                )
+                if isinstance(spec, MLAAttentionSpec)
+                else (type(spec).__name__, spec.block_size)
+            )
+            grouped_repl_specs[key][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
 
-    assert len(mla_specs) > 0
+    if len(mla_specs) == 0:
+        # No full-MLA group to anchor the DeepseekV4 layout; let the generic
+        # paths handle it.
+        return None
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
     assert mla_uniform_spec is not None
 
-    swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
-    for spec_dict in grouped_swa_mla_specs.values():
+    other_uniform_specs: list[UniformTypeKVCacheSpecs] = []
+    for spec_dict in (*grouped_swa_mla_specs.values(), *grouped_repl_specs.values()):
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
-        swa_uniform_specs.append(uniform_spec)
+        other_uniform_specs.append(uniform_spec)
 
-    return [mla_uniform_spec, *swa_uniform_specs]
+    return [mla_uniform_spec, *other_uniform_specs]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1708,8 +1938,17 @@ def _get_kv_cache_groups_uniform_groups(
     ]
 
     swa_mla_specs = grouped_specs[1:]
+    # Non-first groups are SWA-MLA or DCP-replicated caches.
     assert all(
-        isinstance(spec, SlidingWindowMLASpec)
+        isinstance(
+            spec,
+            (
+                MLAAttentionSpec,
+                SlidingWindowMLASpec,
+                FullAttentionSpec,
+                SlidingWindowSpec,
+            ),
+        )
         for group in swa_mla_specs
         for spec in group.kv_cache_specs.values()
     )
@@ -1809,7 +2048,11 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
-    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+    elif grouped_specs := group_and_unify_kv_cache_specs(
+        kv_cache_spec,
+        vllm_config.parallel_config.decode_context_parallel_size,
+        vllm_config.parallel_config.prefill_context_parallel_size,
+    ):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
@@ -1900,6 +2143,21 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    parallel_config = vllm_config.parallel_config
+    if _use_lockstep_mla_allocation(
+        kv_cache_groups,
+        parallel_config.decode_context_parallel_size,
+        parallel_config.prefill_context_parallel_size,
+    ):
+        request_blocks = max(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_groups
+        )
+        return request_blocks * _pool_bytes_per_block(vllm_config, kv_cache_groups)
 
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs

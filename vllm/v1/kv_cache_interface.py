@@ -175,8 +175,21 @@ class KVCacheSpec:
             f"Unsupported KV cache spec type: {type(self)}. "
             "Please register it using @register_kv_cache_spec decorator."
         )
+        # Keep DCP-replicated layers (DFlash draft) out of a shared group with
+        # DCP-sharded layers (MLA target): one group carries a single cp_size.
+        # group_and_unify_kv_cache_specs then routes them as separate groups.
+        self_layout = (
+            getattr(self, "dcp_replicated", False),
+            getattr(self, "dcp_kv_shard_count", None),
+        )
         return all(
-            isinstance(spec, uniform_type_base_spec) for spec in kv_cache_specs.values()
+            isinstance(spec, uniform_type_base_spec)
+            and (
+                getattr(spec, "dcp_replicated", False),
+                getattr(spec, "dcp_kv_shard_count", None),
+            )
+            == self_layout
+            for spec in kv_cache_specs.values()
         )
 
 
@@ -259,6 +272,21 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
+    dcp_replicated: bool = False
+    """Replicate this group's KV cache on every DCP rank instead of
+    sharding it by token position. Used by draft layers whose attention
+    backend cannot reduce across DCP ranks (e.g. the DFlash draft); every
+    rank then stores and attends over the full context."""
+
+    dcp_kv_shard_count: int | None = None
+    """Optional number of unique KV shards inside the configured DCP group.
+
+    ``None`` uses every configured DCP/PCP rank. A proper divisor creates
+    replicated shard groups; for example, four shards under DCP8 stores the
+    same shard on ranks ``r`` and ``r + 4``. Full replication continues to use
+    ``dcp_replicated=True``.
+    """
+
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
@@ -266,8 +294,10 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        if dcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size)
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        cp_shards = get_kv_cache_cp_shard_count(self, dcp_world_size, pcp_world_size)
+        if cp_shards > 1:
+            max_model_len = cdiv(max_model_len, cp_shards)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -317,6 +347,8 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            dcp_replicated=specs[0].dcp_replicated,
+            dcp_kv_shard_count=specs[0].dcp_kv_shard_count,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -348,6 +380,48 @@ class FullAttentionSpec(AttentionSpec):
         return (
             self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
         )
+
+
+def get_kv_cache_cp_shard_count(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> int:
+    """Return the number of unique token-position shards for a cache group."""
+    configured_cp = int(dcp_world_size) * int(pcp_world_size)
+    if configured_cp < 1:
+        raise ValueError(
+            f"Configured context-parallel size must be positive: {configured_cp}"
+        )
+    replicated = bool(getattr(spec, "dcp_replicated", False))
+    override = getattr(spec, "dcp_kv_shard_count", None)
+    if replicated:
+        if override not in (None, 1):
+            raise ValueError(
+                f"dcp_replicated cannot be combined with dcp_kv_shard_count={override}"
+            )
+        return 1
+    if override is None:
+        return configured_cp
+    override = int(override)
+    if pcp_world_size != 1:
+        raise ValueError("Partial KV replication currently requires PCP1")
+    if override < 1 or override > configured_cp or configured_cp % override != 0:
+        raise ValueError(
+            "dcp_kv_shard_count must be a positive divisor of the configured "
+            f"DCP size, got shards={override}, DCP={configured_cp}"
+        )
+    return override
+
+
+def has_nondefault_kv_cp_layout(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+    pcp_world_size: int = 1,
+) -> bool:
+    return get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size) != int(
+        dcp_world_size
+    ) * int(pcp_world_size)
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -406,6 +480,21 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4_ds_mla":
+            # NVFP4 MLA latent: 432 B/token (256B E2M1 NoPE + 32B E4M3 group-16
+            # scales + 16B pad + 128B BF16 RoPE). Same record for the
+            # DeepseekV4 (448-NoPE q_head_dim=512) and GLM/V3.2 (512-NoPE
+            # q_head_dim=576) family specs; the writer asserts kv_lora_rank
+            # so a mismatched geometry fails loudly at store time.
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 432
+            if self.model_version == "glm_fp8_rope":
+                # GLM-only runtime KV format: the 512-D NVFP4 latent remains
+                # byte-identical while the post-RoPE tail is E4M3+FP32 amax.
+                # The GLM model layer sets this private spec marker only for
+                # model_type=glm_moe_dsa. DeepSeek-V4 and V3.2 stay stock.
+                return self.block_size * 368
+            return self.block_size * 432
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
@@ -431,25 +520,33 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        kv_quant_mode_set = set(spec.kv_quant_mode for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
+        dcp_kv_shard_count_set = set(spec.dcp_kv_shard_count for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(kv_quant_mode_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(block_stride_set) == 1
+            and len(dcp_replicated_set) == 1
+            and len(dcp_kv_shard_count_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "dtype, quantization method, compress ratio, model version, and "
+            "KV block stride indexing, and DCP replication mode."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
-            kv_quant_mode=specs[0].kv_quant_mode,
+            dtype=dtype_set.pop(),
+            kv_quant_mode=kv_quant_mode_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
@@ -458,6 +555,8 @@ class MLAAttentionSpec(FullAttentionSpec):
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),
+            dcp_replicated=dcp_replicated_set.pop(),
+            dcp_kv_shard_count=dcp_kv_shard_count_set.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -559,6 +658,10 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
     head_size_v: int = None  # type: ignore[assignment]
+    # Replicate this window-bounded KV group on every DCP rank instead of
+    # sharding by token position. Used by DFlash drafts: the target verifies
+    # every token, while draft attention cannot reduce sharded KV across DCP.
+    dcp_replicated: bool = False
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -608,9 +711,10 @@ class SlidingWindowSpec(AttentionSpec):
         return cdiv(num_tokens, self.block_size) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
+        assert (
+            vllm_config.parallel_config.decode_context_parallel_size == 1
+            or self.dcp_replicated
+        ), "DCP only supports sliding-window KV when it is dcp_replicated."
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
@@ -623,6 +727,7 @@ class SlidingWindowSpec(AttentionSpec):
         return all(
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -636,6 +741,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    dcp_sharded: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -661,6 +767,28 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             * get_dtype_size(self.dtype)
         )
 
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        hf_config = vllm_config.model_config.hf_config
+        is_deepseek_v4_model = getattr(hf_config, "model_type", None) == "deepseek_v4"
+        if (
+            dcp_world_size > 1
+            and pcp_world_size == 1
+            and (self.model_version == "deepseek_v4" or is_deepseek_v4_model)
+        ):
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            block_size = self.block_size
+            if self.dcp_sharded:
+                block_size *= dcp_world_size
+            num_tokens = min(
+                self.sliding_window - 1 + max_num_batched_tokens, max_model_len
+            )
+            max_blocks = cdiv(num_tokens, block_size) + 1
+            return max_blocks * self.page_size_bytes
+        return super().max_memory_usage_bytes(vllm_config)
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
@@ -668,32 +796,44 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             "SlidingWindowMLASpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        kv_quant_mode_set = set(spec.kv_quant_mode for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
+        dcp_sharded_set = set(spec.dcp_sharded for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(kv_quant_mode_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(block_stride_set) == 1
+            and len(dcp_replicated_set) == 1
+            and len(dcp_sharded_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, sliding "
-            "window size, and KV block stride indexing."
+            "dtype, quantization method, compress ratio, model version, "
+            "sliding window size, KV block stride indexing, and DCP sharding "
+            "mode."
         )
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
+            dtype=dtype_set.pop(),
+            kv_quant_mode=kv_quant_mode_set.pop(),
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             sliding_window=sliding_window_set.pop(),
+            dcp_replicated=dcp_replicated_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_sharded=dcp_sharded_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -702,6 +842,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_replicated == self.dcp_replicated
+            and spec.dcp_sharded == self.dcp_sharded
             for spec in kv_cache_specs.values()
         )
 
@@ -847,6 +989,25 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def dcp_replicated(self) -> bool:
+        return all(
+            getattr(spec, "dcp_replicated", False)
+            for spec in self.kv_cache_specs.values()
+        )
+
+    @property
+    def dcp_kv_shard_count(self) -> int | None:
+        shard_counts = {
+            getattr(spec, "dcp_kv_shard_count", None)
+            for spec in self.kv_cache_specs.values()
+        }
+        if len(shard_counts) != 1:
+            raise ValueError(
+                f"A uniform KV cache group cannot mix DCP shard counts: {shard_counts}"
+            )
+        return shard_counts.pop()
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
