@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_name_prefixes,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
@@ -67,6 +68,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
+
+        weight_name_prefixes: tuple[str, ...] | None = None
+        """If defined, load only checkpoint tensor names with these prefixes."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -132,6 +136,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        weight_name_prefixes: tuple[str, ...] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -199,6 +204,7 @@ class DefaultModelLoader(BaseModelLoader):
                 revision,
                 subfolder=subfolder,
                 ignore_patterns=self.load_config.ignore_patterns,
+                weight_name_prefixes=weight_name_prefixes,
             )
         else:
             hf_folder = model_name_or_path
@@ -231,6 +237,12 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
+            hf_weights_files = filter_safetensors_files_by_weight_name_prefixes(
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                weight_name_prefixes,
+            )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -252,6 +264,7 @@ class DefaultModelLoader(BaseModelLoader):
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            source.weight_name_prefixes,
         )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
@@ -268,11 +281,13 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    weight_name_prefixes=source.weight_name_prefixes,
                 )
             elif self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    weight_name_prefixes=source.weight_name_prefixes,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
@@ -282,6 +297,7 @@ class DefaultModelLoader(BaseModelLoader):
                         max_workers=extra_config.get(
                             "num_threads", self.DEFAULT_NUM_THREADS
                         ),
+                        weight_name_prefixes=source.weight_name_prefixes,
                     )
                 else:
                     weights_iterator = safetensors_weights_iterator(
@@ -289,6 +305,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        weight_name_prefixes=source.weight_name_prefixes,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -329,6 +346,9 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            weight_name_prefixes=getattr(
+                model, "checkpoint_weight_name_prefixes", None
+            ),
         )
         yield from self._get_weights_iterator(primary_weights)
 
@@ -346,6 +366,7 @@ class DefaultModelLoader(BaseModelLoader):
             revision=model_config.revision,
             fall_back_to_pt=True,
             allow_patterns_overrides=None,
+            weight_name_prefixes=None,
         )
 
     def _init_ep_weight_filter(self, model_config: ModelConfig) -> None:
@@ -413,6 +434,33 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        if self.load_config.load_format == "instanttensor" and (
+            meta_device_layers := sorted(
+                {
+                    type(quant_method).__name__
+                    for module in model.modules()
+                    if getattr(
+                        (quant_method := getattr(module, "quant_method", None)),
+                        "uses_meta_device",
+                        False,
+                    )
+                }
+            )
+        ):
+            # Online-quantized layers route loads through the layerwise
+            # wrapper, which buffers yielded tensors until a module's last
+            # shard arrives. InstantTensor's copy=False views alias
+            # ring-buffer storage that is recycled as soon as the loader
+            # returns, so deferred replay reads whichever bytes landed there
+            # later -- nondeterministic weight corruption keyed to IO timing.
+            raise ValueError(
+                "load_format='instanttensor' cannot load models with online-"
+                f"quantized (meta-device) layers ({', '.join(meta_device_layers)}): "
+                "deferred weight buffering outlives InstantTensor's zero-copy "
+                "ring-buffer views. Use --load-format safetensors or "
+                "fastsafetensors, whose iterators yield owned tensors."
+            )
+
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (
