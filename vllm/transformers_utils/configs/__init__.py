@@ -51,6 +51,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
     "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
     "KimiK3Config": "vllm.transformers_utils.configs.kimi_k3",
+    "K3DSparkConfig": "vllm.transformers_utils.configs.k3_dspark",
     "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
     "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
@@ -141,6 +142,7 @@ __all__ = [
     "IsaacConfig",
     "KimiK25Config",
     "KimiK3Config",
+    "K3DSparkConfig",
     "KimiLinearConfig",
     "KimiVLConfig",
     "RWConfig",

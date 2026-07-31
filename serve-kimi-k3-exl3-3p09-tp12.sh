@@ -56,6 +56,45 @@ export KDA_DISABLE_AUTOTUNE="${KDA_DISABLE_AUTOTUNE:-1}"
 
 export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-AIO}"
 export INSTANTTENSOR_MAX_FREE_MEM_USAGE="${INSTANTTENSOR_MAX_FREE_MEM_USAGE:-0.6}"
+export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
+
+# Native dense K3 MLA decode on SM120. Override with TRITON_MLA for an A/B run.
+K3_ATTENTION_BACKEND="${K3_ATTENTION_BACKEND:-B12X_MLA}"
+
+# Opt-in Kimi K3 DSpark drafting. The target uses InstantTensor while the
+# smaller draft uses fastsafetensors.
+K3_DSPARK="${K3_DSPARK:-0}"
+K3_DSPARK_ARGS=()
+case "${K3_DSPARK,,}" in
+  0|false|no|off|"")
+    ;;
+  1|true|yes|on)
+    K3_DSPARK_MODEL="${K3_DSPARK_MODEL:-/models/Inferact-Kimi-K3-DSpark-MXFP8}"
+    K3_DSPARK_TOKENS="${K3_DSPARK_TOKENS:-7}"
+    K3_DSPARK_TP_SIZE="${K3_DSPARK_TP_SIZE:-12}"
+    K3_DSPARK_ATTENTION_BACKEND="${K3_DSPARK_ATTENTION_BACKEND:-TRITON_MLA}"
+    K3_DSPARK_KV_CACHE_DTYPE="${K3_DSPARK_KV_CACHE_DTYPE:-fp8}"
+    K3_DSPARK_LOAD_FORMAT="${K3_DSPARK_LOAD_FORMAT:-safetensors}"
+    K3_DSPARK_CONFIG="$(
+      printf \
+        '{"model":"%s","method":"dspark","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,"attention_backend":"%s","kv_cache_dtype":"%s","draft_load_config":{"load_format":"%s"}}' \
+        "${K3_DSPARK_MODEL}" \
+        "${K3_DSPARK_TOKENS}" \
+        "${K3_DSPARK_TP_SIZE}" \
+        "${K3_DSPARK_ATTENTION_BACKEND}" \
+        "${K3_DSPARK_KV_CACHE_DTYPE}" \
+        "${K3_DSPARK_LOAD_FORMAT}"
+    )"
+    K3_DSPARK_ARGS+=(--speculative-config "${K3_DSPARK_CONFIG}")
+    echo \
+      "DSpark enabled with draft: ${K3_DSPARK_MODEL} (${K3_DSPARK_LOAD_FORMAT}, ${K3_DSPARK_ATTENTION_BACKEND}, ${K3_DSPARK_KV_CACHE_DTYPE} KV)" \
+      >&2
+    ;;
+  *)
+    echo "ERROR: K3_DSPARK must be one of 1/0, true/false, yes/no, or on/off; got '${K3_DSPARK}'" >&2
+    exit 1
+    ;;
+esac
 
 K3_PROFILE="${K3_PROFILE:-0}"
 K3_PROFILER_ARGS=()
@@ -141,6 +180,7 @@ exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --tensor-parallel-size 12 \
   --load-format instanttensor \
   --linear-backend b12x \
+  --attention-backend "${K3_ATTENTION_BACKEND}" \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --enable-prefix-caching \
   --enable-auto-tool-choice \
@@ -148,8 +188,10 @@ exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --reasoning-parser kimi_k3 \
   --max-model-len auto \
   --kv-cache-dtype fp8 \
+  --block-size "${K3_BLOCK_SIZE:-128}" \
   --gpu-memory-utilization "${K3_GPU_MEMORY_UTILIZATION:-0.9711}" \
   --max-num-batched-tokens "${K3_MAX_NUM_BATCHED_TOKENS:-1024}" \
   --max-num-seqs "${K3_MAX_NUM_SEQS:-1}" \
+  "${K3_DSPARK_ARGS[@]}" \
   "${K3_PROFILER_ARGS[@]}" \
   "$@"

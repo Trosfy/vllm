@@ -166,6 +166,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         skip_topk: bool = False,
+        non_causal_multi_token_decode: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -215,6 +216,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             use_sparse=self.is_sparse,
             indexer=self.indexer,
             topk_indices_buffer=mla_modules.topk_indices_buffer,
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
         # The deployed NVFP4 writer accepts a scale tensor but discards it and

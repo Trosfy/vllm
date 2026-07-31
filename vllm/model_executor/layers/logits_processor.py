@@ -145,7 +145,8 @@ class LogitsProcessor(PluggableLayer):
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
 
         # Gather logits for TP
-        logits = self._gather_logits(logits)
+        if lm_head.tp_size > 1:
+            logits = self._gather_logits(logits)
 
         # Remove paddings in vocab (if any).
         if logits is not None:
@@ -190,8 +191,7 @@ class LogitsProcessor(PluggableLayer):
 
         if shard_indices.num_added_vocab_padding > 0:
             added_pad_start = (
-                shard_indices.num_org_elements_padded
-                + shard_indices.num_added_elements
+                shard_indices.num_org_elements_padded + shard_indices.num_added_elements
             )
             added_pad_end = (
                 shard_indices.num_org_elements_padded

@@ -605,6 +605,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         use_sparse: bool = False,
         indexer: object | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        non_causal_multi_token_decode: bool = False,
         **extra_impl_args,
     ):
         super().__init__()
@@ -619,6 +620,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
+        self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -1960,6 +1962,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             model_version="glm_fp8_rope" if glm_fp8_rope else None,
             dcp_replicated=dcp_replicated,
+            non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -2630,6 +2633,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     # If set to UNIFORM or VARLEN, this will increase `reorder_batch_threshold` when
     # speculative decoding is enabled.
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
+    supports_non_causal_multi_token_decode: ClassVar[bool] = False
 
     # The threshold for reordering the batch into decode and prefill requests.
     # If > 1, the batch will be reordered such that requests with
@@ -2730,8 +2734,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.compilation_config = vllm_config.compilation_config
         self.vllm_config = vllm_config
         self.device = device
+        self.non_causal_multi_token_decode = getattr(
+            kv_cache_spec, "non_causal_multi_token_decode", False
+        )
 
-        self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
+        layer = self.compilation_config.static_forward_context.get(layer_names[0])
+        self.num_heads = getattr(
+            layer,
+            "num_heads",
+            self.model_config.get_num_attention_heads(parallel_config),
+        )
         self.mla_dims = get_mla_dims(self.model_config)
         self.aot_schedule = current_platform.is_cuda()
 
@@ -2859,13 +2871,39 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold,
-                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+        non_causal_decode = common_attn_metadata.causal is False
+        if non_causal_decode:
+            if not (
+                self.supports_non_causal_multi_token_decode
+                and self.non_causal_multi_token_decode
+            ):
+                raise ValueError(
+                    "Non-causal multi-token MLA requires an explicitly supported "
+                    "attention group."
+                )
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            num_active_reqs = int(torch.count_nonzero(query_lens > 0))
+            uniform_active_queries = num_active_reqs > 0 and bool(
+                torch.all(query_lens[:num_active_reqs] == query_lens[0])
             )
-        )
+            trailing_graph_padding = bool(torch.all(query_lens[num_active_reqs:] == 0))
+            if not (uniform_active_queries and trailing_graph_padding):
+                raise ValueError(
+                    "Non-causal MLA requires a uniform query block; got query "
+                    f"lengths {query_lens.tolist()}."
+                )
+            num_decodes = num_reqs
+            num_prefills = 0
+            num_decode_tokens = num_tokens
+            num_prefill_tokens = 0
+        else:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold,
+                    require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+                )
+            )
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens

@@ -24,8 +24,10 @@ VIRTUAL_TP_PLAN_ATTR = "vllm_virtual_tp_plan"
 VIRTUAL_TP_PROFILE_ATTR = "vllm_virtual_tp_profile"
 _VIRTUAL_TP_PLAN_KIND_B12X_PADDED = "b12x-padded"
 _GQA_GDN_MOE_PROFILE = "gqa-gdn-moe"
+_DENSE_GQA_PROFILE = "dense-gqa"
 _ATTENTION_HEAD_LOCAL_ALIGNMENT = 8
 _MOE_INTERMEDIATE_LOCAL_ALIGNMENT = 32
+_DENSE_GQA_INTERMEDIATE_LOCAL_ALIGNMENT = 32
 _NVFP4_LOCAL_ALIGNMENT = 16
 _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT = 128
 _VOCAB_GLOBAL_ALIGNMENT = 64
@@ -92,6 +94,8 @@ def _build_b12x_virtual_tp_plan(
         return _build_minimax_m3_virtual_tp_plan(model_config, parallel_config)
     if _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE:
         return _build_gqa_gdn_moe_virtual_tp_plan(model_config, parallel_config)
+    if _get_virtual_tp_profile(model_config) == _DENSE_GQA_PROFILE:
+        return _build_dense_gqa_virtual_tp_plan(model_config, parallel_config)
 
     attention_tp_size = parallel_config.tensor_parallel_size
     moe_tp_size = (
@@ -263,6 +267,37 @@ def _build_gqa_gdn_moe_virtual_tp_plan(
     return plan
 
 
+def _build_dense_gqa_virtual_tp_plan(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> dict[str, dict[str, int] | str]:
+    """Build zero-tail padding for a dense GQA transformer draft."""
+    text_config = model_config.hf_text_config
+    tp_size = parallel_config.tensor_parallel_size
+    attention_axis, kv_axis = _make_coupled_virtual_axes(
+        _require_int_attr(text_config, "num_attention_heads"),
+        _require_int_attr(text_config, "num_key_value_heads"),
+        tp_size,
+        ratio_key="q_heads_per_kv",
+        allow_secondary_replication=True,
+    )
+    intermediate_axis = _make_virtual_axis(
+        _require_int_attr(text_config, "intermediate_size"),
+        tp_size,
+        _DENSE_GQA_INTERMEDIATE_LOCAL_ALIGNMENT,
+    )
+    return {
+        "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
+        "model_type": _DENSE_GQA_PROFILE,
+        "attention_heads": attention_axis,
+        "kv_heads": kv_axis,
+        "dense_intermediate_size": intermediate_axis,
+        "vocab_size": _make_virtual_vocab_axis(
+            _require_int_attr(text_config, "vocab_size"), tp_size
+        ),
+    }
+
+
 def _build_minimax_m3_virtual_tp_plan(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
@@ -396,6 +431,9 @@ def _apply_b12x_virtual_tp_plan(
     if plan.get("model_type") == _GQA_GDN_MOE_PROFILE:
         _apply_gqa_gdn_moe_virtual_tp_plan(model_config, plan)
         return
+    if plan.get("model_type") == _DENSE_GQA_PROFILE:
+        _apply_dense_gqa_virtual_tp_plan(model_config, plan)
+        return
 
     configs = tuple(_iter_virtual_tp_configs(model_config))
     attention_axis = _require_axis(plan, "attention_heads")
@@ -517,6 +555,41 @@ def _apply_gqa_gdn_moe_virtual_tp_plan(
         "Automatically enabled B12X virtual TP padding for the %s profile: %s.",
         _GQA_GDN_MOE_PROFILE,
         ", ".join(changes),
+    )
+
+
+def _apply_dense_gqa_virtual_tp_plan(
+    model_config: ModelConfig,
+    plan: dict[str, dict[str, int] | str],
+) -> None:
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    for axis_name, attr in (
+        ("attention_heads", "num_attention_heads"),
+        ("kv_heads", "num_key_value_heads"),
+        ("dense_intermediate_size", "intermediate_size"),
+    ):
+        _apply_virtual_axis_to_config_attr(configs, plan, axis_name, attr)
+    for config in configs:
+        setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
+
+    model_config.model_arch_config = model_config.get_model_arch_config()
+    attention_axis = _require_axis(plan, "attention_heads")
+    kv_axis = _require_axis(plan, "kv_heads")
+    intermediate_axis = _require_axis(plan, "dense_intermediate_size")
+    vocab_axis = _require_axis(plan, "vocab_size")
+    logger.warning(
+        "Enabled virtual TP padding for the %s profile: attention heads "
+        "%d -> %d, KV heads %d -> %d, intermediate size %d -> %d, "
+        "vocab storage size %d -> %d.",
+        _DENSE_GQA_PROFILE,
+        attention_axis["original_size"],
+        attention_axis["padded_size"],
+        kv_axis["original_size"],
+        kv_axis["padded_size"],
+        intermediate_axis["original_size"],
+        intermediate_axis["padded_size"],
+        vocab_axis["original_size"],
+        vocab_axis["padded_size"],
     )
 
 
@@ -713,7 +786,8 @@ def _get_virtual_tp_profile(model_config: ModelConfig) -> str | None:
 
 def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
     return (
-        _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE
+        _get_virtual_tp_profile(model_config)
+        in {_GQA_GDN_MOE_PROFILE, _DENSE_GQA_PROFILE}
         or _is_deepseek_v4_config(model_config)
         or _is_sparse_mla_config(model_config)
         or _is_minimax_m3_config(model_config)

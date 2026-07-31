@@ -1099,6 +1099,7 @@ class DeepseekV2MLAAttention(nn.Module):
         input_size: int | None = None,
         reduce_results: bool = True,
         layer_idx: int | None = None,
+        non_causal_multi_token_decode: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1276,6 +1277,7 @@ class DeepseekV2MLAAttention(nn.Module):
             # _should_skip_index_topk already returns False for MTP/NextN
             # layer ids, so they always start with a populated indexer.
             skip_topk=_skip_topk,
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
     def forward(

@@ -241,6 +241,27 @@ class FakeQwen3NextModelConfig:
         return True
 
 
+class FakeDenseGQADraftModelConfig:
+    def __init__(self):
+        self.hf_text_config = SimpleNamespace(
+            model_type="qwen3",
+            architectures=["Qwen3DSparkModel"],
+            vllm_virtual_tp_profile="dense-gqa",
+            hidden_size=7168,
+            intermediate_size=14336,
+            num_attention_heads=64,
+            num_key_value_heads=16,
+            vocab_size=163840,
+        )
+        self.hf_config = self.hf_text_config
+        self.model_arch_config = self.get_model_arch_config()
+
+    def get_model_arch_config(self):
+        return SimpleNamespace(
+            total_num_attention_heads=self.hf_text_config.num_attention_heads,
+        )
+
+
 def _fake_vllm_config(
     *,
     model_config: Any | None = None,
@@ -504,6 +525,55 @@ def test_b12x_virtual_tp_padding_glm_dsa_draft_precedes_validation():
     spec_config._verify_args()
 
     assert draft_model_config.verified_attention_heads == 66
+
+
+def test_dense_gqa_dspark_draft_virtual_tp12_padding():
+    draft_model_config = FakeDenseGQADraftModelConfig()
+    spec_config = SimpleNamespace(
+        method="dspark",
+        draft_model_config=draft_model_config,
+        draft_parallel_config=SimpleNamespace(tensor_parallel_size=12),
+        target_model_config=object(),
+    )
+
+    SpeculativeConfig._maybe_apply_virtual_tp_to_draft(cast(Any, spec_config))
+
+    config = draft_model_config.hf_text_config
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR)
+    assert config.num_attention_heads == 96
+    assert config.num_key_value_heads == 24
+    assert config.intermediate_size == 14592
+    assert config.original_num_attention_heads == 64
+    assert config.original_num_key_value_heads == 16
+    assert config.original_intermediate_size == 14336
+    assert plan["attention_heads"]["local_size"] == 8
+    assert plan["kv_heads"]["local_size"] == 2
+    assert plan["dense_intermediate_size"]["local_size"] == 1216
+    assert plan["vocab_size"] == {
+        "original_size": 163840,
+        "padded_size": 163968,
+        "tp_size": 12,
+        "local_size": 13664,
+        "padding_size": 192,
+    }
+
+
+def test_dense_gqa_dspark_draft_skips_natively_aligned_tp16():
+    draft_model_config = FakeDenseGQADraftModelConfig()
+    spec_config = SimpleNamespace(
+        method="dspark",
+        draft_model_config=draft_model_config,
+        draft_parallel_config=SimpleNamespace(tensor_parallel_size=16),
+        target_model_config=object(),
+    )
+
+    SpeculativeConfig._maybe_apply_virtual_tp_to_draft(cast(Any, spec_config))
+
+    config = draft_model_config.hf_text_config
+    assert not hasattr(config, VIRTUAL_TP_PLAN_ATTR)
+    assert config.num_attention_heads == 64
+    assert config.num_key_value_heads == 16
+    assert config.intermediate_size == 14336
 
 
 def test_b12x_virtual_tp_padding_minimax_m3_tp3_only():

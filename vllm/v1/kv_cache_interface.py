@@ -406,6 +406,7 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    non_causal_multi_token_decode: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -488,6 +489,9 @@ class MLAAttentionSpec(FullAttentionSpec):
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
             dcp_replicated=dcp_replicated_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
 
