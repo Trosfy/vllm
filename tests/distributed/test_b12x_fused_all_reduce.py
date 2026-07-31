@@ -78,6 +78,7 @@ def make_b12x_custom_allreduce(
     custom_allreduce._IS_CAPTURING = False
     custom_allreduce._ptr = 0
     custom_allreduce.max_size = max(allreduce_max_size, fused_max_size)
+    runtime.algorithm = "oneshot"
     return custom_allreduce, runtime
 
 
@@ -355,6 +356,60 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
     torch.testing.assert_close(residual, expected_residual)
 
 
+def _run_b12x_hierarchical_allreduce_gpu(rank: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(12, 1, rank, str(port), local_rank=rank)
+    tp_group = get_tp_group()
+    custom_allreduce = tp_group.device_communicator.ca_comm
+    assert custom_allreduce is not None
+    assert custom_allreduce.backend_name() == "B12X_PCIE_HIERARCHICAL"
+
+    for elements in (3584, 7168):
+        generator = torch.Generator(device=device).manual_seed(1234 + rank)
+        inp = torch.randn(
+            elements,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        expected = inp.float()
+        dist.all_reduce(expected, group=tp_group.device_group)
+
+        actual = tensor_model_parallel_all_reduce(inp)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(
+            actual.float(),
+            expected,
+            atol=3.125e-2,
+            rtol=0,
+        )
+
+        rank0_actual = actual.clone()
+        dist.broadcast(rank0_actual, src=0, group=tp_group.device_group)
+        torch.testing.assert_close(actual, rank0_actual, atol=0, rtol=0)
+
+        graph_in = inp.clone()
+        graph_in_before = graph_in.clone()
+        with graph_capture(device=device) as capture_context:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_context.stream):
+                graph_out = tensor_model_parallel_all_reduce(graph_in)
+        for _ in range(100):
+            graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(graph_in, graph_in_before, atol=0, rtol=0)
+        torch.testing.assert_close(
+            graph_out.float(),
+            expected,
+            atol=3.125e-2,
+            rtol=0,
+        )
+        rank0_graph_out = graph_out.clone()
+        dist.broadcast(rank0_graph_out, src=0, group=tp_group.device_group)
+        torch.testing.assert_close(graph_out, rank0_graph_out, atol=0, rtol=0)
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.skipif(
     not current_platform.has_device_capability(120),
@@ -374,5 +429,24 @@ def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
         _run_b12x_fused_allreduce_gpu,
         args=(get_open_port(),),
         nprocs=2,
+        join=True,
+    )
+
+
+@multi_gpu_test(num_gpus=12)
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(120),
+    reason="B12X hierarchical PCIe all-reduce test requires SM120",
+)
+def test_b12x_hierarchical_allreduce_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("sparkinfer.comm.pcie")
+    monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
+    monkeypatch.setenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
+    torch.multiprocessing.spawn(
+        _run_b12x_hierarchical_allreduce_gpu,
+        args=(get_open_port(),),
+        nprocs=12,
         join=True,
     )

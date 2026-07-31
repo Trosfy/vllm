@@ -95,14 +95,12 @@ def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
 
 
 @lru_cache(maxsize=1)
-def _load_b12x_pcie_oneshot_pool() -> Any | None:
+def _load_b12x_pcie_allreduce() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import (
-            OneshotAllReducePool as PCIeOneshotAllReducePool,
-        )
+        from sparkinfer.comm.pcie import AllReduce as PCIeAllReduce
     except Exception:
         return None
-    return PCIeOneshotAllReducePool
+    return PCIeAllReduce
 
 
 @lru_cache(maxsize=1)
@@ -354,7 +352,7 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        use_pcie_oneshot = False
+        use_b12x_pcie_allreduce = False
         if b12x_pcie_requested:
             if not current_platform.is_cuda():
                 logger.warning(
@@ -369,7 +367,7 @@ class CustomAllreduce:
                 physical_device_ids,
                 fully_connected,
             )
-            use_pcie_oneshot = True
+            use_b12x_pcie_allreduce = True
         elif not fully_connected:
             if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
                 pcie_backend = _get_pcie_allreduce_backend()
@@ -420,7 +418,7 @@ class CustomAllreduce:
             )
             return
 
-        if use_pcie_oneshot:
+        if use_b12x_pcie_allreduce:
             allow_cross_numa = envs.VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA
             if _is_cross_numa_topology(physical_device_ids) and not allow_cross_numa:
                 logger.warning(
@@ -431,11 +429,11 @@ class CustomAllreduce:
                     physical_device_ids,
                 )
                 return
-            pool_cls = _load_b12x_pcie_oneshot_pool()
-            if pool_cls is None:
+            allreduce_cls = _load_b12x_pcie_allreduce()
+            if allreduce_cls is None:
                 logger.warning(
                     "PCIe custom allreduce was requested, but "
-                    "sparkinfer.comm.pcie.OneshotAllReducePool is unavailable."
+                    "sparkinfer.comm.pcie.AllReduce is unavailable."
                 )
                 return
             # DMA must accommodate the largest scheduled prefill tensor. The
@@ -477,7 +475,7 @@ class CustomAllreduce:
             pcie_runtime = None
             pcie_init_error: Exception | None = None
             try:
-                pcie_runtime = pool_cls.from_exchange_group(
+                pcie_runtime = allreduce_cls.from_exchange_group(
                     exchange_group=self.nccl_group,
                     device=self.device,
                     eager_buffer_bytes=pcie_oneshot_buffer_size,
@@ -510,67 +508,74 @@ class CustomAllreduce:
                 return
             assert pcie_runtime is not None
             self._pcie_runtime = pcie_runtime
-            # Prefill-size DMA allreduce alongside the oneshot. Its fixed
-            # lower bound is applied after every rank initializes cleanly.
-            dma_cls = _load_b12x_pcie_dma()
-            if dma_cls is None:
-                logger.warning(
-                    "b12x PCIe DMA allreduce unavailable "
-                    "(sparkinfer.comm.pcie.DmaAllReduce not importable); "
-                    "large allreduces stay on PyNCCL."
-                )
-            else:
-                dma = None
-                dma_error: Exception | None = None
-                dma_fp8 = os.getenv(
-                    "VLLM_PCIE_DMA_FP8", os.getenv("B12X_PCIE_DMA_FP8", "")
-                )
-                logger.debug(
-                    "b12x PCIe DMA allreduce fp8 request: "
-                    "VLLM_PCIE_DMA_FP8=%r B12X_PCIE_DMA_FP8=%r -> %r",
-                    os.getenv("VLLM_PCIE_DMA_FP8"),
-                    os.getenv("B12X_PCIE_DMA_FP8"),
-                    dma_fp8,
-                )
-                try:
-                    dma = dma_cls(
-                        exchange_group=self.nccl_group,
-                        device=self.device,
-                        max_bytes=pcie_buffer_size,
-                        fp8=dma_fp8,
-                    )
-                except Exception as exc:
-                    dma_error = exc
-                dma_failed = torch.tensor(
-                    [int(dma_error is not None)], dtype=torch.int, device="cpu"
-                )
-                dist.all_reduce(dma_failed, op=dist.ReduceOp.MAX, group=self.group)
-                if int(dma_failed.item()) != 0:
-                    if dma is not None:
-                        dma.close()
+            if not hasattr(pcie_runtime, "all_reduce_fused_add_rms_norm"):
+                self._pcie_fused_add_rms_norm_max_size = 0
+
+            if pcie_runtime.supports_all_peer_auxiliary:
+                # Prefill-size DMA allreduce alongside the oneshot. Its fixed
+                # lower bound is applied after every rank initializes cleanly.
+                dma_cls = _load_b12x_pcie_dma()
+                if dma_cls is None:
                     logger.warning(
-                        "b12x PCIe DMA allreduce initialization failed "
-                        "(rank %d error: %s); large allreduces stay on PyNCCL.",
-                        rank,
-                        dma_error,
+                        "b12x PCIe DMA allreduce unavailable "
+                        "(sparkinfer.comm.pcie.DmaAllReduce not importable); "
+                        "large allreduces stay on PyNCCL."
                     )
                 else:
-                    assert dma is not None
-                    dma.min_bytes = _B12X_PCIE_DMA_MIN_BYTES
-                    self._pcie_dma = dma
-                    logger.debug("b12x PCIe DMA allreduce wire mode: %s", dma.wire_mode)
+                    dma = None
+                    dma_error: Exception | None = None
+                    dma_fp8 = os.getenv(
+                        "VLLM_PCIE_DMA_FP8", os.getenv("B12X_PCIE_DMA_FP8", "")
+                    )
+                    logger.debug(
+                        "b12x PCIe DMA allreduce fp8 request: "
+                        "VLLM_PCIE_DMA_FP8=%r B12X_PCIE_DMA_FP8=%r -> %r",
+                        os.getenv("VLLM_PCIE_DMA_FP8"),
+                        os.getenv("B12X_PCIE_DMA_FP8"),
+                        dma_fp8,
+                    )
+                    try:
+                        dma = dma_cls(
+                            exchange_group=self.nccl_group,
+                            device=self.device,
+                            max_bytes=pcie_buffer_size,
+                            fp8=dma_fp8,
+                        )
+                    except Exception as exc:
+                        dma_error = exc
+                    dma_failed = torch.tensor(
+                        [int(dma_error is not None)], dtype=torch.int, device="cpu"
+                    )
+                    dist.all_reduce(dma_failed, op=dist.ReduceOp.MAX, group=self.group)
+                    if int(dma_failed.item()) != 0:
+                        if dma is not None:
+                            dma.close()
+                        logger.warning(
+                            "b12x PCIe DMA allreduce initialization failed "
+                            "(rank %d error: %s); large allreduces stay on PyNCCL.",
+                            rank,
+                            dma_error,
+                        )
+                    else:
+                        assert dma is not None
+                        dma.min_bytes = _B12X_PCIE_DMA_MIN_BYTES
+                        self._pcie_dma = dma
+                        logger.debug(
+                            "b12x PCIe DMA allreduce wire mode: %s", dma.wire_mode
+                        )
 
             if rank == 0:
                 logger.info(
-                    "Configured b12x PCIe crossovers: "
-                    "oneshot max=%d, fused max=%d, DMA min=%d.",
+                    "Configured b12x PCIe allreduce: "
+                    "algorithm=%s, max=%d, fused max=%d, DMA=%s.",
+                    pcie_runtime.algorithm,
                     self._pcie_allreduce_max_size,
                     self._pcie_fused_add_rms_norm_max_size,
-                    _B12X_PCIE_DMA_MIN_BYTES,
+                    "enabled" if self._pcie_dma is not None else "disabled",
                 )
             self.disabled = False
             logger.debug(
-                "Using b12x PCIe oneshot allreduce backend "
+                "Using b12x PCIe allreduce backend "
                 "(world_size=%d, allreduce_max_size=%d, "
                 "fused_add_rms_norm_max_size=%d, oneshot_buffer_size=%d, "
                 "dma_buffer_size=%d, "
@@ -781,9 +786,10 @@ class CustomAllreduce:
 
     def backend_name(self) -> str:
         if self._pcie_runtime is not None:
+            algorithm = self._pcie_runtime.algorithm.upper()
             if self._pcie_dma is not None:
-                return "B12X_PCIE_ONESHOT_DMA"
-            return "B12X_PCIE_ONESHOT"
+                return f"B12X_PCIE_{algorithm}_DMA"
+            return f"B12X_PCIE_{algorithm}"
         if self._pcie_cpp_backend:
             return "CUSTOM_CPP_PCIE"
         return "CUSTOM"
