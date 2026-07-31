@@ -264,6 +264,15 @@ def _unique_tensor_storage_bytes(*buffers: Any) -> int:
     return total
 
 
+def _scratch_view(backing: torch.Tensor, spec: Any) -> torch.Tensor:
+    """Return a typed plan-scratch view over a shared byte arena."""
+
+    nbytes = int(spec.dtype.itemsize)
+    for dim in spec.shape:
+        nbytes *= int(dim)
+    return backing.narrow(0, 0, nbytes).view(spec.dtype).view(tuple(spec.shape))
+
+
 def _positive_env_int(name: str, default: int) -> int:
     # An env var that is present but blank means "unset". Compose and Kubernetes
     # both render an unset variable as the empty string, so int("") would abort
@@ -1570,7 +1579,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return (128, 128, 128, 128)
 
     def _prepare_mixed_rank_sliced_weights(self, layer: RoutedExperts) -> None:
-        api = _load_sparkinfer_mixed_trellis()
+        mixed_api = _load_sparkinfer_mixed_trellis()
+        fused_api = _load_sparkinfer_fused_moe()
         num_experts = int(layer.local_num_experts)
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
@@ -1609,9 +1619,36 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         down_suh = self._rank_sliced_backing(layer, "w2_suh")
         down_svh = self._rank_sliced_backing(layer, "w2_svh")
         device = gate_suh.device
-        tile_config = self._mixed_trellis_tile_config(hidden_size, intermediate_size)
+        mixed_tile_config = self._mixed_trellis_tile_config(
+            hidden_size, intermediate_size
+        )
+        serial_tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
+        marker = layer.w13_mcg.exl3_tensors[(0, "w1")]
+        tier_order = tuple(
+            expert_id for expert_ids in tiers.values() for expert_id in expert_ids
+        )
+        tier_index = torch.tensor(tier_order, dtype=torch.long, device=device)
+        combined_gate_suh = gate_suh.index_select(0, tier_index).contiguous()
+        combined_up_suh = up_suh.index_select(0, tier_index).contiguous()
+        combined_intermediate_rotations = torch.cat(
+            (
+                gate_svh.index_select(0, tier_index),
+                up_svh.index_select(0, tier_index),
+                down_suh.index_select(0, tier_index),
+            ),
+            dim=1,
+        ).contiguous()
+        combined_down_svh = down_svh.index_select(0, tier_index).contiguous()
+        combined_rotations = SimpleNamespace(
+            intermediate=combined_intermediate_rotations,
+            gate_suh=combined_gate_suh,
+            up_suh=combined_up_suh,
+            down_svh=combined_down_svh,
+        )
         prepared_tiers = []
+        serial_tiers = []
         tier_ids = []
+        tier_offset = 0
         for bits, expert_ids in tiers.items():
             expected_last = 16 * bits
             w13 = torch.stack(
@@ -1651,27 +1688,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
 
             index = torch.tensor(expert_ids, dtype=torch.long, device=device)
-            tier_gate_suh = gate_suh.index_select(0, index).contiguous()
-            tier_up_suh = up_suh.index_select(0, index).contiguous()
-            intermediate_rotations = torch.cat(
-                (
-                    gate_svh.index_select(0, index),
-                    up_svh.index_select(0, index),
-                    down_suh.index_select(0, index),
-                ),
-                dim=1,
-            ).contiguous()
-            tier_down_svh = down_svh.index_select(0, index).contiguous()
+            tier_slice = slice(tier_offset, tier_offset + len(expert_ids))
+            tier_gate_suh = combined_gate_suh[tier_slice]
+            tier_up_suh = combined_up_suh[tier_slice]
+            intermediate_rotations = combined_intermediate_rotations[tier_slice]
+            tier_down_svh = combined_down_svh[tier_slice]
             prepared_tiers.append(
-                api.prepare_weights(
+                mixed_api.prepare_weights(
                     w13=w13,
                     w2=w2,
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
                     num_experts=len(expert_ids),
                     activation=layer.activation.value,
-                    fc1_tile_n=tile_config[1],
-                    fc2_tile_n=tile_config[3],
+                    fc1_tile_n=mixed_tile_config[1],
+                    fc2_tile_n=mixed_tile_config[3],
                     params_dtype=torch.float16,
                     w13_layout="trellis3_t256_proj",
                     trellis_bits=bits,
@@ -1680,25 +1711,64 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     up_suh=tier_up_suh,
                     intermediate_rotations=intermediate_rotations,
                     down_svh=tier_down_svh,
-                    tile_config=tile_config,
+                    tile_config=mixed_tile_config,
                     workspace=w13.view(torch.int32).reshape(-1)[:1],
                 )
             )
+            serial_weight_plan = fused_api.plan_weights(
+                quant_modes="w4a16",
+                source_format="exl3_trellis_mcg",
+                activation=layer.activation.value,
+                params_dtype=layer.exl3_params_dtype,
+                num_experts=len(expert_ids),
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                w13_layout="w13",
+                trellis_bits=bits,
+                trellis_tile_config=serial_tile_config,
+            )
+            serial_weights = fused_api.prepare_weights(
+                plan=serial_weight_plan,
+                params_dtype=layer.exl3_params_dtype,
+                w1_fp4=w13,
+                w2_fp4=w2,
+                gate_suh=tier_gate_suh,
+                up_suh=tier_up_suh,
+                intermediate_rotations=intermediate_rotations,
+                down_svh=tier_down_svh,
+                trellis_mcg=marker,
+            )
+            route_expert_map = torch.full(
+                (num_experts,), -1, dtype=torch.int32, device=device
+            )
+            route_expert_map[index] = torch.arange(
+                len(expert_ids), dtype=torch.int32, device=device
+            )
+            serial_tiers.append(
+                {
+                    "bits": bits,
+                    "weights": serial_weights,
+                    "route_expert_map": route_expert_map,
+                }
+            )
             tier_ids.append(expert_ids)
+            tier_offset += len(expert_ids)
 
-        global_to_combined, descriptor_map = api.build_tiered_maps(
+        global_to_combined, descriptor_map = mixed_api.build_tiered_maps(
             tier_ids[0], tier_ids[1], device=device
         )
         layer.exl3_mixed_trellis = {
             "tiers": tuple(prepared_tiers),
+            "serial_tiers": tuple(serial_tiers),
             "tier_ids": tuple(tier_ids),
             "tier_bits": tuple(tiers),
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
-            "rotations": api.combine_trellis_rotations(*prepared_tiers),
-            "tile_config": tile_config,
+            "rotations": combined_rotations,
+            "tile_config": mixed_tile_config,
+            "serial_tile_config": serial_tile_config,
         }
-        layer.exl3_trellis_tile_config = tile_config
+        layer.exl3_trellis_tile_config = serial_tile_config
 
         # The prepared tier objects own compact, tier-ordered copies. Release
         # per-expert source tensors and the original rotation slabs now rather
@@ -1834,6 +1904,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         mixed = layer.exl3_mixed_trellis
         max_decode_m = _positive_env_int("VLLM_EXL3_TRELLIS_MAX_M", 32)
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+        prefill_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
         if max_decode_m > max_batched_tokens:
             max_decode_m = max_batched_tokens
         topk = int(topk_ids.shape[1])
@@ -1853,6 +1924,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             max_decode_m,
             max_batched_tokens,
             mixed["tile_config"],
+            mixed["serial_tile_config"],
+            prefill_block_m,
         )
         runtime = _MIXED_TRELLIS_RUNTIMES.get(key)
         if runtime is not None:
@@ -1868,18 +1941,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{topk_ids.dtype}"
             )
 
-        api = _load_sparkinfer_mixed_trellis()
+        mixed_api = _load_sparkinfer_mixed_trellis()
+        fused_api = _load_sparkinfer_fused_moe()
         device = x.device
         props = torch.cuda.get_device_properties(device)
         total_experts = sum(experts for _, experts in tier_signature)
 
-        def make_state(capacity: int) -> dict[str, Any]:
-            route_slots = api.max_packed_route_slots(
+        def make_decode_state(capacity: int) -> dict[str, Any]:
+            route_slots = mixed_api.max_packed_route_slots(
                 capacity * topk,
                 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE,
                 total_experts,
             )
-            launch = api.compile_mixed_trellis(
+            launch = mixed_api.compile_mixed_trellis(
                 size_m=capacity,
                 hidden_size=int(layer.exl3_hidden_size),
                 intermediate_size=int(layer.exl3_intermediate_size_per_partition),
@@ -1900,37 +1974,70 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return {
                 "capacity": capacity,
                 "launch": launch,
-                "buffers": api.make_mixed_trellis_buffers(
+                "buffers": mixed_api.make_mixed_trellis_buffers(
                     launch,
                     device=device,
                     sms=int(props.multi_processor_count),
                 ),
             }
 
-        decode = make_state(max_decode_m)
-        prefill = (
-            make_state(max_batched_tokens)
-            if max_batched_tokens > max_decode_m
-            else decode
-        )
+        decode = make_decode_state(max_decode_m)
+        prefill_plans = []
+        prefill_arena = None
+        prefill_accum = None
+        if max_batched_tokens > max_decode_m:
+            if os.environ.get("VLLM_EXL3_PREFILL_TRELLIS", "1") != "1":
+                raise ValueError("mixed-K EXL3 requires VLLM_EXL3_PREFILL_TRELLIS=1")
+            scratch_bytes = 0
+            for tier in mixed["serial_tiers"]:
+                caps = fused_api.Caps(
+                    max_tokens=max_batched_tokens,
+                    num_topk=topk,
+                    route_num_experts=total_experts,
+                    device=device,
+                    weight_plan=tier["weights"].plan,
+                    quant_mode="w4a16",
+                    w4a16_block_size_m=prefill_block_m,
+                )
+                plan = fused_api.plan(caps)
+                prefill_plans.append(plan)
+                spec = plan.scratch_specs()[0]
+                size = int(spec.dtype.itemsize)
+                for dim in spec.shape:
+                    size *= int(dim)
+                scratch_bytes = max(scratch_bytes, size)
+            prefill_arena = torch.empty(scratch_bytes, dtype=torch.uint8, device=device)
+            prefill_accum = torch.empty(
+                (max_batched_tokens, int(layer.exl3_hidden_size)),
+                dtype=torch.float32,
+                device=device,
+            )
         runtime = {
-            "api": api,
+            "mixed_api": mixed_api,
+            "fused_api": fused_api,
             "decode": decode,
-            "prefill": prefill,
+            "prefill_plans": tuple(prefill_plans),
+            "prefill_arena": prefill_arena,
+            "prefill_accum": prefill_accum,
             "max_decode_m": max_decode_m,
             "max_batched_tokens": max_batched_tokens,
         }
         _MIXED_TRELLIS_RUNTIMES[key] = runtime
-        buffer_bytes = _unique_tensor_storage_bytes(
-            decode["buffers"], prefill["buffers"]
+        decode_bytes = _unique_tensor_storage_bytes(decode["buffers"])
+        prefill_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (prefill_arena, prefill_accum)
+            if tensor is not None
         )
         logger.info_once(
-            "EXL3 mixed Trellis runtime planned: tiers=%s decode_capacity=%d "
-            "prefill_capacity=%d buffers=%.1f MiB",
+            "EXL3 mixed Trellis runtime planned: tiers=%s one-grid decode=%d "
+            "serial prefill=%d block_m=%d buffers=%.1f+%.1f MiB",
             tier_signature,
             max_decode_m,
             max_batched_tokens,
-            buffer_bytes / (1 << 20),
+            prefill_block_m,
+            decode_bytes / (1 << 20),
+            prefill_bytes / (1 << 20),
         )
         return runtime
 
@@ -1948,23 +2055,53 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "mixed-bitrate EXL3 batch exceeds planned capacity: "
                 f"m={m}, capacity={runtime['max_batched_tokens']}"
             )
-        state = (
-            runtime["decode"] if m <= runtime["max_decode_m"] else runtime["prefill"]
-        )
         mixed = layer.exl3_mixed_trellis
-        output = runtime["api"].run_mixed_trellis(
-            x,
-            mixed["tiers"][0],
-            mixed["tiers"][1],
-            topk_weights,
-            topk_ids,
-            mixed["global_to_combined"],
-            mixed["descriptor_map"],
-            mixed["rotations"],
-            state["launch"],
-            state["buffers"],
-        )
-        return output.to(x.dtype)
+        # The cooperative mixed-K grid wins at small M, but its SM120 path is
+        # currently limited to route block 8.  Homogeneous tier plans support
+        # block 64 and are substantially faster for prefill, so keep the
+        # one-grid launch for decode and dispatch large M through the two
+        # serial tiers until the mixed kernel gains an efficient large block.
+        if m <= runtime["max_decode_m"]:
+            state = runtime["decode"]
+            output = runtime["mixed_api"].run_mixed_trellis(
+                x,
+                mixed["tiers"][0],
+                mixed["tiers"][1],
+                topk_weights,
+                topk_ids,
+                mixed["global_to_combined"],
+                mixed["descriptor_map"],
+                mixed["rotations"],
+                state["launch"],
+                state["buffers"],
+            )
+            return output.to(x.dtype)
+
+        if runtime["prefill_arena"] is None or runtime["prefill_accum"] is None:
+            raise RuntimeError("mixed-K EXL3 serial prefill plan is unavailable")
+        accum = runtime["prefill_accum"][:m]
+        first = True
+        for plan, tier in zip(
+            runtime["prefill_plans"], mixed["serial_tiers"], strict=True
+        ):
+            binding = runtime["fused_api"].bind(
+                plan,
+                scratch=_scratch_view(
+                    runtime["prefill_arena"], plan.scratch_specs()[0]
+                ),
+                a=x,
+                experts=tier["weights"],
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                route_expert_map=tier["route_expert_map"],
+                output_expert_map=tier["route_expert_map"],
+                output=accum if first else None,
+            )
+            output = runtime["fused_api"].run(binding=binding)
+            if not first:
+                accum.add_(output)
+            first = False
+        return accum.to(x.dtype)
 
     def _rank_sliced_runtime(
         self,
