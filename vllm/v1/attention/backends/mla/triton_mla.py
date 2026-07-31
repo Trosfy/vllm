@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 # so the two cannot drift). Both are hardware dependent.
 _MIN_WORK_PER_SPLIT = 512
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
+_MAX_KV_SPLITS = 8
 
 
 def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
@@ -43,7 +44,10 @@ def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
     # maximum (occupancy multiplier allows multiple blocks per SM
     # for latency hiding).
     ideal_splits = triton.next_power_of_2(max(1, max_seq_len // _MIN_WORK_PER_SPLIT))
-    max_splits = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER
+    max_splits = min(
+        sm_count * _SPLIT_OCCUPANCY_MULTIPLIER,
+        _MAX_KV_SPLITS,
+    )
     return min(ideal_splits, max_splits)
 
 
