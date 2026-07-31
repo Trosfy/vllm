@@ -58,6 +58,9 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.acceptance_length import (
+    AcceptanceLengthController,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -246,12 +249,22 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.acceptance_length_controller: AcceptanceLengthController | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
+            if (
+                observation_window := (
+                    speculative_config.adaptive_speculative_tokens_window
+                )
+            ) is not None:
+                self.acceptance_length_controller = AcceptanceLengthController(
+                    max_num_spec_tokens=self.num_spec_tokens,
+                    observation_window=observation_window,
                 )
             if speculative_config.use_eagle():
                 self.use_eagle = True
@@ -1190,11 +1203,16 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
+        num_spec_tokens_to_schedule = (
+            self.acceptance_length_controller.num_spec_tokens
+            if self.acceptance_length_controller is not None
+            else self.num_spec_tokens
+        )
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+            num_spec_tokens_to_schedule = min(
+                num_spec_tokens_to_schedule,
+                self.dynamic_sd_lookup[len(num_scheduled_tokens)],
+            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1730,6 +1748,12 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        adaptive_num_drafts = 0
+        adaptive_num_draft_tokens = 0
+        adaptive_num_accepted_tokens = 0
+        acceptance_length_controller = getattr(
+            self, "acceptance_length_controller", None
+        )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1773,6 +1797,10 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                if acceptance_length_controller is not None:
+                    adaptive_num_drafts += 1
+                    adaptive_num_draft_tokens += num_draft_tokens
+                    adaptive_num_accepted_tokens += num_accepted
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption
@@ -1942,6 +1970,36 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if acceptance_length_controller is not None:
+            update = acceptance_length_controller.observe_batch(
+                num_drafts=adaptive_num_drafts,
+                num_draft_tokens=adaptive_num_draft_tokens,
+                num_accepted_tokens=adaptive_num_accepted_tokens,
+            )
+            if (
+                update is not None
+                and update.previous_num_spec_tokens != update.num_spec_tokens
+            ):
+                logger.debug(
+                    "Adaptive speculative depth changed from %d to %d "
+                    "(mean accepted drafts: %.2f, mean attempted drafts: %.2f, "
+                    "window: %d steps).",
+                    update.previous_num_spec_tokens,
+                    update.num_spec_tokens,
+                    update.mean_num_accepted_tokens,
+                    update.mean_num_draft_tokens,
+                    acceptance_length_controller.observation_window,
+                )
+
+        if spec_decoding_stats is not None:
+            spec_decoding_stats.current_num_spec_tokens = (
+                acceptance_length_controller.num_spec_tokens
+                if acceptance_length_controller is not None
+                else scheduler_output.resolve_num_spec_tokens_to_schedule(
+                    self.num_spec_tokens
+                )
+            )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
