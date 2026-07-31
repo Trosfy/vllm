@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Kimi-K3 keep+EXL3-3.0 (kquant Phase B) at TP=12, eager bring-up.
-# Mirrors Martin's proven TP16 config where possible: KDA projections stay
-# BF16 (overlay covers MLA attention + shared experts only), which the
-# 3.19 bpw budget affords at TP12.
+# Uses the packaged checkpoint's serialized MXFP8 non-expert weights; no
+# online quantization overlay is involved.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +26,7 @@ export KDA_DISABLE_AUTOTUNE=1
 # I=256 divides 128); the hybrid kept-tier launches are built for w4a16.
 # Revisit W4A8 during the perf pass.
 export B12X_MOE_FORCE_A16=1
-# Route online MXFP8 dense linears through sparkinfer B12X GEMM (flashinfer
+# Route serialized MXFP8 dense linears through sparkinfer B12X GEMM (flashinfer
 # mm_mxfp8 does not exist in this build) - from Martin's hard-won constraints.
 export VLLM_USE_B12X_FP8_GEMM=1
 # First-request decode-shape CuTe compiles can exceed the 300s default;
@@ -40,11 +39,6 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export INSTANTTENSOR_MAX_FREE_MEM_USAGE=0.6
 export INSTANTTENSOR_BACKEND=AIO
 
-# KDA fat projections (q/k/v/o) join the MXFP8 overlay (-2.05 GiB/rank);
-# the exp-compounding gate-adjacent paths (g/f_a/f_b/b_proj/conv1d) and
-# kv_b_proj stay BF16.
-OVERLAY='{"linear":{"weight":"mxfp8"},"shared_experts":{"weight":"mxfp8"},"ignore":["re:.*kv_b_proj","re:.*conv1d","re:.*\\.b_proj","re:.*\\.q_proj","re:.*\\.k_proj","re:.*\\.v_proj","re:.*\\.g_proj","re:.*f_a_proj","re:.*f_b_proj","re:.*o_proj","re:.*lm_head","re:.*attn_res"]}'
-
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   "${MODEL_DIR:-/models/Kimi-K3-EXL3-3p14-serve}" \
   --served-model-name kimi-k3-exl3 \
@@ -54,7 +48,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --max-model-len "${MAX_MODEL_LEN:-4096}" \
   --tensor-parallel-size 12 \
   --enforce-eager \
-  --load-format safetensors \
+  --load-format "${LOAD_FORMAT:-instanttensor}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.985}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-1024}" \
   --max-num-seqs "${MAX_NUM_SEQS:-2}" \
