@@ -81,6 +81,31 @@ def test_ds4_launcher_enables_native_kv_offload(tmp_path: Path) -> None:
 
     assert "--kv-offloading-size 5.5" in output
     assert "--kv-offloading-backend native" in output
+    assert "allocator=expandable_segments:False" in output
+
+
+def test_ds4_launcher_native_offload_preserves_other_allocator_settings(
+    tmp_path: Path,
+) -> None:
+    output = _dry_run(
+        tmp_path,
+        KV_OFFLOADING_SIZE="5.5",
+        PYTORCH_CUDA_ALLOC_CONF=(
+            "max_split_size_mb:256,expandable_segments:True"
+        ),
+    )
+
+    assert (
+        "allocator=max_split_size_mb:256,expandable_segments:False" in output
+    )
+
+
+def test_ds4_launcher_without_offload_keeps_expandable_segments(
+    tmp_path: Path,
+) -> None:
+    output = _dry_run(tmp_path)
+
+    assert "allocator=expandable_segments:True" in output
 
 
 def test_ds4_launcher_zero_kv_offload_stays_disabled(tmp_path: Path) -> None:

@@ -438,7 +438,16 @@ offloading_args=()
 if [[ -n "${kv_offloading_size}" \
   && ! "${kv_offloading_size}" =~ ^0*([.]0*)?$ ]]; then
   # This is the total host-cache capacity across all TP ranks, matching the
-  # vLLM CLI contract. LMCache remains a separate deployment mode.
+  # vLLM CLI contract. LMCache remains a separate deployment mode. Native KV
+  # offload pins/registers GPU cache allocations, so PyTorch's remappable VMM
+  # segments must be disabled while preserving any other allocator settings.
+  allocator_config=${PYTORCH_CUDA_ALLOC_CONF:-}
+  if [[ -z "${allocator_config}" ]]; then
+    allocator_config=expandable_segments:False
+  elif [[ "${allocator_config}" =~ (^|,)expandable_segments:True(,|$) ]]; then
+    allocator_config=${allocator_config//expandable_segments:True/expandable_segments:False}
+  fi
+  export PYTORCH_CUDA_ALLOC_CONF=${allocator_config}
   offloading_args=(
     --kv-offloading-size "${kv_offloading_size}"
     --kv-offloading-backend native
@@ -526,11 +535,12 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s model=%s\n' \
+printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s allocator=%s model=%s\n' \
   "${mode}" "${dspark_depth_mode}" \
   "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
-  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" "${model}" >&2
+  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
+  "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
 printf '\n' >&2
