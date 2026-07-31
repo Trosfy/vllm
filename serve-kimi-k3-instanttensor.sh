@@ -17,4 +17,8 @@ export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.988}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
+# Keep decode on the stable MLA topology validated with this checkpoint.
+export VLLM_TRITON_MLA_STATIC_KV_SPLITS="${VLLM_TRITON_MLA_STATIC_KV_SPLITS:-8}"
+export VLLM_DCP_INDEXER_SHARDS="${VLLM_DCP_INDEXER_SHARDS:-0}"
+
 exec "${SCRIPT_DIR}/serve-kimi-k3.sh" --load-format instanttensor "$@"
