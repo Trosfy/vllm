@@ -37,7 +37,7 @@ def test_ds4_launcher_defaults_to_0731_fixed_k7(tmp_path: Path) -> None:
     assert "num_speculative_tokens\\\":7" in output
     assert "max_seqs=16 graph=128" in output
     assert "--max-model-len 131072" in output
-    assert "--gpu-memory-utilization 0.97" in output
+    assert "--gpu-memory-utilization 0.975" in output
 
 
 def test_ds4_launcher_dynamic_depth_enables_capacity_mode(tmp_path: Path) -> None:

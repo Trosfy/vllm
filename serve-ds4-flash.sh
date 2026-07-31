@@ -387,8 +387,9 @@ fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
   # The 0731 DSpark draft head is larger than the historical MTP head. Its
-  # B12X TP2 profile needs 0.97 to retain the default 131k serving limit after
-  # attention and FULL-graph allocations are accounted for.
+  # B12X TP2 profile needs 0.975 to retain the default 131k serving limit after
+  # attention and FULL-graph allocations are accounted for. At 0.97 the r15
+  # stack exposed 7.11 GiB of KV storage while this profile needs 7.37 GiB.
   if [[ "${mode}" == "dspark" ]]; then
     if [[ "${backend}" == "lucifer-default" ]]; then
       # The default DeepGEMM MoE path retains more model/runtime memory than
@@ -406,7 +407,7 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     elif [[ "${backend}" == lucifer-* ]]; then
       gpu_memory_utilization=0.9465
     else
-      gpu_memory_utilization=0.97
+      gpu_memory_utilization=0.975
     fi
   elif [[ "${backend}" == lucifer-* \
     && ( "${mode}" == "mtp2" || "${mode}" == "mtp3" ) ]]; then
