@@ -43,6 +43,35 @@ export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
 export KDA_DISABLE_AUTOTUNE="${KDA_DISABLE_AUTOTUNE:-1}"
 
+# Opt-in all-expert routing/activation/Hessian capture for kquant.  Capture is
+# intentionally restricted to this official MXFP4 launcher: it forces the
+# ordinary W4A16 MoE path and leaves CUDA graph capture enabled.  The first
+# request arms the stable graph buffers and is excluded; drive the calibration
+# corpus starting with the second request.
+K3_KQUANT_CAPTURE_DIR="${K3_KQUANT_CAPTURE_DIR:-}"
+K3_KQUANT_ARGS=()
+if [[ -n "${K3_KQUANT_CAPTURE_DIR}" ]]; then
+  export B12X_MOE_FORCE_A16=1
+  # The micro small-M kernel uses an internal uint32/chunked cache2 layout.
+  # Keep the regular route-major W4A16/TC-decode scratch that the collector
+  # consumes as canonical post-SiTU activations.
+  export SPARKINFER_W4A16_SMALL_M_DIRECT=0
+  export VLLM_KQUANT_CAPTURE_DIR="${K3_KQUANT_CAPTURE_DIR}"
+  export VLLM_KQUANT_CAPTURE_RUN_ID="${VLLM_KQUANT_CAPTURE_RUN_ID:-$(basename -- "${K3_KQUANT_CAPTURE_DIR}")-$(date +%Y%m%d-%H%M%S)}"
+  export VLLM_KQUANT_CORPUS="${K3_KQUANT_CORPUS:-unspecified}"
+  export VLLM_KQUANT_MOMENT_SAMPLE_RATE="${VLLM_KQUANT_MOMENT_SAMPLE_RATE:-16}"
+  export VLLM_KQUANT_INPUT_HESSIAN_SAMPLE_RATE="${VLLM_KQUANT_INPUT_HESSIAN_SAMPLE_RATE:-512}"
+  export VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE="${VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE:-8192}"
+  export VLLM_KQUANT_SAMPLE_CAPACITY="${VLLM_KQUANT_SAMPLE_CAPACITY:-64}"
+  export VLLM_KQUANT_SAMPLE_SAVE_EVERY="${VLLM_KQUANT_SAMPLE_SAVE_EVERY:-32}"
+  export VLLM_KQUANT_SAMPLE_FLUSH_BYTES="${VLLM_KQUANT_SAMPLE_FLUSH_BYTES:-268435456}"
+  export VLLM_KQUANT_STATS_SAVE_EVERY="${VLLM_KQUANT_STATS_SAVE_EVERY:-128}"
+  export VLLM_KQUANT_FINALIZE_FILE="${VLLM_KQUANT_FINALIZE_FILE:-${K3_KQUANT_CAPTURE_DIR}.finalize}"
+  K3_KQUANT_ARGS+=(--no-enable-prefix-caching)
+  echo "KQuant calibration enabled: ${K3_KQUANT_CAPTURE_DIR} (run ${VLLM_KQUANT_CAPTURE_RUN_ID})" >&2
+  echo "Finalize with: touch ${VLLM_KQUANT_FINALIZE_FILE}; then send one final request" >&2
+fi
+
 MODEL="${MODEL:-moonshotai/Kimi-K3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3}"
 HOST="${HOST:-0.0.0.0}"
@@ -71,4 +100,5 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --reasoning-parser kimi_k3 \
   --tool-call-parser kimi_k3 \
   --enable-auto-tool-choice \
+  "${K3_KQUANT_ARGS[@]}" \
   "$@"

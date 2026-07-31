@@ -858,9 +858,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         The kernel is built over a no-parallel clone of the MoE config with
         the per-rank intermediate size: the weights are already TP-sharded
         by the weight loader, so the kernel must see tp=1 (the layer's
-        post-apply all-reduce handles TP). ``apply`` remaps top-k ids so
-        kept experts map to [0, num_kept) and everything else to the
-        direct-kernel inactive-route sentinel -1.
+        post-apply all-reduce handles TP). The b12x W4A16 kernel consumes the
+        global->local table directly, so routing remains in global-id space.
         """
         from vllm.model_executor.layers.fused_moe.config import (
             FusedMoEParallelConfig,
@@ -924,10 +923,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # post-load maybe_init_modular_kernel() returns early instead of
         # rebuilding a kernel from the (freed) standard weight attrs.
         self.moe_kernel = kernel
-        # Use the direct-kernel inactive-route sentinel.  The route-packed
-        # path also drops negative ids, while the small-M direct path only
-        # checks ``expert_idx >= 0`` and would interpret ``num_kept`` as an
-        # out-of-bounds expert rather than as a sentinel.
+        # Global routes not owned by this compact tier remain -1. Both the
+        # packed prefill route builder and direct TC-decode resolve this map
+        # before any weight access.
         kept_remap = torch.full(
             (state.num_experts,), -1, dtype=torch.int32, device=device
         )
@@ -950,10 +948,16 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         prep = state.prep_kept_hybrid
         prep_ptrs = set()
         for field in (
-            "w13", "w2", "w13_scale", "w2_scale",
-            "micro_w13_scale", "micro_w2_scale",
-            "w13_global_scale", "w2_global_scale",
-            "micro_w13_global_scale", "micro_w2_global_scale",
+            "w13",
+            "w2",
+            "w13_scale",
+            "w2_scale",
+            "micro_w13_scale",
+            "micro_w2_scale",
+            "w13_global_scale",
+            "w2_global_scale",
+            "micro_w13_global_scale",
+            "micro_w2_global_scale",
         ):
             value = getattr(prep, field, None)
             if isinstance(value, torch.Tensor):
@@ -1930,7 +1934,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         decode: bool,
     ) -> torch.Tensor:
         """Kept tier: NVFP4 through the preplanned launcher, MXFP4 through
-        the production modular kernel (sentinel-remapped top-k ids)."""
+        the production modular kernel with in-kernel global route mapping."""
         state: _HybridLayerState = layer.hybrid_state
         runtime = self.quant_config.shared_runtime
         if state.prep_kept is not None:
@@ -1977,26 +1981,15 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 dim=0,
             )
         kept_module = state.kept_module
-        kept_ids = state.kept_remap[topk_ids.long()]
-        # Neither the small-M nor the M=9 packed MXFP4 launcher safely handles
-        # a token with only -1 routes in this tier.  Never expose the sentinel
-        # to the device kernel: expert zero with an exact-zero router weight is
-        # a no-op.  (The general large-prefill route builder can filter -1,
-        # but using this one contract for both regimes avoids a decode-only
-        # all-empty-tier NaN.)
-        active = kept_ids >= 0
-        topk_weights = topk_weights.masked_fill(~active, 0.0).contiguous()
-        kept_ids = kept_ids.clamp_min(0)
-        kept_ids = kept_ids.to(torch.int32).contiguous()
         return state.kept_kernel.apply(
             x,
             kept_module.w13_weight,
             kept_module.w2_weight,
             topk_weights,
-            kept_ids,
+            topk_ids,
             activation=kept_module.activation,
-            global_num_experts=state.num_kept,
-            expert_map=None,
+            global_num_experts=state.num_experts,
+            expert_map=state.kept_remap,
             apply_router_weight_on_input=False,
             shared_experts=None,
             shared_experts_input=None,
