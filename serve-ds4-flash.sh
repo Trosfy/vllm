@@ -101,6 +101,7 @@ max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
 load_format=${LOAD_FORMAT:-instanttensor}
+kv_offloading_size=${KV_OFFLOADING_SIZE:-}
 prefix_cache=$(bool_value PREFIX_CACHE "${PREFIX_CACHE:-1}")
 enable_flashinfer_autotune=$(bool_value ENABLE_FLASHINFER_AUTOTUNE "${ENABLE_FLASHINFER_AUTOTUNE:-1}")
 draft_sample_method=${DRAFT_SAMPLE_METHOD:-probabilistic}
@@ -111,6 +112,11 @@ require_positive_int DCP_SIZE "${dcp_size}"
 require_positive_int MAX_NUM_SEQS "${max_num_seqs}"
 require_positive_int MAX_NUM_BATCHED_TOKENS "${max_num_batched_tokens}"
 require_positive_int BLOCK_SIZE "${block_size}"
+if [[ -n "${kv_offloading_size}" \
+  && ! "${kv_offloading_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+  echo "KV_OFFLOADING_SIZE must be a non-negative GiB value; got '${kv_offloading_size}'" >&2
+  exit 2
+fi
 if [[ "${mode}" == "dspark" && "${dcp_size}" != "1" ]]; then
   echo "DSpark non-causal attention currently requires DCP_SIZE=1" >&2
   exit 2
@@ -428,6 +434,17 @@ if [[ "${enable_flashinfer_autotune}" == "0" ]]; then
   autotune_args=(--no-enable-flashinfer-autotune)
 fi
 
+offloading_args=()
+if [[ -n "${kv_offloading_size}" \
+  && ! "${kv_offloading_size}" =~ ^0*([.]0*)?$ ]]; then
+  # This is the total host-cache capacity across all TP ranks, matching the
+  # vLLM CLI contract. LMCache remains a separate deployment mode.
+  offloading_args=(
+    --kv-offloading-size "${kv_offloading_size}"
+    --kv-offloading-backend native
+  )
+fi
+
 capture_args=()
 capture_sizes=${CUDAGRAPH_CAPTURE_SIZES:-default}
 if [[ "${capture_sizes}" == "auto" ]]; then
@@ -495,6 +512,7 @@ command=(
   "${autotune_args[@]}"
   "${prefix_args[@]}"
   "${capture_args[@]}"
+  "${offloading_args[@]}"
   "${spec_args[@]}"
   "${backend_args[@]}"
   "${allreduce_args[@]}"
