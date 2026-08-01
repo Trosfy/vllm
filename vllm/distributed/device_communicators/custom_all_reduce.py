@@ -648,12 +648,7 @@ class CustomAllreduce:
             )
             return
 
-        if (
-            same_node
-            and world_size > 2
-            and not fully_connected
-            and not self.allow_pcie
-        ):
+        if same_node and world_size > 2 and not fully_connected and not self.allow_pcie:
             logger.warning(
                 "Custom allreduce is disabled because this PCIe topology is not "
                 "fully connected and b12x PCIe oneshot is unavailable."
@@ -891,7 +886,7 @@ class CustomAllreduce:
         ops.register_graph_buffers(self._ptr, handles, offsets)
 
     def should_custom_ar(self, inp: torch.Tensor):
-        if self.disabled or self.world_size > 8:
+        if self.disabled:
             return False
         if self._pcie_runtime is not None:
             inp_size = inp.numel() * inp.element_size()
@@ -909,6 +904,8 @@ class CustomAllreduce:
             ):
                 return True
             return use_custom
+        if self.world_size > 8:
+            return False
         inp_size = inp.numel() * inp.element_size()
         rows = int(inp.shape[0]) if inp.ndim >= 2 else 1
         cutoff_applies = not (

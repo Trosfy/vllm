@@ -3,6 +3,7 @@
 
 import sys
 import types
+from typing import Any
 
 import pytest
 import torch
@@ -137,11 +138,11 @@ def _install_fake_b12x_indexer(
     *,
     prefill_route: str = "packed_contiguous",
 ):
-    sparkinfer_mod = types.ModuleType("sparkinfer")
+    sparkinfer_mod: Any = types.ModuleType("sparkinfer")
     sparkinfer_mod.__path__ = []
-    attention_mod = types.ModuleType("sparkinfer.attention")
+    attention_mod: Any = types.ModuleType("sparkinfer.attention")
     attention_mod.__path__ = []
-    indexer_mod = types.ModuleType("sparkinfer.attention.nsa_indexer")
+    indexer_mod: Any = types.ModuleType("sparkinfer.attention.nsa_indexer")
     indexer_mod.__path__ = []
 
     class _Caps:
@@ -253,7 +254,9 @@ def _install_fake_b12x_indexer(
 
 
 def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
-    tiled_topk_mod = types.ModuleType("sparkinfer.attention.nsa_indexer.tiled_topk")
+    tiled_topk_mod: Any = types.ModuleType(
+        "sparkinfer.attention.nsa_indexer.tiled_topk"
+    )
     tiled_topk_mod.run_row_topk = run_row_topk
     monkeypatch.setitem(
         sys.modules,
@@ -659,7 +662,10 @@ def test_replicated_decode_skips_dcp_merge_and_keeps_global_topk_ids(
     monkeypatch.setattr(
         indexer_mod,
         "get_forward_context",
-        lambda: types.SimpleNamespace(attn_metadata={metadata_key: metadata}),
+        lambda: types.SimpleNamespace(
+            attn_metadata={metadata_key: metadata},
+            cudagraph_runtime_mode=indexer_mod.CUDAGraphMode.NONE,
+        ),
     )
 
     hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
@@ -689,6 +695,8 @@ def test_replicated_decode_skips_dcp_merge_and_keeps_global_topk_ids(
         total_seq_lens=1024,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=True,
+        use_pcp=False,
+        dense_mha_metadata_layer_name=None,
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
@@ -798,7 +806,10 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
     monkeypatch.setattr(
         indexer_mod,
         "get_forward_context",
-        lambda: types.SimpleNamespace(attn_metadata={metadata_key: metadata}),
+        lambda: types.SimpleNamespace(
+            attn_metadata={metadata_key: metadata},
+            cudagraph_runtime_mode=indexer_mod.CUDAGraphMode.NONE,
+        ),
     )
 
     hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
@@ -825,6 +836,8 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
         total_seq_lens=1024,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=True,
+        use_pcp=False,
+        dense_mha_metadata_layer_name=None,
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
         topk_scores_buffer=topk_scores_buffer,
@@ -1275,6 +1288,8 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
         total_seq_lens=total_seq_lens,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=False,
+        use_pcp=False,
+        dense_mha_metadata_layer_name=None,
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
@@ -1381,6 +1396,8 @@ def test_b12x_profile_work_skips_piecewise_capture(monkeypatch):
         total_seq_lens=128,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=False,
+        use_pcp=False,
+        dense_mha_metadata_layer_name=None,
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
@@ -1445,6 +1462,8 @@ def test_b12x_dcp_profile_uses_planner_page_table_width(monkeypatch):
         total_seq_lens=total_seq_lens,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=False,
+        use_pcp=False,
+        dense_mha_metadata_layer_name=None,
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
