@@ -164,6 +164,8 @@ tme = "tme"
 dout = "dout"
 Pn = "Pn"
 arange = "arange"
+suh = "suh"
+SUH = "SUH"
 thw = "thw"
 # temporal position ids (parallels hpos/wpos in vision RoPE)
 tpos = "tpos"
