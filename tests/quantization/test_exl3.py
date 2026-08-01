@@ -463,9 +463,10 @@ def test_mixed_trellis_dispatches_decode_and_serial_prefill(monkeypatch):
         "decode": {"launch": object(), "buffers": object()},
         "prefill_plans": (FakePlan(), FakePlan()),
         "prefill_arena": torch.empty(16, dtype=torch.uint8),
-        "prefill_accum": torch.empty((16, 4), dtype=torch.float32),
+        "prefill_accum": torch.empty((8, 4), dtype=torch.float32),
         "max_decode_m": 8,
         "max_batched_tokens": 16,
+        "prefill_capacity": 8,
     }
     tiers = (
         {"weights": object(), "route_expert_map": torch.tensor([0, -1])},
@@ -495,12 +496,32 @@ def test_mixed_trellis_dispatches_decode_and_serial_prefill(monkeypatch):
     torch.testing.assert_close(decode, torch.ones_like(decode))
     torch.testing.assert_close(prefill, torch.full_like(prefill, 3))
     assert mixed_api.calls == 1
-    assert len(fused_api.bindings) == 2
+    assert len(fused_api.bindings) == 4
+    assert [binding["a"].shape[0] for binding in fused_api.bindings] == [8] * 4
+    assert all(
+        torch.equal(binding["topk_weights"], weights[:8])
+        for binding in fused_api.bindings[:2]
+    )
+    assert all(
+        torch.equal(binding["topk_weights"], weights[8:])
+        for binding in fused_api.bindings[2:]
+    )
+    assert all(
+        torch.equal(binding["topk_ids"], ids[:8]) for binding in fused_api.bindings[:2]
+    )
+    assert all(
+        torch.equal(binding["topk_ids"], ids[8:]) for binding in fused_api.bindings[2:]
+    )
     assert (
         fused_api.bindings[0]["output"].data_ptr()
         == runtime["prefill_accum"].data_ptr()
     )
     assert fused_api.bindings[1]["output"] is None
+    assert (
+        fused_api.bindings[2]["output"].data_ptr()
+        == runtime["prefill_accum"].data_ptr()
+    )
+    assert fused_api.bindings[3]["output"] is None
 
 
 @pytest.mark.parametrize(
