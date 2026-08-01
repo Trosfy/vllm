@@ -437,6 +437,62 @@ class TestMockObjTierFailures:
         assert not by_id[1].success
         assert by_id[2].success
 
+    def test_failed_load_invalidates_cached_lookup(self):
+        """An object that vanished must not stay cached as a hit.
+
+        The cached existence result is what routes a promotion to this tier,
+        and nothing else clears it until every request that looked the key up
+        has finished. If a failed load left it cached as present, the
+        scheduler would re-submit the same failing promotion on every step and
+        the request waiting for those tokens would never finish, so the entry
+        would never be cleaned up either -- a livelock rather than a
+        recompute.
+        """
+        tier, agent = _make_tier(num_blocks=4)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+
+        # Removed behind the tier's back: a bucket lifecycle rule, another
+        # instance sharing the bucket, or any external cleanup. The probe hit
+        # is now stale and the read against it fails.
+        agent._stored_obj_keys.clear()
+        agent.check_xfer_state = lambda h: "ERR"
+
+        tier.submit_load(make_job(2, [key(1)], [0]))
+        results = drain(tier)
+        assert not results[0].success
+
+        assert tier.lookup(key(1), _CTX) == LookupResult.MISS
+
+    def test_submission_time_load_failure_invalidates_cached_lookup(self):
+        """Loads that die before the transfer starts must invalidate too;
+        re-submitting them against the same cached hit is the same livelock."""
+        tier, agent = _make_tier(num_blocks=4)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+
+        agent.register_memory = lambda *a, **k: None
+        tier.submit_load(make_job(2, [key(1)], [0]))
+        results = list(tier.get_finished_jobs())
+        assert len(results) == 1
+        assert not results[0].success
+
+        assert tier.lookup(key(1), _CTX) == LookupResult.MISS
+
+    def test_successful_load_keeps_cached_lookup(self):
+        """The invalidation above must be scoped to failures."""
+        tier, _ = _make_tier(num_blocks=4)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+
+        tier.submit_load(make_job(2, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+
+        assert tier.lookup(key(1), _CTX) == LookupResult.HIT
+
 
 class TestMockObjTierShutdown:
     def test_shutdown_clears_in_flight_transfers(self):

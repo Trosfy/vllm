@@ -176,6 +176,10 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+        # Keys of in-flight load jobs, so a failed load can invalidate the
+        # cached existence results that sent it here.
+        self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -205,6 +209,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         tasks = (
             functools.partial(
                 load_block,
@@ -224,6 +229,14 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         results = []
         for job_id, success in self._pool.get_finished():
+            load_keys = self._load_job_keys.pop(job_id, None)
+            if load_keys is not None and not success:
+                # The blocks this load needed are gone or unreadable, and
+                # load_block has unlinked whatever it could not read. Drop the
+                # cached existence results so the next lookup reports a miss and
+                # the tokens are recomputed; leaving them cached as present
+                # would re-submit this same failing load on every step.
+                self._lookup_manager.invalidate(load_keys)
             if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:
