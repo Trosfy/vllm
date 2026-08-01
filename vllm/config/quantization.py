@@ -193,8 +193,7 @@ def resolve_quantization_config(
     quantization: str | None,
     quantization_config: dict[str, Any] | QuantizationConfigArgs | None,
 ) -> QuantizationConfigArgs | None:
-    """Resolve `--quantization` shorthand and `--quantization-config` into a
-    QuantizationConfigArgs.
+    """Resolve quantization CLI settings into structured arguments.
 
     `quantization` may be a CLI shorthand that desugars into a base config via
     `_ONLINE_SHORTHANDS`. `quantization_config` is a dict or pre-built args
@@ -202,6 +201,18 @@ def resolve_quantization_config(
     `quantization_config` take precedence over the shorthand. Selected
     checkpoint formats accept online overlays for BF16 dense/shared-expert
     projections.
+
+    Args:
+        quantization: Quantization method name or online shorthand.
+        quantization_config: Explicit online quantization fields, if any.
+
+    Returns:
+        The resolved quantization arguments, or ``None`` when no online
+        configuration was requested.
+
+    Raises:
+        ValueError: If an explicit configuration cannot overlay the selected
+            checkpoint quantization method.
     """
     if isinstance(quantization_config, dict):
         quantization_config = QuantizationConfigArgs(**quantization_config)

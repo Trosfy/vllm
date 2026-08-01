@@ -688,6 +688,18 @@ class Exl3Config(QuantizationConfig):
         EXL3-owned dense matrices are selected before this method and routed
         experts never enter it. Shared-expert projections have an independent
         spec so a broad ``linear`` overlay cannot quantize them accidentally.
+
+        Args:
+            layer: Candidate module for the online overlay.
+            prefix: Fully qualified checkpoint module name.
+
+        Returns:
+            An MXFP8 method for an eligible BF16 projection, otherwise
+            ``None``.
+
+        Raises:
+            ValueError: If the EXL3 overlay requests an unsupported weight or
+                activation format.
         """
         if not isinstance(layer, LinearBase):
             return None
@@ -767,10 +779,17 @@ class Exl3Config(QuantizationConfig):
         if not source_leaves:
             return False
         base = prefix.rsplit(".", 1)[0] if "." in prefix else ""
-        return all(
+        source_is_exl3 = [
             self._is_exl3_prefix(f"{base}.{source}" if base else source)
             for source in source_leaves
-        )
+        ]
+        if any(source_is_exl3) and not all(source_is_exl3):
+            raise ValueError(
+                f"Packed EXL3 projection {prefix!r} mixes EXL3 and BF16 "
+                "source shards; a fused module must use one quantization "
+                "scheme."
+            )
+        return all(source_is_exl3)
 
     def _moe_prefix_is_exl3(
         self, prefix: str, layer: torch.nn.Module | None = None
