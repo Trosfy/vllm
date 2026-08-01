@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     _combined_tier_local_descriptors,
     _decode_kquant_nf3_scale,
     _exl3_tp_local_hadamard_tail,
+    _is_k3_exl3_onegrid_geometry,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
@@ -163,6 +164,34 @@ def test_unpack_nf3_codes():
 
 def test_kimi_tp16_uses_tuned_fc1_tile():
     assert _b12x_tiles_for_geometry(3584, 3072 // 16) == (128, 64, 64, 128)
+
+
+def test_kimi_tp16_exl3_onegrid_accepts_exact_unpadded_partition(monkeypatch):
+    monkeypatch.setenv("VLLM_K3_EXL3_ONEGRID", "1")
+
+    assert _is_k3_exl3_onegrid_geometry(
+        hidden_size=3584,
+        intermediate_size=192,
+        num_experts=896,
+        num_kept=394,
+        num_exl3=502,
+        topk=16,
+        kept_mx=True,
+    )
+
+
+def test_kimi_tp16_exl3_onegrid_is_explicitly_disableable(monkeypatch):
+    monkeypatch.setenv("VLLM_K3_EXL3_ONEGRID", "0")
+
+    assert not _is_k3_exl3_onegrid_geometry(
+        hidden_size=3584,
+        intermediate_size=192,
+        num_experts=896,
+        num_kept=394,
+        num_exl3=502,
+        topk=16,
+        kept_mx=True,
+    )
 
 
 def test_tp16_exl3_accepts_explicit_rank_local_h64_artifact():
