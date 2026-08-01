@@ -26,9 +26,9 @@ launch with an expert map.
 """
 
 import dataclasses
-import re
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 
 from vllm import envs
@@ -41,10 +41,18 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -76,12 +84,40 @@ _GRID188_NUM_KEPT = 64
 _GRID188_NUM_NF3 = 192
 
 
+def _is_dense_layer_ignored(
+    prefix: str,
+    ignored_layers: list[str],
+    fused_mapping: dict[str, list[str]],
+) -> bool:
+    """Match dense exclusions as full paths or exact path components."""
+    expanded = list(ignored_layers)
+    candidates = [prefix]
+    base, separator, projection = prefix.rpartition(".")
+    if projection in fused_mapping:
+        candidates.extend(
+            f"{base}{separator}{shard}" for shard in fused_mapping[projection]
+        )
+
+    for ignored in ignored_layers:
+        if not ignored or "." in ignored:
+            continue
+        expanded.extend(
+            candidate for candidate in candidates if ignored in candidate.split(".")
+        )
+
+    return is_layer_skipped(
+        prefix=prefix,
+        ignored_layers=expanded,
+        fused_mapping=fused_mapping,
+    )
+
+
 def _combined_tier_local_descriptors(
     remap: dict[int, tuple[int, int]],
 ) -> list[int]:
     """Encode an exact E64/E192 partition for the mapped Grid188 kernel."""
     descriptors = [-1] * (_GRID188_NUM_KEPT + _GRID188_NUM_NF3)
-    seen_local = (set(), set())
+    seen_local: tuple[set[int], set[int]] = (set(), set())
     for global_id, tier_local in remap.items():
         try:
             global_id_i = int(global_id)
@@ -266,10 +302,36 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         )
         self.hybrid_bit_map: dict[str, list[int]] = hybrid_bit_map or {}
         self.kept_format = kept_format
+        self.dense_format: str | None = None
+        self.dense_ignored_layers: list[str] = []
         self.shared_runtime = _HybridSharedRuntime()
 
     def get_name(self) -> QuantizationMethods:
         return "nvfp4_nf3_hybrid"
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if isinstance(layer, RoutedExperts):
+            return self.FusedMoEMethodCls(
+                quant_config=self, moe_config=layer.moe_config
+            )
+        if isinstance(layer, LinearBase):
+            if self.dense_format == "mxfp8":
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Mxfp8SerializedLinearMethod,
+                )
+
+                if not _is_dense_layer_ignored(
+                    prefix,
+                    self.dense_ignored_layers,
+                    self.packed_modules_mapping,
+                ):
+                    return Mxfp8SerializedLinearMethod()
+                return UnquantizedLinearMethod()
+            online_method = self._get_shared_expert_online_method(
+                layer, prefix
+            ) or self._get_dense_linear_online_method(layer, prefix)
+            return online_method or UnquantizedLinearMethod()
+        return None
 
     @classmethod
     def override_quantization_method(
@@ -311,6 +373,23 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         assert isinstance(config, NvFp4Nf3HybridConfig)
         config.hybrid_bit_map = hybrid_bit_map
         config.kept_format = kept_format
+        quantization = original_config.get("quantization")
+        dense_format = original_config.get("dense_format")
+        dense_ignored_layers = original_config.get("ignored_layers")
+        if isinstance(quantization, dict):
+            dense_format = dense_format or quantization.get("dense_format")
+            dense_ignored_layers = dense_ignored_layers or quantization.get(
+                "ignored_layers"
+            )
+        if dense_format is not None:
+            if dense_format != "mxfp8":
+                raise ValueError(f"unsupported dense_format {dense_format!r}")
+            if dense_ignored_layers is not None and not isinstance(
+                dense_ignored_layers, list
+            ):
+                raise ValueError("ignored_layers must be a list")
+            config.dense_format = dense_format
+            config.dense_ignored_layers = list(dense_ignored_layers or [])
         return config
 
 
@@ -421,7 +500,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             name = name_mapped or weight_name or ""
             if "input_scale" in name:  # W4A16: activation scales are unused
                 return True
-            tier, local_id = state.remap[int(expert_id)]
+            if expert_id is None:
+                raise ValueError(f"missing expert ID while loading {name}")
+            tier, local_id = state.remap[expert_id]
             family = "w13" if "w13_" in name else "w2"
             if "weight_scale_2" in name:  # NVFP4 per-tensor global (kept only)
                 target = getattr(layer, f"{family}_weight_scale_2")
@@ -456,7 +537,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
 
         def register(name: str, shape: tuple[int, ...], dtype=torch.uint8) -> None:
             param = torch.nn.Parameter(
-                torch.zeros(shape, dtype=dtype, device=torch.cuda.current_device()),
+                torch.zeros(
+                    shape,
+                    dtype=dtype,
+                    device=torch.accelerator.current_device_index(),
+                ),
                 requires_grad=False,
             )
             set_weight_attrs(param, {"weight_loader": hybrid_weight_loader})
@@ -491,7 +576,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             layer.register_parameter(
                 name,
                 torch.nn.Parameter(
-                    torch.zeros(shape, dtype=dtype, device=torch.cuda.current_device()),
+                    torch.zeros(
+                        shape,
+                        dtype=dtype,
+                        device=torch.accelerator.current_device_index(),
+                    ),
                     requires_grad=False,
                 ),
             )
@@ -553,6 +642,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         quant_config = make_mxfp4_moe_quant_config(
             backend, w13_scale, w2_scale, layer=kept_module
         )
+        assert quant_config is not None
+        assert experts_cls is not None
         kernel = make_mxfp4_moe_kernel(
             quant_config,
             kept_moe,
@@ -746,6 +837,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
 
         runtime = self.quant_config.shared_runtime
+        assert runtime.topk is not None
+        assert runtime.max_m is not None
         hidden = self.moe.hidden_dim
         inter = self.moe.intermediate_size_per_partition
         key = (
@@ -760,7 +853,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         cached = runtime.launches.get(key)
         if cached is not None:
             return cached
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = torch.cuda.get_device_properties(
+            torch.accelerator.current_device_index()
+        )
         common = dict(
             hidden_size=hidden,
             intermediate_size=inter,
@@ -912,7 +1007,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if not prepared_contract:
                 raise RuntimeError("prepared tier layouts do not match Grid188 ABI")
 
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            props = torch.cuda.get_device_properties(
+                torch.accelerator.current_device_index()
+            )
             sms = int(props.multi_processor_count)
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", 101_376)
@@ -1057,7 +1154,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             int(launch.fc2_tile_k),
             int(launch.fc2_tile_n),
             bool(launch.schedule_whole_tiles),
-            int(torch.cuda.current_stream(x.device).cuda_stream),
+            int(torch.accelerator.current_stream(x.device).cuda_stream),
         )
         return state.grid188_output[:m]
 
@@ -1076,6 +1173,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if runtime.max_m is None:
             runtime.max_m = max(int(self.moe.max_num_tokens), int(m))
             runtime.topk = int(topk)
+        assert runtime.max_m is not None
+        assert runtime.topk is not None
         if int(topk) != runtime.topk:
             raise RuntimeError(
                 f"nvfp4_nf3_hybrid: topk changed {runtime.topk} -> {topk}"
@@ -1159,6 +1258,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             # the -1 entries of the other tier.
             launch_expert_map = expert_map
         buffers = runtime.buffers
+        assert buffers is not None
         return run_w4a16_moe(
             x,
             prepared,
@@ -1192,6 +1292,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         runtime = self.quant_config.shared_runtime
         if state.prep_kept is not None:
             m = x.shape[0]
+            assert state.launch_kept is not None
+            assert state.emap_kept is not None
+            assert runtime.out_kept is not None
             return self._run_tier(
                 x,
                 topk_weights,
@@ -1203,6 +1306,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 decode,
             )
         kept_module = state.kept_module
+        assert kept_module is not None
+        assert state.kept_remap is not None
         kept_ids = state.kept_remap[topk_ids.long()]
         return state.kept_kernel.apply(
             x,
@@ -1234,6 +1339,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         m = int(x.shape[0])
         if not state.runtime_ready:
             self._ensure_runtime(layer, m, int(topk_ids.shape[1]))
+        assert runtime.max_m is not None
         if m > runtime.max_m:
             raise RuntimeError(
                 f"nvfp4_nf3_hybrid: m={m} exceeds the planned launch "
@@ -1269,6 +1375,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 return self._run_grid188(layer, x, weights, grid_ids)
         if state.num_nf3 == 0:
             # Uniform-NVFP4 layer (e.g. MTP head): single-tier launch.
+            assert state.prep_kept is not None
+            assert state.launch_kept is not None
+            assert state.emap_kept is not None
             output = torch.empty((m, state.hidden_size), dtype=x.dtype, device=x.device)
             return self._run_tier(
                 x,
@@ -1280,6 +1389,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 output,
                 decode,
             )
+        assert state.prep_nf3 is not None
+        assert state.launch_nf3 is not None
+        assert state.emap_nf3 is not None
+        assert runtime.out_nf3 is not None
         out_kept = self._run_kept(layer, x, weights, topk_ids, decode)
         out_nf3 = self._run_tier(
             x,
