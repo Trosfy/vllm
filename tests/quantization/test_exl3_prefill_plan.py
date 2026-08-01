@@ -61,13 +61,37 @@ class _FakeFusedMoeApi:
         self.planned.append(caps)
         return plan
 
-    def bind(self, plan, *, scratch, a, experts, topk_weights, topk_ids):
+    def bind(
+        self,
+        plan,
+        *,
+        scratch,
+        a,
+        experts,
+        topk_weights,
+        topk_ids,
+        route_expert_map=None,
+        output_expert_map=None,
+        output=None,
+    ):
         del scratch, experts
         self.bound.append((plan, int(a.shape[0])))
         self.routed.append((topk_weights.clone(), topk_ids.clone()))
-        return SimpleNamespace(plan=plan, a=a)
+        return SimpleNamespace(
+            plan=plan,
+            a=a,
+            route_expert_map=route_expert_map,
+            output_expert_map=output_expert_map,
+            output=output,
+        )
 
     def run(self, *, binding):
+        if binding.route_expert_map is not None:
+            tier_output = binding.a.to(torch.float32).mul(0.5)
+            if binding.output is not None:
+                binding.output.copy_(tier_output)
+                return binding.output
+            return tier_output
         return binding.a.to(torch.float32)
 
 
@@ -134,6 +158,17 @@ def _make_mixed_layer():
         "descriptor_map": object(),
         "rotations": object(),
         "tile_config": (64, 128, 64, 128),
+        "serial_tile_config": (64, 128, 64, 128),
+        "serial_tiers": (
+            {
+                "weights": SimpleNamespace(plan=object()),
+                "route_expert_map": torch.tensor([0, 1, 2, 3, -1, -1, -1, -1]),
+            },
+            {
+                "weights": SimpleNamespace(plan=object()),
+                "route_expert_map": torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3]),
+            },
+        ),
     }
     return layer
 
@@ -229,9 +264,7 @@ def test_opt_in_prefill_capacity_slices_dispatch():
         assert h.api.bound[-1][0].caps["max_tokens"] == 32
 
         _apply(method, layer, 200)
-        assert all(
-            bound[0].caps["max_tokens"] == 128 for bound in h.api.bound[-2:]
-        )
+        assert all(bound[0].caps["max_tokens"] == 128 for bound in h.api.bound[-2:])
         assert [bound[1] for bound in h.api.bound[-2:]] == [128, 72]
         assert not h.ext.moe_calls
 
@@ -271,14 +304,8 @@ def test_prefill_capacity_boundaries_preserve_rows_and_routing(
     with _Harness(env={"VLLM_EXL3_PREFILL_CAPACITY": "128"}) as h:
         method = _make_method()
         layer = _make_layer()
-        x = (
-            torch.arange(rows, dtype=torch.bfloat16)
-            .unsqueeze(1)
-            .expand(-1, HIDDEN)
-        )
-        weights = torch.arange(rows * TOPK, dtype=torch.float32).reshape(
-            rows, TOPK
-        )
+        x = torch.arange(rows, dtype=torch.bfloat16).unsqueeze(1).expand(-1, HIDDEN)
+        weights = torch.arange(rows * TOPK, dtype=torch.float32).reshape(rows, TOPK)
         ids = torch.arange(rows * TOPK, dtype=torch.int64).reshape(rows, TOPK)
         ids = ids.remainder(EXPERTS)
 
@@ -286,9 +313,7 @@ def test_prefill_capacity_boundaries_preserve_rows_and_routing(
 
         assert [bound[1] for bound in h.api.bound] == expected_slice_rows
         assert torch.equal(out, x)
-        assert torch.equal(
-            torch.cat([route[0] for route in h.api.routed]), weights
-        )
+        assert torch.equal(torch.cat([route[0] for route in h.api.routed]), weights)
         assert torch.equal(torch.cat([route[1] for route in h.api.routed]), ids)
         assert all(bound[0] is h.api.bound[0][0] for bound in h.api.bound)
 
@@ -307,36 +332,31 @@ def test_mixed_prefill_capacity_slices_rows_and_routing():
         method = _make_method()
         layer = _make_mixed_layer()
         rows = 200
-        x = (
-            torch.arange(rows, dtype=torch.bfloat16)
-            .unsqueeze(1)
-            .expand(-1, HIDDEN)
-        )
-        weights = torch.arange(rows * TOPK, dtype=torch.float32).reshape(
-            rows, TOPK
-        )
+        x = torch.arange(rows, dtype=torch.bfloat16).unsqueeze(1).expand(-1, HIDDEN)
+        weights = torch.arange(rows * TOPK, dtype=torch.float32).reshape(rows, TOPK)
         ids = torch.arange(rows * TOPK, dtype=torch.int64).reshape(rows, TOPK)
         ids = ids.remainder(EXPERTS)
 
         out = method._apply_rank_sliced(layer, x, weights, ids)
 
-        assert [launch.size_m for launch in h.mixed_api.compiled] == [32, 128]
-        assert [route[0].shape[0] for route in h.mixed_api.routed] == [128, 72]
+        assert [launch.size_m for launch in h.mixed_api.compiled] == [32]
+        assert [caps["max_tokens"] for caps in h.planned_caps()] == [128, 128]
+        assert [bound[1] for bound in h.api.bound] == [128, 128, 72, 72]
         assert torch.equal(out, x)
         assert torch.equal(
-            torch.cat([route[0] for route in h.mixed_api.routed]), weights
+            torch.cat([route[0] for route in h.api.routed[::2]]), weights
         )
-        assert torch.equal(
-            torch.cat([route[1] for route in h.mixed_api.routed]), ids
+        assert torch.equal(torch.cat([route[1] for route in h.api.routed[::2]]), ids)
+        assert all(
+            torch.equal(left[0], right[0]) and torch.equal(left[1], right[1])
+            for left, right in zip(h.api.routed[::2], h.api.routed[1::2], strict=True)
         )
 
 
 def test_prefill_capacity_cannot_exceed_scheduler_bound():
     env = {"VLLM_EXL3_PREFILL_CAPACITY": str(MAX_BATCHED + 1)}
     with _Harness(env=env) as h:
-        with pytest.raises(
-            ValueError, match="cannot exceed max_num_batched_tokens"
-        ):
+        with pytest.raises(ValueError, match="cannot exceed max_num_batched_tokens"):
             _apply(_make_method(), _make_layer(), 16)
         assert not h.planned_caps()
 
