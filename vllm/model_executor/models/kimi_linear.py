@@ -65,6 +65,30 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _load_zero_padded_shard(
+    param_data: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    dim: int,
+    start_idx: int,
+) -> None:
+    """Load the available checkpoint slice and zero an out-of-range tail."""
+    dim = dim if dim >= 0 else param_data.ndim + dim
+    assert param_data.ndim == loaded_weight.ndim
+    assert all(
+        param_data.shape[index] == loaded_weight.shape[index]
+        for index in range(param_data.ndim)
+        if index != dim
+    )
+    shard_size = param_data.shape[dim]
+    available = max(0, min(shard_size, loaded_weight.shape[dim] - start_idx))
+    param_data.zero_()
+    if available:
+        param_data.narrow(dim, 0, available).copy_(
+            loaded_weight.narrow(dim, start_idx, available)
+        )
+
+
 class KimiColumnParallelGate(ColumnParallelLinear):
     """TP-sharded K3 router with globally ordered FP32 logits."""
 
@@ -74,13 +98,29 @@ class KimiColumnParallelGate(ColumnParallelLinear):
         output_size: int,
         prefix: str,
     ) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        self.logical_output_size = output_size
+        padded_output_size = cdiv(output_size, tp_size) * tp_size
         super().__init__(
             input_size,
-            output_size,
+            padded_output_size,
             bias=False,
             gather_output=False,
             quant_config=None,
             prefix=prefix,
+        )
+
+    def weight_loader(self, param, loaded_weight: torch.Tensor) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is None:
+            super().weight_loader(param, loaded_weight)
+            return
+        shard_size = param.data.shape[output_dim]
+        _load_zero_padded_shard(
+            param.data,
+            loaded_weight,
+            dim=output_dim,
+            start_idx=self.tp_rank * shard_size,
         )
 
     def forward(self, x: torch.Tensor):
@@ -94,7 +134,89 @@ class KimiColumnParallelGate(ColumnParallelLinear):
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
-        return output, None
+        return output[..., : self.logical_output_size], None
+
+
+class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
+    """Column-parallel BF16 linear with an internal zero-padded output."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+    ) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        self.logical_output_size = output_size
+        padded_output_size = cdiv(output_size, tp_size) * tp_size
+        super().__init__(
+            input_size,
+            padded_output_size,
+            bias=False,
+            gather_output=True,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param, loaded_weight: torch.Tensor) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is None:
+            super().weight_loader(param, loaded_weight)
+            return
+        shard_size = param.data.shape[output_dim]
+        _load_zero_padded_shard(
+            param.data,
+            loaded_weight,
+            dim=output_dim,
+            start_idx=self.tp_rank * shard_size,
+        )
+
+    def forward(self, input_):
+        output, output_bias = super().forward(input_)
+        return output[..., : self.logical_output_size], output_bias
+
+
+class KimiPaddedRowParallelLinear(RowParallelLinear):
+    """Row-parallel BF16 linear with an internal zero-padded input."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+    ) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        self.logical_input_size = input_size
+        padded_input_size = cdiv(input_size, tp_size) * tp_size
+        self.input_padding = padded_input_size - input_size
+        super().__init__(
+            padded_input_size,
+            output_size,
+            bias=False,
+            input_is_parallel=False,
+            reduce_results=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param, loaded_weight: torch.Tensor) -> None:
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is None:
+            super().weight_loader(param, loaded_weight)
+            return
+        shard_size = param.data.shape[input_dim]
+        _load_zero_padded_shard(
+            param.data,
+            loaded_weight,
+            dim=input_dim,
+            start_idx=self.tp_rank * shard_size,
+        )
+
+    def forward(self, input_):
+        assert input_.shape[-1] == self.logical_input_size
+        if self.input_padding:
+            input_ = torch.nn.functional.pad(input_, (0, self.input_padding))
+        return super().forward(input_)
 
 
 class KimiMLP(nn.Module):
@@ -207,12 +329,9 @@ class KimiMoE(nn.Module):
             # in BF16 and its compressed-tensors ignore list does not cover
             # them, so passing the config through would create unloadable
             # MXFP4 linear layers.
-            self.routed_expert_down_proj = ColumnParallelLinear(
+            self.routed_expert_down_proj = KimiPaddedColumnParallelLinear(
                 hidden_size,
                 routed_expert_hidden_size,
-                bias=False,
-                gather_output=True,
-                quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -220,13 +339,9 @@ class KimiMoE(nn.Module):
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = RowParallelLinear(
+            self.routed_expert_up_proj = KimiPaddedRowParallelLinear(
                 routed_expert_hidden_size,
                 hidden_size,
-                bias=False,
-                input_is_parallel=False,
-                reduce_results=False,
-                quant_config=None,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
             self.routed_output_transform = KimiRoutedOutputTransform(
