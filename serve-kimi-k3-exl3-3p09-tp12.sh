@@ -11,7 +11,9 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 TP_SIZE="${TP_SIZE:-12}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+# Match the canonical full-MXFP4 KLD capture schedule. This keeps the
+# prompt-logit chunks and prefill kernel geometry comparable across runs.
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-256}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-268435456}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.98}"
 
