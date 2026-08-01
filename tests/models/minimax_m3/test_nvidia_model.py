@@ -541,7 +541,6 @@ def test_minimax_m3_sparse_attention_custom_op_uses_forward_context() -> None:
                     MiniMaxM3SparseAttention,
                     torch.Tensor,
                     torch.Tensor,
-                    tuple[torch.Tensor, torch.Tensor],
                     torch.Tensor,
                 ]
             ] = []
@@ -551,10 +550,9 @@ def test_minimax_m3_sparse_attention_custom_op_uses_forward_context() -> None:
             layer: MiniMaxM3SparseAttention,
             query: torch.Tensor,
             kv_cache: torch.Tensor,
-            topk_idx: tuple[torch.Tensor, torch.Tensor],
             output: torch.Tensor,
         ) -> torch.Tensor:
-            self.calls.append((layer, query, kv_cache, topk_idx, output))
+            self.calls.append((layer, query, kv_cache, output))
             output.copy_(query)
             return output
 
@@ -590,11 +588,10 @@ def test_minimax_m3_sparse_attention_custom_op_uses_forward_context() -> None:
     assert seen_index_query is index_query
     assert seen_index_cache is index_kv_cache
     assert len(layer.impl.calls) == 1
-    seen_layer, seen_query, seen_cache, seen_topk, seen_output = layer.impl.calls[0]
+    seen_layer, seen_query, seen_cache, seen_output = layer.impl.calls[0]
     assert seen_layer is layer
     assert seen_query is query
     assert seen_cache is main_kv_cache
-    assert seen_topk[0] is seen_topk[1]
     assert seen_output is output
     torch.testing.assert_close(output, query)
 
@@ -662,8 +659,9 @@ def test_minimax_m3_triton_sparse_attention_reuses_topk_slices(monkeypatch) -> N
 
     assert result is output
     assert len(kernel_topk) == 2
-    torch.testing.assert_close(kernel_topk[0], topk[:, :1, :])
-    torch.testing.assert_close(kernel_topk[1], topk[:, 1:, :])
+    expected_topk = topk.transpose(0, 1)
+    torch.testing.assert_close(kernel_topk[0], expected_topk[:, :1, :])
+    torch.testing.assert_close(kernel_topk[1], expected_topk[:, 1:, :])
     assert reports[0] is kernel_topk[0]
     assert reports[1] is kernel_topk[1]
 
@@ -979,9 +977,7 @@ def test_minimax_m3_qkv_loader_zero_fills_virtual_tp3_tail(monkeypatch) -> None:
 
         torch.testing.assert_close(
             weight.data[:4096],
-            _expected_padded_rows(
-                8192, cols, torch.bfloat16, tp_rank * 4096, 4096
-            ),
+            _expected_padded_rows(8192, cols, torch.bfloat16, tp_rank * 4096, 4096),
         )
         torch.testing.assert_close(
             weight.data[4096:4352],
@@ -1017,18 +1013,12 @@ def test_minimax_m3_qkv_indexer_loader_zero_fills_virtual_tp3_tail(
             layer.weight_loader_v2(weight, _rows(8192, cols, torch.bfloat16), "q")
             layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "k")
             layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "v")
-            layer.weight_loader_v2(
-                weight, _rows(512, cols, torch.bfloat16), "index_q"
-            )
-            layer.weight_loader_v2(
-                weight, _rows(128, cols, torch.bfloat16), "index_k"
-            )
+            layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "index_q")
+            layer.weight_loader_v2(weight, _rows(128, cols, torch.bfloat16), "index_k")
 
         torch.testing.assert_close(
             weight.data[:4096],
-            _expected_padded_rows(
-                8192, cols, torch.bfloat16, tp_rank * 4096, 4096
-            ),
+            _expected_padded_rows(8192, cols, torch.bfloat16, tp_rank * 4096, 4096),
         )
         torch.testing.assert_close(
             weight.data[4096:4352],

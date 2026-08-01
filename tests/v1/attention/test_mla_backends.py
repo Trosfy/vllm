@@ -86,6 +86,7 @@ def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.dcp_q_replicate = False
+    layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
     dequantized = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
@@ -284,6 +285,7 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.dcp_q_replicate = False
+    layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
 
@@ -401,6 +403,7 @@ def test_b12x_absorb_bmm_unsupported_pack_uses_materialized_pair(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.dcp_q_replicate = False
+    layer.kv_cache_dtype = "auto"
     layer.quant_config = None
     layer.layer_name = "test"
 
@@ -646,10 +649,13 @@ def test_fused_mla_query_dispatch_uses_backend_workspace(monkeypatch):
     )
     workspace = torch.empty((2, 8, 576), dtype=torch.bfloat16)
     workspace_calls = []
+
+    def get_workspace(*args):
+        workspace_calls.append(args)
+        return workspace
+
     layer.impl = SimpleNamespace(
-        get_fused_mla_query_output=lambda *args: (
-            workspace_calls.append(args) or workspace
-        )
+        get_fused_mla_query_output=get_workspace,
     )
     kernel_calls = []
     monkeypatch.setattr(
@@ -711,8 +717,13 @@ def test_fused_mla_query_dispatch_uses_temporary_when_backend_rejects_direct_out
         torch.empty((8, 192, 16), dtype=torch.uint8),
     )
     workspace_calls = []
+
+    def reject_direct_output(*args):
+        workspace_calls.append(args)
+        return None
+
     layer.impl = SimpleNamespace(
-        get_fused_mla_query_output=lambda *args: workspace_calls.append(args) or None
+        get_fused_mla_query_output=reject_direct_output,
     )
     kernel_calls = []
     monkeypatch.setattr(
@@ -747,8 +758,13 @@ def test_bf16_fused_mla_query_dispatch_supports_tp6_dcp_temporary(monkeypatch):
     layer._q_scale = torch.ones(1, dtype=torch.float32)
     layer.W_UK_T = torch.empty((11, 192, 512), dtype=torch.bfloat16)
     workspace_calls = []
+
+    def reject_direct_output(*args):
+        workspace_calls.append(args)
+        return None
+
     layer.impl = SimpleNamespace(
-        get_fused_mla_query_output=lambda *args: workspace_calls.append(args) or None
+        get_fused_mla_query_output=reject_direct_output,
     )
     kernel_calls = []
     monkeypatch.setattr(
@@ -1274,6 +1290,7 @@ def test_mla_query_absorb_safe_bmm_fallback_materializes_input(monkeypatch):
     layer.kv_lora_rank = 3
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
+    layer.use_pcp = False
     layer.use_safe_mla_query_bmm = True
     layer._fused_mla_query_output_dtype = torch.bfloat16
     layer.is_aiter_triton_fp4_bmm_enabled = False
@@ -1390,6 +1407,7 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     layer.kv_lora_rank = 3
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
+    layer.use_pcp = False
     layer.force_contiguous_mla_bmm_input = False
     layer.use_safe_mla_query_bmm = False
     layer.force_contiguous_mla_bmm_output = False
@@ -1474,6 +1492,7 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     layer.kv_lora_rank = 3
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
+    layer.use_pcp = False
     layer.force_contiguous_mla_bmm_input = False
     layer.use_safe_mla_query_bmm = False
     layer.is_aiter_triton_fp4_bmm_enabled = False

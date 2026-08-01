@@ -296,11 +296,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                         self.sample_indices,
                         self.sample_pos,
                         self.sample_idx_mapping,
+                        self.temperature,
+                        self.seeds,
                         input_batch,
                         num_sampled,
                         num_rejected,
                         last_sampled,
                         next_prefill_tokens,
+                        self.temperature,
+                        self.seeds,
                         self.block_tables.input_block_tables[gid],
                         self.block_tables.kernel_block_sizes[gid],
                         self.num_cached_tokens,
@@ -492,6 +496,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         step: int,
         num_query_per_req: int | None = None,
         causal: bool | Mapping[int, bool] = False,
+        max_seq_len_upper_bound: int | None = None,
+        query_start_loc_cpu: torch.Tensor | None = None,
         query_start_loc_np: np.ndarray | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
@@ -506,6 +512,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=step,
             num_query_per_req=num_query_per_req,
             causal=causal,
+            max_seq_len_upper_bound=max_seq_len_upper_bound,
+            query_start_loc_cpu=query_start_loc_cpu,
             query_start_loc_np=query_start_loc_np,
         )
 

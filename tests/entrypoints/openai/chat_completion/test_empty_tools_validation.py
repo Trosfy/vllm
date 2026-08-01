@@ -3,10 +3,10 @@
 """An empty tools array must validate like an omitted field (OpenAI parity);
 a tool_choice that forces a call with zero tools must still be rejected."""
 
-import pydantic
 import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.exceptions import VLLMValidationError
 
 pytestmark = pytest.mark.cpu_test
 
@@ -61,7 +61,7 @@ def test_empty_tools_with_forcing_tool_choice_rejected(tool_choice):
         "tool_choice": tool_choice,
     }
 
-    with pytest.raises(pydantic.ValidationError, match="`tools` must be set"):
+    with pytest.raises(VLLMValidationError, match="`tools` must be set"):
         ChatCompletionRequest.model_validate(data)
 
 
@@ -86,7 +86,7 @@ def test_tools_default_tool_choice_auto():
 
 def test_tool_choice_without_tools_rejected():
     """Existing behavior: tool_choice=auto without any tools field."""
-    with pytest.raises(pydantic.ValidationError, match="`tools` must be set"):
+    with pytest.raises(VLLMValidationError, match="`tools` must be set"):
         ChatCompletionRequest.model_validate(
             {"messages": MESSAGES, "model": "x", "tool_choice": "auto"}
         )

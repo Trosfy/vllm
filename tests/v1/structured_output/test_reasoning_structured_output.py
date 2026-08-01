@@ -277,13 +277,13 @@ class TestReasoningStructuredOutput:
         assert manager_with_reasoner.should_advance(request) is False
         assert structured_req.reasoning_ended is False
 
-        # ...the explicit step delta does not (no spec config here, so the
-        # advance itself is still deferred to the next step).
+        # ...the explicit step delta does, and upstream now advances every
+        # structured-output type immediately across the reasoning boundary.
         result = manager_with_reasoner.should_advance(
             request, [end_token_id, content_token_id]
         )
         assert structured_req.reasoning_ended is True
-        assert result is False
+        assert result is True
 
     def test_should_advance_straddle_step_trims_and_advances_same_step(
         self,
