@@ -44,6 +44,7 @@ def test_kimi_router_tp12_zero_pads_and_slices(monkeypatch):
     )
     output, _ = gates[0](x)
     assert output.shape == (2, 896)
+    assert output.is_contiguous()
     assert torch.equal(output, torch.nn.functional.linear(x, source))
 
 
@@ -68,6 +69,17 @@ def test_kimi_latent_tp12_padding_preserves_projection(monkeypatch):
 
     gathered_latent = torch.cat(down_outputs, dim=-1)[..., :3584]
     assert torch.equal(gathered_latent, latent)
+    padded_gather = torch.nn.functional.pad(latent, (0, 4))
+    monkeypatch.setattr(
+        kimi_module, "tensor_model_parallel_all_gather", lambda _: padded_gather
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.tensor_model_parallel_all_gather",
+        lambda _: padded_gather,
+    )
+    down_output, _ = down(x)
+    assert down_output.shape == (2, 3584)
+    assert down_output.is_contiguous()
     torch.testing.assert_close(
         sum(up_outputs),
         torch.nn.functional.linear(latent, up_source),

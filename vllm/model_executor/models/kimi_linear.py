@@ -140,7 +140,10 @@ class KimiColumnParallelGate(ColumnParallelLinear):
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
-        return output[..., : self.logical_output_size], None
+        # TP12 pads 896 router rows to 900.  Slicing the gathered tensor keeps
+        # its 900-wide stride, while both the router and MoE kernels require a
+        # dense logical output.
+        return output[..., : self.logical_output_size].contiguous(), None
 
 
 class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
@@ -182,7 +185,10 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
 
     def forward(self, input_):
         output, output_bias = super().forward(input_)
-        return output[..., : self.logical_output_size], output_bias
+        # The gathered TP12 tensor is 3588 wide; the logical 3584-wide view is
+        # strided until materialized.  SparkInfer's fused MoE entry requires
+        # the routed activation to be contiguous.
+        return output[..., : self.logical_output_size].contiguous(), output_bias
 
 
 class KimiPaddedRowParallelLinear(RowParallelLinear):
