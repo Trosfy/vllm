@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -251,6 +253,60 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _maybe_capture_kld_prompt_logits(
+    logits: torch.Tensor,
+    *,
+    req_id: str,
+    start_idx: int,
+    vocab_size: int,
+) -> None:
+    """Persist full-vocabulary prompt logits when explicitly requested.
+
+    This is intentionally an environment-gated rank-0 diagnostic hook. It
+    writes one safetensors file per chunk, avoiding both the OpenAI JSON path
+    and holding an entire multi-GiB prompt-logit tensor in worker memory.
+    """
+    capture_dir = os.environ.get("VLLM_KLD_CAPTURE_DIR")
+    if not capture_dir or not is_global_first_rank():
+        return
+
+    safe_req_id = "".join(
+        char if char.isalnum() or char in "-_." else "_" for char in req_id
+    )
+    request_dir = Path(capture_dir) / safe_req_id
+    request_dir.mkdir(parents=True, exist_ok=True)
+    end_idx = start_idx + logits.shape[0]
+    output_path = request_dir / (
+        f"logits.rows-{start_idx:06d}-{end_idx:06d}.safetensors"
+    )
+    if output_path.exists():
+        raise RuntimeError(f"Refusing to overwrite KLD capture chunk: {output_path}")
+
+    # Transfer BF16/FP16 logits first, then widen on CPU. This avoids a large
+    # transient float32 allocation on a GPU that is already weight-bound.
+    logits_cpu = logits[:, :vocab_size].detach().to(device="cpu").float().contiguous()
+    from safetensors.torch import save_file
+
+    save_file(
+        {"logits": logits_cpu},
+        str(output_path),
+        metadata={
+            "request_id": req_id,
+            "row_start": str(start_idx),
+            "row_end": str(end_idx),
+            "vocab_size": str(vocab_size),
+        },
+    )
+    logger.info(
+        "Saved KLD prompt-logit rows [%d, %d) shape=%s to %s",
+        start_idx,
+        end_idx,
+        tuple(logits_cpu.shape),
+        output_path,
+    )
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -5699,6 +5755,13 @@ class GPUModelRunner(
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
+
+            _maybe_capture_kld_prompt_logits(
+                logits,
+                req_id=req_id,
+                start_idx=start_idx,
+                vocab_size=self.input_batch.vocab_size,
+            )
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
