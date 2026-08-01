@@ -123,6 +123,12 @@ class KimiColumnParallelGate(ColumnParallelLinear):
             start_idx=self.tp_rank * shard_size,
         )
 
+    def weight_loader_v2(self, param, loaded_weight: torch.Tensor) -> None:
+        # UnquantizedLinearMethod installs weight_loader_v2 on the Parameter.
+        # Keep it on the Kimi-specific zero-padding path as well; otherwise
+        # rank 11 tries to narrow rows 825:900 from the 896-row checkpoint.
+        self.weight_loader(param, loaded_weight)
+
     def forward(self, x: torch.Tensor):
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
             output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
@@ -171,6 +177,9 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
             start_idx=self.tp_rank * shard_size,
         )
 
+    def weight_loader_v2(self, param, loaded_weight: torch.Tensor) -> None:
+        self.weight_loader(param, loaded_weight)
+
     def forward(self, input_):
         output, output_bias = super().forward(input_)
         return output[..., : self.logical_output_size], output_bias
@@ -211,6 +220,9 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             dim=input_dim,
             start_idx=self.tp_rank * shard_size,
         )
+
+    def weight_loader_v2(self, param, loaded_weight: torch.Tensor) -> None:
+        self.weight_loader(param, loaded_weight)
 
     def forward(self, input_):
         assert input_.shape[-1] == self.logical_input_size

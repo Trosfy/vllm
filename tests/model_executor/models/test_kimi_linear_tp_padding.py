@@ -32,7 +32,7 @@ def test_kimi_router_tp12_zero_pads_and_slices(monkeypatch):
     for rank in range(12):
         _set_tp(monkeypatch, rank)
         gate = kimi_module.KimiColumnParallelGate(4, 896, "gate")
-        gate.weight_loader(gate.weight, source)
+        gate.weight.weight_loader(gate.weight, source)
         local_outputs.append(torch.nn.functional.linear(x, gate.weight))
         gates.append(gate)
 
@@ -57,11 +57,11 @@ def test_kimi_latent_tp12_padding_preserves_projection(monkeypatch):
     for rank in range(12):
         _set_tp(monkeypatch, rank)
         down = kimi_module.KimiPaddedColumnParallelLinear(4, 3584, "down")
-        down.weight_loader(down.weight, down_source)
+        down.weight.weight_loader(down.weight, down_source)
         down_outputs.append(torch.nn.functional.linear(x, down.weight))
 
         up = kimi_module.KimiPaddedRowParallelLinear(3584, 3, "up")
-        up.weight_loader(up.weight, up_source)
+        up.weight.weight_loader(up.weight, up_source)
         padded_latent = torch.nn.functional.pad(latent, (0, 4))
         local_latent = padded_latent[..., rank * 299 : (rank + 1) * 299]
         up_outputs.append(torch.nn.functional.linear(local_latent, up.weight))
