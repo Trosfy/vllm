@@ -133,6 +133,21 @@ def test_exl3_online_overlay_rejects_split_packed_quantization(monkeypatch):
         )
 
 
+def test_exl3_online_overlay_rejects_mixed_packed_storage(monkeypatch):
+    config = Exl3Config(
+        tensor_storage={"model.layers.3.self_attn.q_a_proj": {"quant_format": "exl3"}}
+    )
+    config.packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    }
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+
+    with pytest.raises(ValueError, match="mixes EXL3 and BF16 source shards"):
+        config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.fused_qkv_a_proj"
+        )
+
+
 def test_exl3_online_overlay_never_quantizes_bf16_lm_head(monkeypatch):
     config = Exl3Config()
     _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
