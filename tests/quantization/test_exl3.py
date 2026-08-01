@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -9,10 +10,13 @@ import torch
 import vllm.model_executor.layers.quantization.exl3 as exl3_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.config import CompilationMode
-from vllm.model_executor.layers.fused_moe import MoEActivation
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor.layers.fused_moe import MoEActivation, RoutedExperts
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
+    Exl3LinearMethod,
     Exl3MoEMethod,
     Exl3MoEParameter,
 )
@@ -33,6 +37,125 @@ def _rank_sliced_metadata(**overrides):
     }
     metadata.update(overrides)
     return metadata
+
+
+def _set_online_overlay(monkeypatch, args: QuantizationConfigArgs) -> object:
+    current = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=args,
+            enforce_eager=True,
+        )
+    )
+    sentinel = object()
+    monkeypatch.setattr(exl3_module, "get_current_vllm_config_or_none", lambda: current)
+    monkeypatch.setattr(exl3_module, "Mxfp8OnlineLinearMethod", lambda: sentinel)
+    return sentinel
+
+
+def _mock_linear() -> Mock:
+    return Mock(spec=LinearBase)
+
+
+def test_exl3_online_overlay_quantizes_only_bf16_dense_and_shared(monkeypatch):
+    config = Exl3Config(
+        tensor_storage={"model.layers.3.self_attn.q_b_proj": {"quant_format": "exl3"}}
+    )
+    sentinel = _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(linear="mxfp8", shared_experts="mxfp8"),
+    )
+
+    serialized = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.q_b_proj"
+    )
+    dense_bf16 = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+    )
+    shared_bf16 = config.get_quant_method(
+        _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+    )
+
+    assert isinstance(serialized, Exl3LinearMethod)
+    assert dense_bf16 is sentinel
+    assert shared_bf16 is sentinel
+
+
+def test_exl3_linear_overlay_does_not_select_shared_experts(monkeypatch):
+    config = Exl3Config()
+    sentinel = _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+
+    dense = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+    )
+    shared = config.get_quant_method(
+        _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+    )
+
+    assert dense is sentinel
+    assert isinstance(shared, UnquantizedLinearMethod)
+
+
+def test_exl3_online_overlay_honors_unfused_ignore_names(monkeypatch):
+    config = Exl3Config()
+    config.packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    }
+    sentinel = _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(
+            linear="mxfp8",
+            ignore=["re:.*\\.q_a_proj$", "re:.*kv_a_proj_with_mqa"],
+        ),
+    )
+
+    ignored = config.get_quant_method(
+        _mock_linear(), "model.layers.3.self_attn.fused_qkv_a_proj"
+    )
+    kept = config.get_quant_method(_mock_linear(), "model.layers.3.self_attn.kv_b_proj")
+
+    assert isinstance(ignored, UnquantizedLinearMethod)
+    assert kept is sentinel
+
+
+def test_exl3_online_overlay_rejects_split_packed_quantization(monkeypatch):
+    config = Exl3Config()
+    config.packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    }
+    _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(linear="mxfp8", ignore=["re:.*\\.q_a_proj$"]),
+    )
+
+    with pytest.raises(ValueError, match="different quantization schemes"):
+        config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.fused_qkv_a_proj"
+        )
+
+
+def test_exl3_online_overlay_never_quantizes_bf16_lm_head(monkeypatch):
+    config = Exl3Config()
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+    lm_head = type("ParallelLMHead", (torch.nn.Module,), {})()
+
+    method = config.get_quant_method(lm_head, "lm_head")
+
+    assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_exl3_online_overlay_preserves_rank_sliced_routed_experts(monkeypatch):
+    config = Exl3Config()
+    config.rank_sliced_metadata = _rank_sliced_metadata()
+    _set_online_overlay(
+        monkeypatch,
+        QuantizationConfigArgs(linear="mxfp8", shared_experts="mxfp8"),
+    )
+    routed = Mock(spec=RoutedExperts)
+    routed.moe_config = object()
+
+    method = config.get_quant_method(routed, "model.layers.3.mlp.experts")
+
+    assert isinstance(method, Exl3MoEMethod)
 
 
 def test_rank_sliced_checkpoint_selects_exl3_override():

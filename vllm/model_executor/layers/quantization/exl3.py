@@ -31,6 +31,7 @@ import torch
 from transformers import PretrainedConfig
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -53,6 +54,14 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    Mxfp8OnlineLinearMethod,
+    is_shared_expert_projection,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
@@ -658,14 +667,66 @@ class Exl3Config(QuantizationConfig):
         if is_lm_head and not prefix:
             prefix = "lm_head"
         if isinstance(layer, LinearBase) or is_lm_head:
-            if not self._linear_prefix_is_exl3(prefix):
-                return UnquantizedLinearMethod()
-            return Exl3LinearMethod(self)
+            if self._linear_prefix_is_exl3(prefix):
+                return Exl3LinearMethod(self)
+            if not is_lm_head and (
+                method := self._get_bf16_online_linear_method(layer, prefix)
+            ):
+                return method
+            return UnquantizedLinearMethod()
         if isinstance(layer, RoutedExperts):
             if not self._moe_prefix_is_exl3(prefix, layer):
                 return None
             return Exl3MoEMethod(self, layer.moe_config)
         return None
+
+    def _get_bf16_online_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        """Overlay MXFP8 only on linears absent from EXL3 tensor storage.
+
+        EXL3-owned dense matrices are selected before this method and routed
+        experts never enter it. Shared-expert projections have an independent
+        spec so a broad ``linear`` overlay cannot quantize them accidentally.
+        """
+        if not isinstance(layer, LinearBase):
+            return None
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        args = vllm_config.model_config.quantization_config
+        if not isinstance(args, QuantizationConfigArgs):
+            return None
+
+        shared_expert = is_shared_expert_projection(prefix)
+        spec = args.shared_experts if shared_expert else args.linear
+        if spec is None:
+            return None
+        if (
+            not shared_expert
+            and args.ignore
+            and should_ignore_layer(
+                prefix,
+                ignore=args.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            )
+        ):
+            return None
+        if spec.weight != kMxfp8Dynamic or spec.activation is not None:
+            raise ValueError(
+                "EXL3 BF16 online overlay only supports weight='mxfp8' "
+                "with no activation override."
+            )
+
+        logger.info_once(
+            "EXL3 BF16 online overlay: quantizing non-EXL3 %s projections "
+            "to MXFP8 at load time (module example: %s).",
+            "shared-expert" if shared_expert else "dense-linear",
+            prefix,
+        )
+        logger.debug("EXL3 BF16 MXFP8 overlay applied to %s", prefix)
+        return Mxfp8OnlineLinearMethod()
 
     def _storage_entry(self, prefix: str) -> dict[str, Any] | None:
         candidates = [prefix]
