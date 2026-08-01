@@ -292,6 +292,7 @@ def _positive_env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
 
+
 def _resolve_prefill_capacity(max_batched_tokens: int) -> int:
     """Resolve the optional EXL3 arena bound within the scheduler contract."""
 
