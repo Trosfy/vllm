@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
     _decode_kquant_nf3_scale,
+    _exl3_tp_local_hadamard_tail,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
@@ -64,6 +65,10 @@ def test_config_registration_and_parsing():
                 "codebook": "mcg",
                 "mcg_mult": 0xCBAC1FED,
                 "shared_su": True,
+                "compatible_tp_sizes": [16],
+                "tp_local_quantization": True,
+                "tp_local_intermediate_size": 192,
+                "intermediate_hadamard_blocks": [128, 64],
             },
         }
     )
@@ -74,6 +79,8 @@ def test_config_registration_and_parsing():
     assert config.dense_format == "mxfp8"
     assert config.ignored_layers == ["kv_b_proj"]
     assert config.trellis["shared_su"] is True
+    assert config.trellis["compatible_tp_sizes"] == [16]
+    assert config.trellis["tp_local_intermediate_size"] == 192
 
 
 def test_config_rejects_unknown_demoted_format():
@@ -156,6 +163,40 @@ def test_unpack_nf3_codes():
 
 def test_kimi_tp16_uses_tuned_fc1_tile():
     assert _b12x_tiles_for_geometry(3584, 3072 // 16) == (128, 64, 64, 128)
+
+
+def test_tp16_exl3_accepts_explicit_rank_local_h64_artifact():
+    trellis = {
+        "tp_local_quantization": True,
+        "compatible_tp_sizes": [16],
+        "tp_local_intermediate_size": 192,
+        "intermediate_hadamard_blocks": [128, 64],
+    }
+
+    assert (
+        _exl3_tp_local_hadamard_tail(trellis, tp_size=16, intermediate_size=192) == 64
+    )
+
+
+def test_tp16_exl3_rejects_globally_quantized_h64_artifact():
+    with pytest.raises(ValueError, match="not quantized after TP sharding"):
+        _exl3_tp_local_hadamard_tail({}, tp_size=16, intermediate_size=192)
+
+
+def test_tp_local_exl3_rejects_wrong_runtime_tp():
+    trellis = {
+        "tp_local_quantization": True,
+        "compatible_tp_sizes": [16],
+        "tp_local_intermediate_size": 192,
+        "intermediate_hadamard_blocks": [128, 64],
+    }
+
+    with pytest.raises(ValueError, match="active TP12"):
+        _exl3_tp_local_hadamard_tail(trellis, tp_size=12, intermediate_size=256)
+
+
+def test_legacy_tp12_exl3_keeps_aligned_transform_contract():
+    assert _exl3_tp_local_hadamard_tail({}, tp_size=12, intermediate_size=256) == 0
 
 
 def test_kquant_nf3_scale_reinterprets_raw_fp8_bits():

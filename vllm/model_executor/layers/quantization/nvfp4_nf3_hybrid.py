@@ -182,6 +182,29 @@ def _is_k3_hybrid_geometry(
     )
 
 
+def _is_k3_exl3_onegrid_geometry(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_kept: int,
+    num_exl3: int,
+    topk: int,
+    kept_mx: bool,
+) -> bool:
+    return (
+        bool(int(os.getenv("VLLM_K3_EXL3_ONEGRID", "1")))
+        and kept_mx
+        and hidden_size == _K3_HYBRID_HIDDEN
+        and intermediate_size == _K3_HYBRID_INTERMEDIATE
+        and num_experts == _K3_HYBRID_EXPERTS
+        and num_kept > 0
+        and num_exl3 > 0
+        and num_kept + num_exl3 == num_experts
+        and topk == _K3_HYBRID_TOPK
+    )
+
+
 def _read_hybrid_keys(config: Any) -> tuple[dict[str, list[int]] | None, str | None]:
     """Read ``hybrid_bit_map``/``kept_format`` from a quantization config dict.
 
@@ -245,6 +268,49 @@ def _b12x_tiles_for_geometry(
     )
 
 
+def _exl3_tp_local_hadamard_tail(
+    trellis: dict[str, Any], *, tp_size: int, intermediate_size: int
+) -> int:
+    """Validate the artifact's rank-local EXL3 transform contract."""
+    tp_size = int(tp_size)
+    intermediate_size = int(intermediate_size)
+    tail = intermediate_size % 128
+    if tail not in (0, 64):
+        raise ValueError(
+            f"EXL3 TP{tp_size} local intermediate {intermediate_size} is not "
+            "H128/H64 compatible"
+        )
+    tp_local = bool(trellis.get("tp_local_quantization", False))
+    if not tp_local:
+        if tail:
+            raise ValueError(
+                f"EXL3 TP{tp_size} I={intermediate_size} has an H64 tail but "
+                "the artifact was not quantized after TP sharding"
+            )
+        return 0
+    compatible = tuple(int(value) for value in trellis.get("compatible_tp_sizes", ()))
+    if tp_size not in compatible:
+        raise ValueError(
+            f"EXL3 artifact supports TP{compatible}, not the active TP{tp_size}"
+        )
+    artifact_intermediate = int(trellis.get("tp_local_intermediate_size", -1))
+    if artifact_intermediate != intermediate_size:
+        raise ValueError(
+            "EXL3 artifact rank-local intermediate mismatch: "
+            f"artifact={artifact_intermediate}, runtime={intermediate_size}"
+        )
+    blocks = tuple(
+        int(value) for value in trellis.get("intermediate_hadamard_blocks", ())
+    )
+    expected_blocks = (128, 64) if tail else (128,)
+    if blocks != expected_blocks:
+        raise ValueError(
+            "EXL3 artifact Hadamard block contract mismatch: "
+            f"artifact={blocks}, expected={expected_blocks}"
+        )
+    return tail
+
+
 def _decode_kquant_nf3_scale(raw: torch.Tensor) -> torch.Tensor:
     """Interpret kquant's uint8 payload as biased E4M3 scale values.
 
@@ -292,6 +358,7 @@ class _HybridSharedRuntime:
         self.exl3_scratch: torch.Tensor | None = None
         self.exl3_max_m: int | None = None
         self.exl3_topk: int | None = None
+        self.exl3_onegrid_buffers: Any = None
 
 
 class _HybridLayerState:
@@ -325,6 +392,7 @@ class _HybridLayerState:
         self.prep_nf3: Any = None
         self.prep_exl3: Any = None
         self.exl3_plan: Any = None
+        self.exl3_hadamard_tail = 0
         # Global -> local id maps, -1 for experts outside the tier.
         self.emap_kept: torch.Tensor | None = None
         self.emap_nf3: torch.Tensor | None = None
@@ -348,6 +416,14 @@ class _HybridLayerState:
         self.k3_hybrid_tier_map: torch.Tensor | None = None
         self.k3_hybrid_output: torch.Tensor | None = None
         self.k3_hybrid_ready = False
+        # K3 TP16 one-grid original-MXFP4 + TP-local EXL3 decode resources.
+        self.exl3_onegrid_launch: Any = None
+        self.exl3_onegrid_maps: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.exl3_onegrid_rotations: Any = None
+        self.exl3_onegrid_buffers: Any = None
+        self.exl3_onegrid_output: torch.Tensor | None = None
+        self.exl3_onegrid_disabled_reason: str | None = None
+        self.exl3_onegrid_ready = False
         # Keeps kernel-format tensors alive: b12x prepared weights VIEW the
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
@@ -908,15 +984,19 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 f"marker={marker:#010x}"
             )
         if not bool(trellis.get("shared_su", False)):
-            raise ValueError("K3 TP12 EXL3 artifact must declare shared_su=true")
+            raise ValueError("K3 EXL3 artifact must declare shared_su=true")
 
         hidden, inter = state.hidden_size, state.intermediate_size
-        if hidden % 256 or inter % 256:
+        tp_size = get_tensor_model_parallel_world_size()
+        hadamard_tail = _exl3_tp_local_hadamard_tail(
+            trellis, tp_size=tp_size, intermediate_size=inter
+        )
+        if hidden % 128 or inter % 64:
             raise ValueError(
-                "K3 TP12 EXL3 requires local hidden/intermediate dimensions "
-                f"divisible by 256, got H={hidden}, I={inter}"
+                "K3 EXL3 requires H128 and I64 rank-local alignment, got "
+                f"H={hidden}, I={inter}"
             )
-        tile_config = (64, 256, 64, 256)
+        tile_config = state.tiles
         w13 = layer.w13_exl3_trellis.contiguous()
         w2 = layer.w2_exl3_trellis.contiguous()
         gate_suh = layer.w13_exl3_suh[0].contiguous()
@@ -943,7 +1023,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             w13_layout="w13",
             trellis_bits=bits,
             trellis_tile_config=tile_config,
+            tp_local_intermediate_hadamard_tail=hadamard_tail,
         )
+        state.exl3_hadamard_tail = hadamard_tail
         state.prep_exl3 = fused_moe.prepare_weights(
             plan=weight_plan,
             params_dtype=layer.hybrid_params_dtype,
@@ -1589,6 +1671,153 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 runtime.k3_hybrid_disabled_reason,
             )
 
+    def _prepare_exl3_onegrid(self, layer: "RoutedExperts", topk: int) -> None:
+        """Arm K3 TP16's MXFP4+EXL3 one-grid decode during eager profile."""
+        state: _HybridLayerState = layer.hybrid_state
+        runtime = self.quant_config.shared_runtime
+        if state.exl3_onegrid_ready or state.exl3_onegrid_disabled_reason is not None:
+            return
+        if not _is_k3_exl3_onegrid_geometry(
+            hidden_size=state.hidden_size,
+            intermediate_size=state.intermediate_size,
+            num_experts=state.num_experts,
+            num_kept=state.num_kept,
+            num_exl3=state.num_nf3,
+            topk=topk,
+            kept_mx=state.kept_mx,
+        ):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            state.exl3_onegrid_disabled_reason = (
+                "resources were not prepared before capture"
+            )
+            return
+        try:
+            from sparkinfer.moe._shared.kernels.w4a16.host import (
+                max_packed_route_slots,
+            )
+            from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+                build_tiered_maps,
+                combine_mxfp4_trellis_rotations,
+                compile_mixed_mxfp4_trellis,
+                make_mixed_trellis_buffers,
+            )
+
+            prep_kept = state.prep_kept_hybrid
+            prep_exl3 = (
+                None
+                if state.prep_exl3 is None
+                else state.prep_exl3.representation_for("w4a16")
+            )
+            if prep_kept is None or prep_exl3 is None:
+                raise RuntimeError("both prepared K3 tiers are required")
+            prepared_contract = (
+                prep_kept.weight_layout == "modelopt"
+                and prep_kept.scale_format == "e8m0_k32"
+                and prep_kept.w13_layout == "w31"
+                and int(prep_kept.num_experts) == state.num_kept
+                and prep_exl3.weight_layout == "trellis3_t256"
+                and prep_exl3.scale_format == "e4m3_k32"
+                and prep_exl3.w13_layout == "trellis3_t256_proj"
+                and int(prep_exl3.num_experts) == state.num_nf3
+                and int(prep_exl3.tp_local_intermediate_hadamard_tail)
+                == state.exl3_hadamard_tail
+            )
+            if not prepared_contract:
+                raise RuntimeError("prepared tiers do not match K3 EXL3 one-grid ABI")
+            if (
+                prep_exl3.gate_suh is None
+                or prep_exl3.up_suh is None
+                or prep_exl3.intermediate_rotations is None
+                or prep_exl3.down_svh is None
+            ):
+                raise RuntimeError("prepared EXL3 rotation tables are incomplete")
+
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            sms = int(props.multi_processor_count)
+            max_shared_mem = int(
+                getattr(props, "shared_memory_per_block_optin", 101_376)
+            )
+            route_slots = max_packed_route_slots(_K3_HYBRID_TOPK, 8, _K3_HYBRID_EXPERTS)
+            launch = compile_mixed_mxfp4_trellis(
+                size_m=_K3_HYBRID_M,
+                hidden_size=_K3_HYBRID_HIDDEN,
+                intermediate_size=_K3_HYBRID_INTERMEDIATE,
+                tier0_num_experts=state.num_kept,
+                tier1_num_experts=state.num_nf3,
+                top_k=_K3_HYBRID_TOPK,
+                max_m_blocks=(route_slots + 7) // 8,
+                sms=sms,
+                max_shared_mem=max_shared_mem,
+                force_tile_config=state.tiles,
+                activation=layer.activation.value,
+                intermediate_hadamard_tail=state.exl3_hadamard_tail,
+                tier1_broadcast_suh=int(prep_exl3.gate_suh.shape[0]) == 1,
+                tier1_broadcast_svh=int(prep_exl3.down_svh.shape[0]) == 1,
+            )
+            if (
+                int(launch.local_memory_bytes) > 0
+                or int(launch.tier0_num_experts) != state.num_kept
+                or int(launch.tier1_num_experts) != state.num_nf3
+            ):
+                raise RuntimeError("compiled K3 EXL3 one-grid launch failed admission")
+
+            tier0_ids = [
+                global_id
+                for _, global_id in sorted(
+                    (local_id, global_id)
+                    for global_id, (tier, local_id) in state.remap.items()
+                    if tier == 0
+                )
+            ]
+            tier1_ids = [
+                global_id
+                for _, global_id in sorted(
+                    (local_id, global_id)
+                    for global_id, (tier, local_id) in state.remap.items()
+                    if tier == 1
+                )
+            ]
+            maps = build_tiered_maps(tier0_ids, tier1_ids, device=prep_kept.w13.device)
+            rotations = combine_mxfp4_trellis_rotations(state.num_kept, prep_exl3)
+            if runtime.exl3_onegrid_buffers is None:
+                runtime.exl3_onegrid_buffers = make_mixed_trellis_buffers(
+                    launch, device=prep_kept.w13.device, sms=sms
+                )
+            buffers = dataclasses.replace(
+                runtime.exl3_onegrid_buffers,
+                output=torch.empty(
+                    (_K3_HYBRID_M, _K3_HYBRID_HIDDEN),
+                    dtype=torch.float32,
+                    device=prep_kept.w13.device,
+                ),
+            )
+            output = torch.empty(
+                (_K3_HYBRID_M, _K3_HYBRID_HIDDEN),
+                dtype=layer.hybrid_params_dtype,
+                device=prep_kept.w13.device,
+            )
+            state.exl3_onegrid_launch = launch
+            state.exl3_onegrid_maps = maps
+            state.exl3_onegrid_rotations = rotations
+            state.exl3_onegrid_buffers = buffers
+            state.exl3_onegrid_output = output
+            state.exl3_onegrid_ready = True
+            logger.info(
+                "nvfp4_nf3_hybrid: armed %s K3 TP16 EXL3 one-grid decode "
+                "(MXFP4=%d, EXL3=%d)",
+                layer.layer_name,
+                state.num_kept,
+                state.num_nf3,
+            )
+        except Exception as exc:
+            state.exl3_onegrid_disabled_reason = f"{type(exc).__name__}: {exc}"
+            logger.warning_once(
+                "nvfp4_nf3_hybrid: K3 EXL3 one-grid unavailable; using serial "
+                "decode: %s",
+                state.exl3_onegrid_disabled_reason,
+            )
+
     def _run_grid188(
         self,
         layer: "RoutedExperts",
@@ -1706,6 +1935,42 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
         return state.k3_hybrid_output
 
+    def _run_exl3_onegrid(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+            run_mixed_trellis,
+        )
+
+        state: _HybridLayerState = layer.hybrid_state
+        assert state.prep_kept_hybrid is not None
+        assert state.prep_exl3 is not None
+        assert state.exl3_onegrid_launch is not None
+        assert state.exl3_onegrid_maps is not None
+        assert state.exl3_onegrid_rotations is not None
+        assert state.exl3_onegrid_buffers is not None
+        assert state.exl3_onegrid_output is not None
+        prep_exl3 = state.prep_exl3.representation_for("w4a16")
+        global_to_combined, descriptor_map = state.exl3_onegrid_maps
+        result = run_mixed_trellis(
+            x,
+            state.prep_kept_hybrid,
+            prep_exl3,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor_map,
+            state.exl3_onegrid_rotations,
+            state.exl3_onegrid_launch,
+            state.exl3_onegrid_buffers,
+        )
+        state.exl3_onegrid_output.copy_(result)
+        return state.exl3_onegrid_output
+
     def _ensure_exl3_runtime(self, layer: "RoutedExperts", m: int, topk: int) -> None:
         """Plan one layer and grow the process-shared Trellis scratch arena."""
         from sparkinfer.moe import fused_moe
@@ -1749,6 +2014,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 spec.shape, dtype=spec.dtype, device=spec.device
             )
         state.exl3_plan = plan
+        self._prepare_exl3_onegrid(layer, topk)
         state.runtime_ready = True
 
     def _run_exl3(
@@ -1795,7 +2061,21 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 f"EXL3 m={m} exceeds planned capacity {runtime.exl3_max_m}"
             )
         weights = topk_weights.float().contiguous()
-        ids = topk_ids.contiguous()
+        ids = (
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        ).contiguous()
+        if (
+            state.exl3_onegrid_ready
+            and m == _K3_HYBRID_M
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and ids.numel() == _K3_HYBRID_TOPK
+            and weights.numel() == _K3_HYBRID_TOPK
+        ):
+            logger.info_once(
+                "nvfp4_nf3_hybrid: executing K3 TP16 MXFP4+EXL3 one-grid decode"
+            )
+            return self._run_exl3_onegrid(layer, x, weights, ids)
         decode = m <= _B12X_DECODE_M
         if state.num_nf3 == 0:
             return self._run_kept(layer, x, weights, ids, decode)
