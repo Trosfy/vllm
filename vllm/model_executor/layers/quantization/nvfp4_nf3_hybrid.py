@@ -33,10 +33,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm import envs
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -198,6 +194,47 @@ def _read_hybrid_keys(config: Any) -> tuple[dict[str, list[int]] | None, str | N
         hybrid_bit_map = hybrid_bit_map or quantization.get("hybrid_bit_map")
         kept_format = kept_format or quantization.get("kept_format")
     return hybrid_bit_map, kept_format
+
+
+def _local_hybrid_remap(
+    bits: list[int],
+    expert_map: torch.Tensor | None,
+    expected_local_experts: int,
+) -> dict[int, tuple[int, int]]:
+    """Map rank-local global expert ids into compact per-tier ids."""
+    if expert_map is None:
+        local_global_ids = list(range(len(bits)))
+    else:
+        if expert_map.numel() != len(bits):
+            raise ValueError(
+                "expert_map and hybrid_bit_map disagree on global expert count: "
+                f"{expert_map.numel()} != {len(bits)}"
+            )
+        mapped = expert_map.detach().cpu().tolist()
+        local_global_ids = [
+            global_id for global_id, local_id in enumerate(mapped) if local_id >= 0
+        ]
+        local_ids = sorted(int(mapped[global_id]) for global_id in local_global_ids)
+        if local_ids != list(range(len(local_global_ids))):
+            raise ValueError("expert_map local ids must form a contiguous range")
+
+    if len(local_global_ids) != expected_local_experts:
+        raise ValueError(
+            "expert_map local expert count does not match the MoE allocation: "
+            f"{len(local_global_ids)} != {expected_local_experts}"
+        )
+
+    kept = [global_id for global_id in local_global_ids if bits[global_id] == 4]
+    demoted = [global_id for global_id in local_global_ids if bits[global_id] == 3]
+    if len(kept) + len(demoted) != expected_local_experts:
+        raise ValueError("hybrid_bit_map contains bit widths other than 4 and 3")
+    return {
+        **{global_id: (0, local_id) for local_id, global_id in enumerate(kept)},
+        **{
+            global_id: (1, local_id)
+            for local_id, global_id in enumerate(demoted)
+        },
+    }
 
 
 def _unpack_nf3_codes(packed: torch.Tensor, size_k: int) -> torch.Tensor:
@@ -542,39 +579,32 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 "nvfp4_nf3_hybrid only supports SiLU/SiTU-gated MoE layers, got "
                 f"{layer.activation}."
             )
+        global_num_experts = int(
+            extra_weight_attrs.get("global_num_experts", num_experts)
+        )
         bits = self._layer_bits(layer)
         kept_mx = bits is not None and self.quant_config.kept_format == "mxfp4_e8m0k32"
         if bits is None:
             # MoE layer absent from hybrid_bit_map (e.g. an MTP head): its
             # experts are uniform NVFP4; run it through the hybrid path as
             # all-kept so it shares this loader and kernel.
-            bits = [4] * num_experts
-        if len(bits) != num_experts:
+            bits = [4] * global_num_experts
+        if len(bits) != global_num_experts:
             raise ValueError(
                 f"hybrid_bit_map entry for {layer.layer_name} has {len(bits)} "
-                f"experts, expected {num_experts}."
+                f"experts, expected {global_num_experts}."
             )
         hidden = hidden_size
         inter = intermediate_size_per_partition
         group_size = self.quant_config.group_size
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        kept = [e for e, b in enumerate(bits) if b == 4]
-        demoted = [e for e, b in enumerate(bits) if b == 3]
-        if len(kept) + len(demoted) != num_experts:
-            raise ValueError(
-                f"hybrid_bit_map entry for {layer.layer_name} contains bit "
-                "widths other than 4 (kept) and 3 (NF3)."
-            )
-        remap = {
-            **{e: (0, i) for i, e in enumerate(kept)},
-            **{e: (1, i) for i, e in enumerate(demoted)},
-        }
+        tp_rank = layer.moe_config.tp_rank
+        tp_size = layer.moe_config.tp_size
+        remap = _local_hybrid_remap(bits, layer.expert_map, num_experts)
         state = _HybridLayerState(
             remap,
             hidden,
             inter,
-            num_experts,
+            global_num_experts,
             kept_mx,
             self.quant_config.demoted_format,
         )
@@ -601,7 +631,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             name = name_mapped or weight_name or ""
             if "input_scale" in name:  # W4A16: activation scales are unused
                 return True
-            tier, local_id = state.remap[int(expert_id)]
+            mapped = state.remap.get(int(expert_id))
+            if mapped is None:
+                return False if return_success else None
+            tier, local_id = mapped
             family = "w13" if "w13_" in name else "w2"
             if "exl3_" in name:
                 if state.demoted_format != "exl3_3" or tier != 1:

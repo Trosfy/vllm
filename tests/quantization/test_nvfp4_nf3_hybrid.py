@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
     _decode_kquant_nf3_scale,
+    _local_hybrid_remap,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
@@ -152,6 +153,22 @@ def test_unpack_nf3_codes():
     )
 
     torch.testing.assert_close(_unpack_nf3_codes(packed, size_k=8), expected)
+
+
+def test_ep_hybrid_remap_keeps_only_rank_local_experts():
+    bits = [4, 3, 3, 4, 3, 4, 3, 3]
+    expert_map = torch.tensor([-1, 0, -1, 1, -1, -1, 2, -1], dtype=torch.int32)
+
+    remap = _local_hybrid_remap(bits, expert_map, expected_local_experts=3)
+
+    assert remap == {3: (0, 0), 1: (1, 0), 6: (1, 1)}
+
+
+def test_ep_hybrid_remap_rejects_noncontiguous_local_ids():
+    expert_map = torch.tensor([0, -1, 2, -1], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="contiguous"):
+        _local_hybrid_remap([4, 3, 3, 4], expert_map, expected_local_experts=2)
 
 
 def test_kimi_tp16_uses_tuned_fc1_tile():
