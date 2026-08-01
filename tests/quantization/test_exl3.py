@@ -603,7 +603,10 @@ def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
     assert all(tuple(table.shape) == (experts,) for table in layer.exl3_pointer_tables)
 
 
-def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
+@pytest.mark.parametrize("shared_h", [False, True])
+def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(
+    monkeypatch, shared_h
+):
     experts = 4
     hidden = intermediate = 128
     bitrates = (3, 4, 3, 4)
@@ -629,10 +632,12 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
         )
 
     slabs = {
-        "w13_suh": torch.ones((2, experts, hidden), dtype=torch.float16),
+        "w13_suh": torch.ones(
+            (2, 1 if shared_h else experts, hidden), dtype=torch.float16
+        ),
         "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
         "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
-        "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
+        "w2_svh": torch.ones((1 if shared_h else experts, hidden), dtype=torch.float16),
     }
     layer = SimpleNamespace(
         local_num_experts=experts,
@@ -727,7 +732,15 @@ def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypat
     assert all(entry["trellis_mcg"] is marker for entry in fused_api.prepared)
     assert len(layer.exl3_mixed_trellis["serial_tiers"]) == 2
     rotations = layer.exl3_mixed_trellis["rotations"]
+    expected_h_rows = 1 if shared_h else experts
+    assert rotations.gate_suh.shape[0] == expected_h_rows
+    assert rotations.up_suh.shape[0] == expected_h_rows
+    assert rotations.down_svh.shape[0] == expected_h_rows
     for mixed_entry, serial_entry in zip(api.prepared, fused_api.prepared, strict=True):
+        expected_tier_rows = 1 if shared_h else 2
+        assert mixed_entry["gate_suh"].shape[0] == expected_tier_rows
+        assert mixed_entry["up_suh"].shape[0] == expected_tier_rows
+        assert mixed_entry["down_svh"].shape[0] == expected_tier_rows
         assert (
             mixed_entry["gate_suh"].untyped_storage().data_ptr()
             == rotations.gate_suh.untyped_storage().data_ptr()
