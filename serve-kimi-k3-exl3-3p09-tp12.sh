@@ -29,7 +29,11 @@ json_bool() {
   esac
 }
 
-export PYTHONPATH="${K3_SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+# Overlay this checkout only when its compiled extension is present. Otherwise,
+# leave an installed wheel intact instead of importing a sourceless worktree.
+if [[ -e "${K3_SCRIPT_DIR}/vllm/_C_stable_libtorch.abi3.so" ]]; then
+  export PYTHONPATH="${K3_SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${K3_DEFAULT_GPU_UUIDS}}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
