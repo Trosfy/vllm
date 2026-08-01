@@ -163,9 +163,22 @@ def _runtime_scope_id(quant_config: Any) -> int:
 
 
 _RANK_SLICED_FORMAT = "exl3-trellis"
+_PER_EXPERT_ROTATION_LAYOUT = "per_expert_v1"
+_SHARED_H_ROTATION_LAYOUT = "shared_h_v1"
+_SHARED_H_TENSOR_SCHEMA = (
+    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+)
 _RANK_SLICED_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
     r"(?P<field>trellis|suh|svh|mcg|mul1)$"
+)
+_SHARED_H_WEIGHT_RE = re.compile(
+    r"^(?P<experts_prefix>.+\.experts)\.shared_h\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\.rank(?P<rank>\d+)\."
+    r"(?P<field>suh|svh)$"
+)
+_EXPERT_PROJECTION_RE = re.compile(
+    r"^.+\.experts\.\d+\.(?P<projection>gate_proj|up_proj|down_proj)$"
 )
 
 ShardId = str | int | tuple[int, ...] | None
@@ -390,6 +403,7 @@ class Exl3Config(QuantizationConfig):
         self.tensor_storage = tensor_storage or {}
         self._eager_checked = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
+        self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
         self.rank_sliced_k_values: tuple[int, ...] | None = None
         self.rank_sliced_bits_by_layer: dict[int, tuple[int, ...]] = {}
 
@@ -517,7 +531,30 @@ class Exl3Config(QuantizationConfig):
                 "unsupported rank-sliced EXL3 tensor schema: "
                 f"{metadata['tensor_schema']!r}"
             )
+        rotation_layout = str(
+            metadata.get("rotation_layout", _PER_EXPERT_ROTATION_LAYOUT)
+        )
+        if rotation_layout not in {
+            _PER_EXPERT_ROTATION_LAYOUT,
+            _SHARED_H_ROTATION_LAYOUT,
+        }:
+            raise ValueError(
+                f"unsupported rank-sliced EXL3 rotation_layout: {rotation_layout!r}"
+            )
+        shared_schema = metadata.get("shared_h_tensor_schema")
+        if rotation_layout == _SHARED_H_ROTATION_LAYOUT:
+            if shared_schema != _SHARED_H_TENSOR_SCHEMA:
+                raise ValueError(
+                    "shared_h_v1 rank-sliced EXL3 requires "
+                    f"shared_h_tensor_schema={_SHARED_H_TENSOR_SCHEMA!r}"
+                )
+        elif shared_schema is not None:
+            raise ValueError(
+                "shared_h_tensor_schema is only valid with "
+                "rotation_layout='shared_h_v1'"
+            )
         self.rank_sliced_metadata = dict(metadata)
+        self.rank_sliced_rotation_layout = rotation_layout
         bits_field = metadata["bits"]
         if isinstance(bits_field, str) and bits_field.strip().lower() == "mixed":
             k_values = tuple(
@@ -869,9 +906,40 @@ class Exl3Config(QuantizationConfig):
         """Drop non-local TP payloads and remove the serialized rank segment."""
         if self.rank_sliced_metadata is None:
             return name
+        shared_match = _SHARED_H_WEIGHT_RE.match(name)
+        if shared_match is not None:
+            if self.rank_sliced_rotation_layout != _SHARED_H_ROTATION_LAYOUT:
+                raise ValueError(
+                    "rank-sliced EXL3 contains shared-H tensors but metadata "
+                    "does not declare rotation_layout='shared_h_v1'"
+                )
+            projection = shared_match.group("projection")
+            field = shared_match.group("field")
+            expected_field = "svh" if projection == "down_proj" else "suh"
+            if field != expected_field:
+                raise ValueError(
+                    "invalid shared-H EXL3 tensor: "
+                    f"projection={projection!r} requires {expected_field}, got {field}"
+                )
+            if int(shared_match.group("rank")) != get_tensor_model_parallel_rank():
+                return None
+            return f"{shared_match.group('experts_prefix')}.0.{projection}.{field}"
         match = _RANK_SLICED_WEIGHT_RE.match(name)
         if match is None:
             return name
+        if self.rank_sliced_rotation_layout == _SHARED_H_ROTATION_LAYOUT:
+            projection_match = _EXPERT_PROJECTION_RE.match(match.group("prefix"))
+            if projection_match is not None:
+                projection = projection_match.group("projection")
+                field = match.group("field")
+                is_h_side = (
+                    projection in {"gate_proj", "up_proj"} and field == "suh"
+                ) or (projection == "down_proj" and field == "svh")
+                if is_h_side:
+                    raise ValueError(
+                        "shared_h_v1 must store H-side rotations under "
+                        "experts.shared_h, not under an expert id"
+                    )
         if int(match.group("rank")) != get_tensor_model_parallel_rank():
             return None
         return f"{match.group('prefix')}.{match.group('field')}"
@@ -1412,6 +1480,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
+        shared_h = (
+            rank_sliced
+            and self.quant_config.rank_sliced_rotation_layout
+            == _SHARED_H_ROTATION_LAYOUT
+        )
+        layer.exl3_shared_h_rotations = shared_h
         if rank_sliced:
             checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
             if checkpoint_tp != layer.exl3_tp_size:
@@ -1464,11 +1538,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+                shared_parameter = shared_h and (
+                    (prefix == "w13" and suffix == "suh")
+                    or (prefix == "w2" and suffix == "svh")
+                )
                 layer.register_parameter(
                     f"{prefix}_{suffix}",
                     Exl3MoEParameter(
                         weight_loader=_exl3_moe_weight_loader,
-                        num_experts=num_experts,
+                        num_experts=1 if shared_parameter else num_experts,
                         shard_ids=shard_ids,
                         preallocate=rank_sliced
                         and suffix
@@ -1486,7 +1564,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         for prefix, shard_ids in required.items():
             for attr in ("suh", "svh", "trellis"):
                 tensors = getattr(layer, f"{prefix}_{attr}").exl3_tensors
-                for expert_id in range(layer.local_num_experts):
+                shared_parameter = getattr(
+                    layer, "exl3_shared_h_rotations", False
+                ) and (
+                    (prefix == "w13" and attr == "suh")
+                    or (prefix == "w2" and attr == "svh")
+                )
+                expert_ids = (
+                    (0,) if shared_parameter else range(layer.local_num_experts)
+                )
+                for expert_id in expert_ids:
                     for shard_id in shard_ids:
                         if (expert_id, shard_id) not in tensors:
                             missing.append(f"{prefix}_{attr}[{expert_id},{shard_id}]")
@@ -1588,8 +1675,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 for shard_id in shard_ids:
                     key = (expert_id, shard_id)
                     trellis = getattr(layer, f"{group}_trellis").exl3_tensors[key]
-                    suh = getattr(layer, f"{group}_suh").exl3_tensors[key]
-                    svh = getattr(layer, f"{group}_svh").exl3_tensors[key]
+                    suh_key = (
+                        (0, shard_id)
+                        if getattr(layer, "exl3_shared_h_rotations", False)
+                        and group == "w13"
+                        else key
+                    )
+                    svh_key = (
+                        (0, shard_id)
+                        if getattr(layer, "exl3_shared_h_rotations", False)
+                        and group == "w2"
+                        else key
+                    )
+                    suh = getattr(layer, f"{group}_suh").exl3_tensors[suh_key]
+                    svh = getattr(layer, f"{group}_svh").exl3_tensors[svh_key]
                     if (
                         trellis.dtype != torch.int16
                         or trellis.ndim != 3
@@ -1635,16 +1734,39 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return backing
 
     @staticmethod
-    def _pointer_table(slab: torch.Tensor) -> torch.Tensor:
+    def _pointer_table(
+        slab: torch.Tensor,
+        *,
+        num_experts: int | None = None,
+    ) -> torch.Tensor:
         if slab.ndim < 2 or not slab[0].is_contiguous():
             raise RuntimeError("EXL3 pointer-table rows must be contiguous")
+        rows = int(slab.shape[0])
+        entries = rows if num_experts is None else int(num_experts)
+        if rows not in {1, entries}:
+            raise RuntimeError(
+                "EXL3 pointer-table rows must be per-expert or broadcast: "
+                f"rows={rows}, experts={entries}"
+            )
         step = slab.stride(0) * slab.element_size()
         base = slab.data_ptr()
         return torch.tensor(
-            [base + expert_id * step for expert_id in range(slab.shape[0])],
+            [
+                base + (0 if rows == 1 else expert_id) * step
+                for expert_id in range(entries)
+            ],
             dtype=torch.int64,
             device=slab.device,
         )
+
+    @staticmethod
+    def _select_rotation_rows(
+        rotations: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if int(rotations.shape[0]) == 1:
+            return rotations
+        return rotations.index_select(0, expert_ids).contiguous()
 
     @staticmethod
     def _trellis_tile_config(hidden_size: int, intermediate_size: int):
@@ -1723,8 +1845,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             expert_id for expert_ids in tiers.values() for expert_id in expert_ids
         )
         tier_index = torch.tensor(tier_order, dtype=torch.long, device=device)
-        combined_gate_suh = gate_suh.index_select(0, tier_index).contiguous()
-        combined_up_suh = up_suh.index_select(0, tier_index).contiguous()
+        combined_gate_suh = self._select_rotation_rows(gate_suh, tier_index)
+        combined_up_suh = self._select_rotation_rows(up_suh, tier_index)
         combined_intermediate_rotations = torch.cat(
             (
                 gate_svh.index_select(0, tier_index),
@@ -1733,7 +1855,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             ),
             dim=1,
         ).contiguous()
-        combined_down_svh = down_svh.index_select(0, tier_index).contiguous()
+        combined_down_svh = self._select_rotation_rows(down_svh, tier_index)
         combined_rotations = SimpleNamespace(
             intermediate=combined_intermediate_rotations,
             gate_suh=combined_gate_suh,
@@ -1784,10 +1906,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
             index = torch.tensor(expert_ids, dtype=torch.long, device=device)
             tier_slice = slice(tier_offset, tier_offset + len(expert_ids))
-            tier_gate_suh = combined_gate_suh[tier_slice]
-            tier_up_suh = combined_up_suh[tier_slice]
+            tier_gate_suh = (
+                combined_gate_suh
+                if int(combined_gate_suh.shape[0]) == 1
+                else combined_gate_suh[tier_slice]
+            )
+            tier_up_suh = (
+                combined_up_suh
+                if int(combined_up_suh.shape[0]) == 1
+                else combined_up_suh[tier_slice]
+            )
             intermediate_rotations = combined_intermediate_rotations[tier_slice]
-            tier_down_svh = combined_down_svh[tier_slice]
+            tier_down_svh = (
+                combined_down_svh
+                if int(combined_down_svh.shape[0]) == 1
+                else combined_down_svh[tier_slice]
+            )
             prepared_tiers.append(
                 mixed_api.prepare_weights(
                     w13=w13,
@@ -1972,13 +2106,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             down_suh,
             down_svh,
         )
-        layer.exl3_pointer_tables = tuple(self._pointer_table(slab) for slab in slabs)
+        layer.exl3_pointer_tables = tuple(
+            self._pointer_table(slab, num_experts=num_experts) for slab in slabs
+        )
         layer.exl3_expert_map = torch.arange(
             num_experts,
             dtype=torch.int64,
             device=w13.device,
         )
         layer.exl3_trellis_tile_config = tile_config
+        if getattr(layer, "exl3_shared_h_rotations", False):
+            saved_bytes = (num_experts - 1) * 3 * hidden_size * 2
+            logger.info_once(
+                "EXL3 shared-H rotation layout active; saving %.2f MiB per "
+                "routed-expert layer and TP rank",
+                saved_bytes / (1024 * 1024),
+            )
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts

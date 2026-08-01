@@ -230,6 +230,8 @@ def test_glm_model_retains_quant_config_for_weight_loading(monkeypatch):
         ({"codebook": "mul1"}, "MCG codebook"),
         ({"moe_layers": [77, 3]}, "moe_layers"),
         ({"tensor_schema": "unsupported"}, "tensor schema"),
+        ({"rotation_layout": "implicit_magic"}, "rotation_layout"),
+        ({"rotation_layout": "shared_h_v1"}, "shared_h_tensor_schema"),
     ],
 )
 def test_rank_sliced_metadata_fails_closed(overrides, message):
@@ -254,6 +256,28 @@ def test_rank_sliced_metadata_admits_only_declared_moe_layers():
     assert (
         config.codebook_for_prefix("model.layers.10.mlp.experts.0.gate_proj") == "mcg"
     )
+
+
+def test_rank_sliced_shared_h_metadata_is_explicit_and_legacy_defaults_unchanged():
+    legacy = Exl3Config()
+    legacy.maybe_update_config(
+        "unused", SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata())
+    )
+    shared = Exl3Config()
+    shared.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+
+    assert legacy.rank_sliced_rotation_layout == "per_expert_v1"
+    assert shared.rank_sliced_rotation_layout == "shared_h_v1"
 
 
 def test_mixed_rank_sliced_metadata_hydrates_per_layer_bitrates(monkeypatch):
@@ -317,6 +341,49 @@ def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
     )
 
 
+def test_rank_sliced_shared_h_names_map_once_and_fail_closed(monkeypatch):
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_rank", lambda: 2)
+    prefix = "model.layers.3.mlp.experts"
+
+    assert (
+        config.normalize_rank_sliced_weight_name(
+            f"{prefix}.shared_h.gate_proj.rank2.suh"
+        )
+        == f"{prefix}.0.gate_proj.suh"
+    )
+    assert (
+        config.normalize_rank_sliced_weight_name(
+            f"{prefix}.shared_h.down_proj.rank1.svh"
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="requires suh"):
+        config.normalize_rank_sliced_weight_name(
+            f"{prefix}.shared_h.gate_proj.rank2.svh"
+        )
+    with pytest.raises(ValueError, match="must store H-side rotations"):
+        config.normalize_rank_sliced_weight_name(f"{prefix}.7.down_proj.rank2.svh")
+
+    legacy = Exl3Config()
+    legacy.maybe_update_config(
+        "unused", SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata())
+    )
+    with pytest.raises(ValueError, match="does not declare"):
+        legacy.normalize_rank_sliced_weight_name(f"{prefix}.shared_h.up_proj.rank2.suh")
+
+
 def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -344,6 +411,70 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     )
     torch.testing.assert_close(param.exl3_tensors[(1, "w1")], w1)
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
+
+
+def test_rank_sliced_broadcast_pointer_table_repeats_one_physical_row():
+    slab = torch.ones((1, 128), dtype=torch.float16)
+
+    table = Exl3MoEMethod._pointer_table(slab, num_experts=4)
+
+    assert table.tolist() == [slab.data_ptr()] * 4
+    with pytest.raises(RuntimeError, match="per-expert or broadcast"):
+        Exl3MoEMethod._pointer_table(
+            torch.ones((2, 128), dtype=torch.float16), num_experts=4
+        )
+
+
+def test_rank_sliced_shared_h_create_weights_allocates_one_physical_row(
+    monkeypatch,
+):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    config = Exl3Config()
+    config.maybe_update_config(
+        "unused",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(
+                rotation_layout="shared_h_v1",
+                shared_h_tensor_schema=(
+                    "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        exl3_module,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+            model_config=SimpleNamespace(runner_type="generate"),
+        ),
+    )
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.3.mlp.experts"
+    moe = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=False, tp_rank=0, tp_size=4),
+        has_bias=False,
+    )
+    method = Exl3MoEMethod(config, moe)
+
+    method.create_weights(
+        layer,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size_per_partition=512,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.exl3_shared_h_rotations
+    assert layer.w13_suh.exl3_num_experts == 1
+    assert layer.w2_svh.exl3_num_experts == 1
+    assert layer.w13_svh.exl3_num_experts == 256
+    assert layer.w2_suh.exl3_num_experts == 256
+    assert layer.w13_trellis.exl3_num_experts == 256
+    assert layer.w2_trellis.exl3_num_experts == 256
 
 
 def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
@@ -414,6 +545,62 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
     assert api.prepare_kwargs["w1_fp4"] is slabs["w13_trellis"]
     assert api.prepare_kwargs["w2_fp4"] is slabs["w2_trellis"]
     assert api.prepare_kwargs["trellis_mcg"] is marker
+
+
+def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
+    experts = 3
+    hidden = intermediate = 128
+    bits = 3
+    slabs = {
+        "w13_trellis": torch.zeros(
+            (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w2_trellis": torch.zeros(
+            (experts, intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+        ),
+        "w13_suh": torch.ones((2, 1, hidden), dtype=torch.float16),
+        "w13_svh": torch.ones((2, experts, intermediate), dtype=torch.float16),
+        "w2_suh": torch.ones((experts, intermediate), dtype=torch.float16),
+        "w2_svh": torch.ones((1, hidden), dtype=torch.float16),
+    }
+
+    class FakeFusedMoe:
+        @staticmethod
+        def plan_weights(**kwargs):
+            return SimpleNamespace(source_format=kwargs["source_format"])
+
+        @staticmethod
+        def prepare_weights(**kwargs):
+            return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(
+        exl3_module, "_load_sparkinfer_fused_moe", lambda: FakeFusedMoe()
+    )
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(bits=float(bits))
+    method._rank_sliced_backing = lambda _layer, name: slabs[name]
+    marker = torch.tensor(0xCBAC1FED - (1 << 32), dtype=torch.int32)
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        exl3_hidden_size=hidden,
+        exl3_intermediate_size_per_partition=intermediate,
+        exl3_params_dtype=torch.float16,
+        exl3_layer_bitrates=(bits,) * experts,
+        exl3_mixed_bitrate=False,
+        exl3_shared_h_rotations=True,
+        activation=MoEActivation.SILU,
+        w13_mcg=SimpleNamespace(exl3_tensors={(0, "w1"): marker}),
+    )
+
+    method._prepare_rank_sliced_weights(layer)
+
+    prepared = layer.exl3_trellis_weights
+    assert tuple(prepared.gate_suh.shape) == (1, hidden)
+    assert tuple(prepared.up_suh.shape) == (1, hidden)
+    assert tuple(prepared.down_svh.shape) == (1, hidden)
+    assert all(tuple(table.shape) == (experts,) for table in layer.exl3_pointer_tables)
 
 
 def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
