@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -253,7 +254,12 @@ class VocabParallelEmbedding(PluggableLayer):
         tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_embeddings = num_embeddings
-        self.padding_size = get_virtual_tp_vocab_padding_size(padding_size)
+        configured_padding_size = get_virtual_tp_vocab_padding_size(padding_size)
+        # The padded global vocabulary must be divisible by both its requested
+        # alignment and TP size. The old code only honored the former, which
+        # made non-power-of-two TP sizes fail in _get_indices() even though
+        # this layer promises to pad the vocabulary for model parallelism.
+        self.padding_size = math.lcm(configured_padding_size, self.tp_size)
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.org_vocab_size_padded = pad_vocab_size(
