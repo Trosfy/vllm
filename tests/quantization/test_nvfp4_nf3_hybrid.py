@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from vllm.config.quantization import resolve_quantization_config
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import get_quantization_config
+from vllm.model_executor.layers.quantization.fp8 import Mxfp8SerializedLinearMethod
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     NvFp4Nf3HybridConfig,
     _b12x_tiles_for_geometry,
@@ -54,11 +56,37 @@ def test_config_registration_and_parsing():
             "quant_algo": "NVFP4",
             "hybrid_bit_map": {"0": [4, 3]},
             "kept_format": "mxfp4_e8m0k32",
+            "demoted_format": "exl3_3",
+            "dense_format": "mxfp8",
+            "ignored_layers": ["kv_b_proj"],
+            "trellis": {
+                "bits": 3,
+                "codebook": "mcg",
+                "mcg_mult": 0xCBAC1FED,
+                "shared_su": True,
+            },
         }
     )
 
     assert config.hybrid_bit_map == {"0": [4, 3]}
     assert config.kept_format == "mxfp4_e8m0k32"
+    assert config.demoted_format == "exl3_3"
+    assert config.dense_format == "mxfp8"
+    assert config.ignored_layers == ["kv_b_proj"]
+    assert config.trellis["shared_su"] is True
+
+
+def test_config_rejects_unknown_demoted_format():
+    with pytest.raises(ValueError, match="demoted_format"):
+        NvFp4Nf3HybridConfig.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "hybrid_bit_map": {"0": [4, 3]},
+                "kept_format": "mxfp4_e8m0k32",
+                "demoted_format": "not-a-format",
+            }
+        )
 
 
 def test_config_rejects_missing_hybrid_bit_map():
@@ -94,6 +122,25 @@ def test_config_does_not_quantize_bf16_lm_head():
     lm_head = ParallelLMHead.__new__(ParallelLMHead)
 
     assert config.get_quant_method(lm_head, "lm_head") is None
+
+
+def test_config_loads_serialized_mxfp8_and_honors_ignored_layers():
+    config = NvFp4Nf3HybridConfig(
+        is_checkpoint_nvfp4_serialized=True,
+        hybrid_bit_map={"1": [4, 3]},
+        dense_format="mxfp8",
+        ignored_layers=["kv_b_proj"],
+    )
+    linear = LinearBase.__new__(LinearBase)
+
+    assert isinstance(
+        config.get_quant_method(linear, "model.layers.1.self_attn.q_proj"),
+        Mxfp8SerializedLinearMethod,
+    )
+    assert isinstance(
+        config.get_quant_method(linear, "model.layers.1.self_attn.kv_b_proj"),
+        UnquantizedLinearMethod,
+    )
 
 
 def test_unpack_nf3_codes():
