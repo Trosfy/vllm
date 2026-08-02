@@ -92,6 +92,27 @@ _K3_HYBRID_INTERMEDIATE = 192
 _K3_HYBRID_EXPERTS = 896
 
 
+def _mxfp4_tail_launch_m(*, live_m: int, capacity_m: int, kept_mx: bool) -> int:
+    """Choose the already-warmed native-MXFP4 launch shape.
+
+    K3 decode has a dedicated M=1 one-grid kernel.  Every other native MXFP4
+    shape is prefill and must use the capacity shape compiled by vLLM's profile
+    forward.  Returning the live tail here would specialize one CuteDSL kernel
+    per prompt length and per layer after the API has started.
+    """
+    live_m = int(live_m)
+    capacity_m = int(capacity_m)
+    if live_m <= 0:
+        raise ValueError(f"live_m must be positive, got {live_m}")
+    if capacity_m < live_m:
+        raise ValueError(
+            f"MXFP4 live batch {live_m} exceeds planned capacity {capacity_m}"
+        )
+    if not kept_mx or live_m == _K3_HYBRID_M:
+        return live_m
+    return capacity_m
+
+
 def _combined_tier_local_descriptors(
     remap: dict[int, tuple[int, int]],
     *,
@@ -2247,20 +2268,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 decode,
             )
         result_m = int(x.shape[0])
-        if decode and state.kept_mx and result_m != 1:
+        packed_m = _mxfp4_tail_launch_m(
+            live_m=result_m,
+            capacity_m=int(runtime.max_m),
+            kept_mx=state.kept_mx,
+        )
+        if packed_m != result_m:
             # The native MXFP4 microkernel is valuable for single-sequence
-            # decode, where M is exactly one.  Chunked-prefill tails can also
-            # land in the nominal decode range (M=2..8); specializing the
-            # microkernel for every tail M and every per-layer expert count
-            # creates thousands of surprise JIT compiles.  Keep those tails on
-            # the numerically-safe packed route while NF3 retains its direct
-            # launch at the original M.
-            packed_m = _B12X_DECODE_M + 1
-            if runtime.max_m < packed_m:
-                raise RuntimeError(
-                    "nvfp4_nf3_hybrid requires max_num_batched_tokens >= "
-                    f"{packed_m} for safe hybrid prefill tails"
-                )
+            # decode, where M is exactly one.  Every other short batch is a
+            # chunked-prefill tail.  Pad only this token-independent MoE call
+            # to the capacity launch compiled by the profile pass, then trim
+            # its output below.  This prevents one post-start CuteDSL compile
+            # for every distinct prompt tail and per-layer expert count.
             pad_m = packed_m - result_m
             x = torch.cat((x, x.new_zeros((pad_m, x.shape[1]))), dim=0)
             topk_weights = torch.cat(

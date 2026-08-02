@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,12 +11,14 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.fp8 import Mxfp8SerializedLinearMethod
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
+    NvFp4Nf3HybridMoEMethod,
     NvFp4Nf3HybridConfig,
     _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
     _decode_kquant_nf3_scale,
     _exl3_tp_local_hadamard_tail,
     _is_k3_exl3_onegrid_geometry,
+    _mxfp4_tail_launch_m,
     _read_hybrid_keys,
     _unpack_nf3_codes,
 )
@@ -192,6 +196,60 @@ def test_kimi_tp16_exl3_onegrid_is_explicitly_disableable(monkeypatch):
         topk=16,
         kept_mx=True,
     )
+
+
+@pytest.mark.parametrize("live_m", [2, 8, 9, 28, 255, 256])
+def test_kimi_mxfp4_prefill_tail_reuses_profile_capacity(live_m):
+    assert _mxfp4_tail_launch_m(
+        live_m=live_m, capacity_m=256, kept_mx=True
+    ) == 256
+
+
+def test_kimi_mxfp4_decode_and_non_mxfp4_keep_live_shape():
+    assert _mxfp4_tail_launch_m(live_m=1, capacity_m=256, kept_mx=True) == 1
+    assert _mxfp4_tail_launch_m(live_m=28, capacity_m=256, kept_mx=False) == 28
+    with pytest.raises(ValueError, match="exceeds planned capacity"):
+        _mxfp4_tail_launch_m(live_m=257, capacity_m=256, kept_mx=True)
+
+
+def test_kimi_mxfp4_prefill_tail_pads_only_moe_call_to_capacity():
+    captured = {}
+
+    class FakeKernel:
+        def apply(self, x, *args, **kwargs):
+            captured["x"] = x
+            captured["weights"] = args[2]
+            captured["ids"] = args[3]
+            return x.float()
+
+    method = NvFp4Nf3HybridMoEMethod.__new__(NvFp4Nf3HybridMoEMethod)
+    method.quant_config = SimpleNamespace(
+        shared_runtime=SimpleNamespace(max_m=256)
+    )
+    state = SimpleNamespace(
+        prep_kept=None,
+        kept_mx=True,
+        kept_kernel=FakeKernel(),
+        kept_module=SimpleNamespace(
+            w13_weight=object(), w2_weight=object(), activation="situ"
+        ),
+        kept_remap=torch.arange(896, dtype=torch.int32),
+        num_kept=896,
+    )
+    layer = SimpleNamespace(hybrid_state=state)
+    x = torch.randn(28, 3584, dtype=torch.bfloat16)
+    weights = torch.full((28, 16), 1.0 / 16, dtype=torch.float32)
+    ids = torch.arange(16, dtype=torch.int32).expand(28, -1).contiguous()
+
+    output = method._run_kept(layer, x, weights, ids, decode=False)
+
+    assert captured["x"].shape == (256, 3584)
+    assert captured["weights"].shape == (256, 16)
+    assert captured["ids"].shape == (256, 16)
+    assert torch.count_nonzero(captured["x"][28:]) == 0
+    assert torch.count_nonzero(captured["weights"][28:]) == 0
+    assert torch.count_nonzero(captured["ids"][28:]) == 0
+    torch.testing.assert_close(output, x.float())
 
 
 def test_tp16_exl3_accepts_explicit_rank_local_h64_artifact():
