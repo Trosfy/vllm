@@ -331,7 +331,10 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
     partial_output = torch.zeros(1, 16, 64, dtype=torch.bfloat16)
-    partial_lse = torch.zeros(1, 16, dtype=torch.float32)
+    # Dense MLA kernels may return activation-dtype LSE.  Public dispatch must
+    # promote it before checking the SparkInfer contract instead of falling
+    # through to NCCL during CUDA graph replay.
+    partial_lse = torch.zeros(1, 16, dtype=torch.bfloat16)
     expected = torch.ones(1, 8, 64, dtype=torch.bfloat16)
     captured: dict[str, Any] = {}
 
@@ -367,9 +370,11 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert actual is expected
+    dispatched_lse = captured.pop("lse")
+    assert dispatched_lse.dtype == torch.float32
+    torch.testing.assert_close(dispatched_lse, partial_lse.float())
     assert captured == {
         "output": partial_output,
-        "lse": partial_lse,
         "group": group,
         "return_lse": False,
         "is_lse_base_on_e": True,
