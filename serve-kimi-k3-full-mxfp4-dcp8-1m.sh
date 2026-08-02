@@ -83,7 +83,7 @@ fi
 export MODEL="${MODEL:-/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-DCP8-1M}"
 export TP_SIZE DCP_SIZE MAX_MODEL_LEN MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
-export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.988}"
+export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.985}"
 
 # An empty NCCL graph filename makes NCCL try to open an empty path.
 unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE
