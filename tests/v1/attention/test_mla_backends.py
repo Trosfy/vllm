@@ -66,6 +66,13 @@ DEVICE_TYPE = current_platform.device_type
 
 
 @pytest.mark.cpu_test
+def test_b12x_dcp_a2a_supports_dense_triton_mla():
+    assert mla_attention_module._supports_b12x_dcp_a2a("TRITON_MLA")
+    assert mla_attention_module._supports_b12x_dcp_a2a("B12X_MLA_SPARSE")
+    assert not mla_attention_module._supports_b12x_dcp_a2a("FLASH_ATTN_MLA")
+
+
+@pytest.mark.cpu_test
 def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
     layer = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(layer)

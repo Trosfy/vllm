@@ -298,6 +298,14 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+
+def _supports_b12x_dcp_a2a(attn_backend_name: str) -> bool:
+    """Return whether an MLA backend satisfies SparkInfer's DCP contract."""
+    # B12X sparse MLA was the first consumer. Dense Triton MLA exposes the
+    # same [tokens, gathered_heads, latent_dim] output plus per-head LSE and is
+    # used by Kimi K3, whose TP16/DCP8 geometry is (48, 512, query=576).
+    return attn_backend_name in ("B12X_MLA_SPARSE", "TRITON_MLA")
+
 _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
 
@@ -788,7 +796,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.dcp_b12x = (
             self.dcp_a2a
             and envs.VLLM_USE_B12X_DCP_A2A
-            and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
+            and _supports_b12x_dcp_a2a(self.attn_backend.get_name())
             # The B12X PCIe DCP channel only exists for world sizes 2/4/8;
             # other DCP sizes (e.g. TP6 with DCP3/DCP6) use NCCL collectives.
             and _vllm_config is not None
