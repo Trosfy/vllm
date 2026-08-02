@@ -68,11 +68,18 @@ export VLLM_DCP_QUERY_SPLIT="${VLLM_DCP_QUERY_SPLIT:-0}"
 export VLLM_DCP_GLOBAL_TOPK="${VLLM_DCP_GLOBAL_TOPK:-0}"
 export VLLM_DCP_PROJECT_BEFORE_MERGE="${VLLM_DCP_PROJECT_BEFORE_MERGE:-0}"
 export VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE="${VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE:-0}"
+export VLLM_MEMORY_PROFILE_INCLUDE_ATTN="${VLLM_MEMORY_PROFILE_INCLUDE_ATTN:-0}"
+
+# The checkpoint stores the 24 dense MLA q_a/kv_a projections in BF16. Shard
+# their output rows over TP16 and gather the small 2112-element latent result;
+# this saves about 0.63 GiB/rank without changing checkpoint precision.
+export VLLM_KIMI_SHARD_QKV_A="${VLLM_KIMI_SHARD_QKV_A:-1}"
 
 # The source branch carries the TP16 SparkInfer one-shot all-reduce.  Keep the
 # lossless path enabled for TP projections/MoE while DCP shards attention.
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
-export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-cpp}"
+export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
+export VLLM_PCIE_ONESHOT_SINGLE_CHANNEL="${VLLM_PCIE_ONESHOT_SINGLE_CHANNEL:-1}"
 
 # K3 needs piecewise graphs with KDA and MLA eager breaks.  Capture only the
 # decode batch used by this max_num_seqs=1 profile and fuse TP all-reduce+RMS.

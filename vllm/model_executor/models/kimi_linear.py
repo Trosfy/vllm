@@ -6,6 +6,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -63,6 +64,72 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _restore_merged_output_order(
+    rank_major_output: torch.Tensor,
+    output_sizes: list[int],
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert ``[rank0(a,b), rank1(a,b), ...]`` to ``[all_a, all_b]``.
+
+    A merged column-parallel layer stores a local shard of every logical
+    projection. A single all-gather is cheaper than gathering each projection
+    separately, but its natural rank-major result interleaves those logical
+    shards. MLA expects the original checkpoint order before splitting q_a
+    from kv_a, so restore that order explicitly.
+    """
+    if tp_size == 1:
+        return rank_major_output
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            f"Merged output sizes {output_sizes} must be divisible by TP={tp_size}"
+        )
+    local_sizes = [size // tp_size for size in output_sizes]
+    local_total = sum(local_sizes)
+    if rank_major_output.shape[-1] != local_total * tp_size:
+        raise ValueError(
+            "Unexpected gathered merged projection width: "
+            f"got {rank_major_output.shape[-1]}, expected {local_total * tp_size}"
+        )
+    rank_major = rank_major_output.unflatten(-1, (tp_size, local_total))
+    logical_local_shards = rank_major.split(local_sizes, dim=-1)
+    return torch.cat(
+        [logical_shards.flatten(-2) for logical_shards in logical_local_shards],
+        dim=-1,
+    )
+
+
+class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Merged column projection with one gather and logical-shard reorder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size > 1:
+            rank_major_output = tensor_model_parallel_all_gather(output_parallel)
+            output = _restore_merged_output_order(
+                rank_major_output, self.output_sizes, self.tp_size
+            )
+        else:
+            output = output_parallel
+        return output, output_bias
 
 
 class KimiColumnParallelGate(ColumnParallelLinear):
@@ -324,14 +391,26 @@ class KimiMLAAttention(nn.Module):
         assert self.use_nope is True
         assert num_heads % tp_size == 0
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                disable_tp=True,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-            )
+            qkv_a_output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            if envs.VLLM_KIMI_SHARD_QKV_A and tp_size > 1:
+                self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+            else:
+                self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    bias=False,
+                    quant_config=quant_config,
+                    disable_tp=True,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
             self.q_a_layernorm = RMSNorm(
                 self.q_lora_rank,
                 eps=config.rms_norm_eps,
