@@ -306,6 +306,7 @@ def _supports_b12x_dcp_a2a(attn_backend_name: str) -> bool:
     # used by Kimi K3, whose TP16/DCP8 geometry is (48, 512, query=576).
     return attn_backend_name in ("B12X_MLA_SPARSE", "TRITON_MLA")
 
+
 _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
 
@@ -1472,7 +1473,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         f"{type(self.impl).__name__} did not return decode "
                         "softmax LSE required by DCP."
                     )
-                valid_counts = None
+                # A rank can own no local KV tokens even when the global
+                # request is non-empty (notably K3's 720-token hybrid pages).
+                # Triton MLA then returns the neutral LSE=-inf but leaves its
+                # partial output undefined/NaN. Both NCCL and SparkInfer would
+                # otherwise evaluate 0*NaN while applying the LSE weight and
+                # poison the merged decode state.
+                valid_counts = getattr(attn_metadata.decode, "seq_lens", None)
+                if (
+                    not isinstance(valid_counts, torch.Tensor)
+                    or valid_counts.ndim != 1
+                    or valid_counts.numel() < num_mqa_tokens
+                    or valid_counts.dtype != torch.int32
+                    or valid_counts.device != attn_out.device
+                ):
+                    raise RuntimeError(
+                        "DCP MLA merge requires one-dimensional local int32 "
+                        "decode seq_lens with at least "
+                        f"{num_mqa_tokens} rows on {attn_out.device}."
+                    )
+                valid_counts = valid_counts[:num_mqa_tokens]
+                if not valid_counts.is_contiguous():
+                    raise RuntimeError("DCP MLA local valid counts must be contiguous.")
                 if project_before_merge:
                     valid_counts_tensor = getattr(
                         attn_metadata, "nsa_cache_seqlens", None
@@ -1540,6 +1562,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         )
                         self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
                         attn_out = projected
+                sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
                 if dcp_use_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
@@ -1551,8 +1574,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
                     )
                 else:
-                    if project_before_merge:
-                        sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
                     if workspace_gather_used:
                         workspace_output = getattr(
                             self.impl,
