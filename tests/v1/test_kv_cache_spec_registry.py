@@ -171,6 +171,10 @@ def are_uniform_specs(*specs: KVCacheSpec) -> bool:
     )
 
 
+def test_mamba_state_is_replicated_across_context_parallel_ranks():
+    assert make_spec(MambaSpec).dcp_replicated
+
+
 class TestKVCacheSpecRegistry:
     """Test the core registry functionality."""
 

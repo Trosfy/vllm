@@ -50,6 +50,12 @@ class MambaBase(AttentionLayerBase):
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
             block_size=mamba_block_size,
+            # Recurrent state is TP-sharded by heads, but it is not token
+            # sharded: every DCP/PCP rank must advance its local head state for
+            # every token. Treating this group like an attention KV history
+            # makes the slot mapping update only one CP rank per token and
+            # eventually poisons hybrid KDA/MLA decode.
+            dcp_replicated=True,
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
