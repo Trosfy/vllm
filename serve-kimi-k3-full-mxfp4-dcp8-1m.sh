@@ -76,7 +76,9 @@ export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-cpp}"
 
 # K3 needs piecewise graphs with KDA and MLA eager breaks.  Capture only the
 # decode batch used by this max_num_seqs=1 profile and fuse TP all-reduce+RMS.
-export COMPILATION_CONFIG="${COMPILATION_CONFIG:-{\"mode\":0,\"cudagraph_mode\":\"PIECEWISE\",\"cudagraph_capture_sizes\":[1],\"pass_config\":{\"fuse_allreduce_rms\":true}}}"
+if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
+  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1],"pass_config":{"fuse_allreduce_rms":true}}'
+fi
 
 export MODEL="${MODEL:-/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-DCP8-1M}"
