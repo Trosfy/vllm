@@ -15,7 +15,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.986}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-15032385536}"
 COMPILATION_CONFIG="${COMPILATION_CONFIG:-}"
 if [[ -z "${COMPILATION_CONFIG}" ]]; then
-  COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1],"pass_config":{"fuse_allreduce_rms":true}}'
+  COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1]}'
 fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
