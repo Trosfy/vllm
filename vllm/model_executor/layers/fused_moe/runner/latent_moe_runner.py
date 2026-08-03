@@ -4,7 +4,10 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import aux_stream, current_stream
@@ -13,17 +16,72 @@ from .moe_runner import MoERunner, _unpack
 
 logger = init_logger(__name__)
 
+_K3_ROUTED_UP_INPLACE_AR_MIN_BYTES = 1024 * 1024
+
 
 def _project_sharded_up_and_reduce(
     fused_latent: torch.Tensor,
     shared_output: torch.Tensor,
     up_proj: torch.nn.Module,
+    output_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project a TP latent slice and reduce routed+shared partials together."""
-    routed_output = up_proj(fused_latent)
-    if isinstance(routed_output, tuple):
-        routed_output = routed_output[0]
-    return tensor_model_parallel_all_reduce(routed_output.add_(shared_output))
+    """Project a TP latent slice and reduce routed+shared partials together.
+
+    ``output_buffer`` lets K3 reuse the now-dead, full-width MoE input for the
+    routed projection.  At a 2048-token scheduler chunk the ordinary linear
+    path would otherwise allocate another 28 MiB tensor next to the equally
+    sized shared-expert output.  The K3 routed-up projection is an unquantized,
+    bias-free RowParallelLinear, so spelling out its input slice and using the
+    standard BF16 ``mm(..., out=...)`` preserves the original GEMM and add
+    rounding exactly while removing that peak allocation.
+    """
+    if output_buffer is None:
+        routed_output = up_proj(fused_latent)
+        if isinstance(routed_output, tuple):
+            routed_output = routed_output[0]
+    else:
+        if output_buffer.shape != shared_output.shape:
+            raise ValueError(
+                "The routed-up reuse buffer must match the shared output: "
+                f"{output_buffer.shape=} != {shared_output.shape=}"
+            )
+        if output_buffer.dtype != shared_output.dtype:
+            raise ValueError(
+                "The routed-up reuse buffer must match the shared output "
+                f"dtype: {output_buffer.dtype=} != {shared_output.dtype=}"
+            )
+        if getattr(up_proj, "input_is_parallel", True):
+            input_parallel = fused_latent
+        else:
+            shard_size = up_proj.input_size_per_partition
+            shard_offset = up_proj.tp_rank * shard_size
+            input_parallel = fused_latent.narrow(
+                -1, shard_offset, shard_size
+            ).contiguous()
+        if getattr(up_proj, "bias", None) is not None:
+            raise ValueError("The routed-up reuse path requires a bias-free projection")
+        quant_method = getattr(up_proj, "quant_method", None)
+        if (
+            quant_method is not None
+            and quant_method.__class__.__name__ != "UnquantizedLinearMethod"
+        ):
+            raise ValueError(
+                "The routed-up reuse path requires an unquantized projection"
+            )
+        torch.mm(input_parallel, up_proj.weight.t(), out=output_buffer)
+        routed_output = output_buffer
+    routed_output.add_(shared_output)
+    if (
+        output_buffer is not None
+        and routed_output.numel() * routed_output.element_size()
+        >= _K3_ROUTED_UP_INPLACE_AR_MIN_BYTES
+    ):
+        # Large prefill tensors fall through the TP16 custom-AR size limit to
+        # NCCL. Reuse this dead buffer as NCCL's receive buffer instead of
+        # allocating a second full hidden-width output (28 MiB at 2048 K3
+        # tokens). Decode-sized tensors keep the existing custom graph path.
+        return tensor_model_parallel_all_reduce_in_place(routed_output)
+    return tensor_model_parallel_all_reduce(routed_output)
 
 
 class LatentMoERunner(MoERunner):
@@ -203,9 +261,15 @@ class LatentMoERunner(MoERunner):
 
             # RowParallelLinear slices the reconstructed latent input and
             # emits an unreduced hidden-width partial. Shared experts already
-            # emit the matching TP partial, so reduce their sum only once.
+            # emit the matching TP partial, so reduce their sum only once. The
+            # original shared-expert input is dead after _forward_entry and is
+            # exactly full hidden width, making it a safe output buffer here.
+            assert shared_experts_input is not None
             result = _project_sharded_up_and_reduce(
-                fused_latent, shared_output, transform.up_proj
+                fused_latent,
+                shared_output,
+                transform.up_proj,
+                output_buffer=shared_experts_input,
             )
             result = self._maybe_reduce_final_output(
                 result, og_hidden_dim_post_xform, output_is_reduced=True

@@ -348,6 +348,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """Run the fallback NCCL all-reduce with one input/output buffer.
+
+        This deliberately bypasses the functional custom-op dispatch used by
+        :meth:`all_reduce`: PyTorch custom ops cannot declare that they mutate
+        and return the same tensor. Callers must therefore opt in only when
+        the input is dead after the collective. NCCL natively supports an
+        in-place all-reduce by passing the same send and receive pointer.
+        """
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            torch.distributed.all_reduce(input_, group=self.device_group)
+            return input_
+        out = pynccl_comm.all_reduce(input_, out_tensor=input_)
+        if out is None:
+            torch.distributed.all_reduce(input_, group=self.device_group)
+        return input_
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:
