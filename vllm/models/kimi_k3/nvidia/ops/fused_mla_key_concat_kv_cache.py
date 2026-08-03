@@ -21,6 +21,29 @@ sm_90+.
 
 import torch
 
+_KIMI_K3_CACHE_OPS_LOADED = False
+_KIMI_K3_CACHE_OP_SENTINEL = (
+    "fused_kimi_k3_mla_decode_q_concat_kv_cache_fp8_insert"
+)
+
+
+def ensure_kimi_k3_cache_ops() -> None:
+    """Load the small HH compatibility fragment when the main image is old."""
+    global _KIMI_K3_CACHE_OPS_LOADED
+    if _KIMI_K3_CACHE_OPS_LOADED:
+        return
+    if not hasattr(torch.ops._C, _KIMI_K3_CACHE_OP_SENTINEL):
+        try:
+            import vllm._kimi_k3_cache_ops  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "HH Kimi-K3 cache ops are absent from _C_stable_libtorch and "
+                "the companion vllm._kimi_k3_cache_ops extension is missing"
+            ) from exc
+    if not hasattr(torch.ops._C, _KIMI_K3_CACHE_OP_SENTINEL):
+        raise RuntimeError("Kimi-K3 cache op companion failed to register")
+    _KIMI_K3_CACHE_OPS_LOADED = True
+
 
 def fused_mla_key_concat_kv_cache_insert(
     q: torch.Tensor,  # [Tp, H, qk_head_dim], RoPE is applied in place
@@ -45,6 +68,7 @@ def fused_mla_key_concat_kv_cache_insert(
     )
     if tp == 0:
         return k_out
+    ensure_kimi_k3_cache_ops()
     torch.ops._C.fused_kimi_k3_mla_key_concat_kv_cache_insert(
         q,
         k_nope,
@@ -85,6 +109,7 @@ def fused_mla_key_concat_ds_mla_insert(
     )
     if tp == 0:
         return k_out
+    ensure_kimi_k3_cache_ops()
     torch.ops._C.fused_kimi_k3_mla_key_concat_ds_mla_insert(
         q,
         k_nope,
@@ -134,6 +159,7 @@ def fused_mla_qkv_quant_kv_cache_fp8_insert(
     v_fp8 = torch.empty((tp, num_heads, v_head_dim), dtype=fp8, device=q.device)
     if tp == 0:
         return q_fp8, k_fp8, v_fp8
+    ensure_kimi_k3_cache_ops()
     torch.ops._C.fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert(
         q,
         k_nope,
@@ -190,6 +216,7 @@ def fused_mla_decode_q_concat_kv_cache_insert(
     mqa_q = torch.empty((b, num_heads, entry), dtype=out_dtype, device=ql_nope.device)
     if b == 0:
         return mqa_q
+    ensure_kimi_k3_cache_ops()
 
     if ds_mla:
         cache = (

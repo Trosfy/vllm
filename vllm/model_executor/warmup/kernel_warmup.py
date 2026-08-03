@@ -210,6 +210,9 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     from vllm.models.deepseek_v4.nvidia.b12x import (
         DeepseekV4B12xMLAAttention,
     )
+    from vllm.models.kimi_k3.nvidia.mla import (
+        MultiHeadLatentAttention as KimiK3MLAAttention,
+    )
     from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
 
     model = worker.get_model()
@@ -234,6 +237,14 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
             device = next(module.parameters()).device
             total_heads = int(module.num_heads) * dcp_world_size
             query_head_dim = int(module.kv_lora_rank + module.qk_rope_head_dim)
+            output_head_dim = int(module.kv_lora_rank)
+        elif (
+            isinstance(module, KimiK3MLAAttention)
+            and module.attn_backend.get_name() == "B12X_MLA"
+        ):
+            device = next(module.parameters()).device
+            total_heads = int(module.num_local_heads) * dcp_world_size
+            query_head_dim = int(module.head_size)
             output_head_dim = int(module.kv_lora_rank)
         else:
             continue
@@ -412,6 +423,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
         worker.get_model(),
         max_tokens=max(moe_token_counts),
         token_counts=moe_token_counts,
+        direct_token_counts=(1, *cudagraph_capture_sizes),
     )
 
     minimax_m3_msa_warmup(worker)

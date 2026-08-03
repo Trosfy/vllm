@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from contextlib import suppress
 
 import torch
 from einops import rearrange
@@ -50,6 +51,20 @@ from vllm.v1.attention.backend import AttentionBackend
 logger = init_logger(__name__)
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
+_KIMI_K3_KDA_OPS_LOAD_ATTEMPTED = False
+
+
+def ensure_fused_kda_decode_op() -> bool:
+    """Load HH's small decode companion when the main image predates it."""
+    global _KIMI_K3_KDA_OPS_LOAD_ATTEMPTED
+    if hasattr(torch.ops._C, "fused_kda_decode"):
+        return True
+    if not _KIMI_K3_KDA_OPS_LOAD_ATTEMPTED:
+        _KIMI_K3_KDA_OPS_LOAD_ATTEMPTED = True
+        # Keep the upstream fallback usable on unsupported platforms.
+        with suppress(ImportError):
+            import vllm._kimi_k3_kda_ops  # noqa: F401
+    return hasattr(torch.ops._C, "fused_kda_decode")
 
 
 def a_log_weight_loader(
@@ -140,6 +155,7 @@ def is_fused_kda_decode_supported(
     input_dtype: torch.dtype,
     conv_state_dtype: torch.dtype,
 ) -> bool:
+    fused_op_available = ensure_fused_kda_decode_op()
     if (
         num_heads not in (12, 24, 48, 96)
         or head_dim != 128
@@ -148,7 +164,7 @@ def is_fused_kda_decode_supported(
         or input_dtype != torch.bfloat16
         or conv_state_dtype != torch.bfloat16
         or is_conv_state_dim_first()
-        or not hasattr(torch.ops._C, "fused_kda_decode")
+        or not fused_op_available
     ):
         return False
     # SM90 is architecture-specific; SM10x and SM12x use family binaries.

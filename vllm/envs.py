@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
+    VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -336,6 +337,11 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_MEMORY_PROFILE_INCLUDE_ATTN: bool = False
+    VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ: bool = False
+    VLLM_KIMI_SHARD_ROUTED_UP_PROJ: bool = False
+    VLLM_KIMI_SHARD_ROUTER: bool = False
+    VLLM_KIMI_LOG_CONSTRUCTION_MEMORY: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -1239,6 +1245,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # capture, so this remains opt-in for debugging kernels that still need it.
     "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
         int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
+    ),
+    # Resolve exact B12X graph bindings without launching a full eager model
+    # forward. Required by K3's breakable graph path, where that eager forward
+    # uses capture-prepared workspaces and can corrupt CUDA state.
+    "VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM", "0"))
     ),
     # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
     # native/modelopt-layout W4A16 prep path.
@@ -2259,6 +2271,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MEMORY_PROFILE_INCLUDE_ATTN": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILE_INCLUDE_ATTN", "0"))
     ),
+    # TP-shard Kimi's merged MLA q_a/kv_a projection and reconstruct its two
+    # logical outputs after one small all-gather per dense MLA layer.
+    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    # TP-shard Kimi-K3's BF16 latent-MoE down projection and gather its small
+    # latent output. This preserves the replicated-up-projection fast tail.
+    "VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ": lambda: bool(
+        int(os.getenv("VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ", "0"))
+    ),
+    # TP-shard Kimi-K3's BF16 latent-MoE up projection. The latent runner
+    # reduces the latent state, projects a local input shard, adds the shared
+    # expert partial, then reduces the combined hidden state once.
+    "VLLM_KIMI_SHARD_ROUTED_UP_PROJ": lambda: bool(
+        int(os.getenv("VLLM_KIMI_SHARD_ROUTED_UP_PROJ", "0"))
+    ),
+    "VLLM_KIMI_SHARD_ROUTER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_SHARD_ROUTER", "0"))
+    ),
+    # Log per-layer CUDA allocation while constructing Kimi-K3. This is a
+    # model-free diagnostic: it runs before any checkpoint weight is read.
+    "VLLM_KIMI_LOG_CONSTRUCTION_MEMORY": lambda: bool(
+        int(os.getenv("VLLM_KIMI_LOG_CONSTRUCTION_MEMORY", "0"))
+    ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
@@ -2305,7 +2339,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-
 }
 
 

@@ -34,6 +34,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.b12x_capture import (
+    b12x_compile_only_warmup,
     b12x_cuda_graph_wrapper_prewarm_enabled,
     guard_b12x_kernel_resolution,
 )
@@ -383,7 +384,19 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        if b12x_cuda_graph_wrapper_prewarm_enabled(
+        if envs.VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM:
+            # Some B12X kernels retain exact binding specializations for
+            # capture, but a full K3 eager forward here launches the routed
+            # MoE against capture-prepared workspaces and corrupts CUDA state.
+            # Let the adapters compile their exact bindings while suppressing
+            # those compute launches; ordinary kernel warmup has already run
+            # every graph-visible MoE specialization.
+            with b12x_compile_only_warmup():
+                prewarm_output = self.runnable(*args, **kwargs)
+            get_offloader().join_after_forward()
+            del prewarm_output
+            get_offloader().sync_prev_onload()
+        elif b12x_cuda_graph_wrapper_prewarm_enabled(
             is_piecewise=(
                 get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
             )

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.compilation.b12x_capture import b12x_compile_only_warmup
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla import b12x_mla
 from vllm.v1.attention.backends.mla.b12x_mla import (
@@ -33,6 +34,7 @@ class _FakeDenseMLA:
     def __init__(self) -> None:
         self.bindings: list[SimpleNamespace] = []
         self.compile_count = 0
+        self.run_count = 0
 
     def bind(self, plan, **kwargs):
         binding = SimpleNamespace(plan=plan, **kwargs)
@@ -43,6 +45,7 @@ class _FakeDenseMLA:
         self.compile_count += 1
 
     def run(self, *, binding):
+        self.run_count += 1
         lse = torch.zeros(
             binding.output.shape[:2], dtype=torch.float32, device=binding.output.device
         )
@@ -50,16 +53,80 @@ class _FakeDenseMLA:
 
 
 def _fake_impl(monkeypatch) -> tuple[B12xMLAImpl, _FakeDenseMLA]:
-    monkeypatch.setattr(b12x_mla, "is_workspace_manager_initialized", lambda: False)
     impl = object.__new__(B12xMLAImpl)
     impl.num_heads = 8
     impl.kv_lora_rank = 512
     impl.scale = 192**-0.5
+    impl.dcp_world_size = 1
+    impl._dcp_comm_backend = "a2a"
+    impl._dcp_max_batch_size = 64
     impl._compiled_bindings = set()
-    impl._fallback_scratch = {}
+    impl._scratch_by_plan = {}
     dense_mla = _FakeDenseMLA()
     impl._dense_mla = dense_mla
     return impl, dense_mla
+
+
+def test_b12x_mla_impl_keeps_configured_dcp_world_size(monkeypatch) -> None:
+    def fake_common_init(
+        self,
+        num_heads,
+        head_size,
+        scale,
+        num_kv_heads,
+        alibi_slopes,
+        sliding_window,
+        kv_cache_dtype,
+        logits_soft_cap,
+        attn_type,
+        kv_sharing_target_layer_name,
+        **mla_args,
+    ) -> None:
+        self.num_heads = num_heads
+        self.kv_lora_rank = mla_args["kv_lora_rank"]
+        self.qk_nope_head_dim = mla_args["qk_nope_head_dim"]
+        self.qk_rope_head_dim = mla_args["qk_rope_head_dim"]
+        self.qk_head_dim = mla_args["qk_head_dim"]
+        self.v_head_dim = mla_args["v_head_dim"]
+        self.scale = scale
+        self.dcp_world_size = -1
+
+    monkeypatch.setattr(b12x_mla.MLACommonImpl, "__init__", fake_common_init)
+    monkeypatch.setattr(b12x_mla, "_load_dense_mla", _FakeDenseMLA)
+    monkeypatch.setattr(
+        b12x_mla,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=8,
+                prefill_context_parallel_size=1,
+                dcp_comm_backend="a2a",
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=256),
+        ),
+    )
+
+    impl = B12xMLAImpl(
+        num_heads=6,
+        head_size=576,
+        scale=192**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        qk_head_dim=192,
+        v_head_dim=128,
+        kv_b_proj=None,
+    )
+
+    assert impl.dcp_world_size == 8
 
 
 def test_b12x_mla_adapter_binds_common_decode_metadata(monkeypatch) -> None:
@@ -122,3 +189,94 @@ def test_b12x_mla_adapter_passes_fp8_scales(monkeypatch) -> None:
     binding = dense_mla.bindings[0]
     assert binding.q_scale is layer._q_scale
     assert binding.kv_scale is layer._k_scale
+
+
+def test_b12x_mla_compile_only_warmup_resolves_without_launch(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch)
+    q = torch.randn(1, 8, 576, dtype=torch.bfloat16)
+    cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(0.25),
+        _k_scale=torch.tensor(0.5),
+    )
+
+    with b12x_compile_only_warmup():
+        output, lse = impl.forward_mqa(q, cache, metadata, layer)
+
+    assert output.shape == (1, 8, 512)
+    assert torch.count_nonzero(output) == 0
+    assert lse is None
+    assert dense_mla.compile_count == 1
+    assert dense_mla.run_count == 0
+
+
+def test_b12x_mla_adapter_gathers_and_reduces_dcp_heads(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch)
+    impl.num_heads = 6
+    impl.dcp_world_size = 8
+    group = SimpleNamespace(world_size=8)
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_dcp_group", lambda: group)
+
+    gather_calls = []
+
+    def fake_gather(q, actual_group, **kwargs):
+        gather_calls.append((q.shape, actual_group, kwargs))
+        return torch.cat([q] * 8, dim=1)
+
+    reduce_calls = []
+
+    def fake_reduce(output, lse, actual_group, **kwargs):
+        reduce_calls.append((output.shape, lse.shape, actual_group, kwargs))
+        return output[:, :6]
+
+    monkeypatch.setattr(b12x_mla, "dcp_b12x_all_gather_heads", fake_gather)
+    monkeypatch.setattr(b12x_mla, "dcp_a2a_lse_reduce", fake_reduce)
+
+    q = torch.randn(1, 6, 576, dtype=torch.bfloat16)
+    cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(0.25),
+        _k_scale=torch.tensor(0.5),
+    )
+
+    output, lse = impl.forward_mqa(q, cache, metadata, layer)
+
+    assert output.shape == (1, 6, 512)
+    assert lse is None
+    assert dense_mla.bindings[0].q.shape == (1, 48, 576)
+    assert gather_calls[0][0] == (1, 6, 576)
+    assert gather_calls[0][2]["output_head_dim"] == 512
+    assert reduce_calls[0][0] == (1, 48, 512)
+    assert reduce_calls[0][1] == (1, 48)
+    assert reduce_calls[0][3]["use_b12x"] is True
+
+
+def test_max_dcp_local_cache_tokens_respects_interleave() -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1_048_576),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            cp_kv_cache_interleave_size=1,
+        ),
+    )
+    assert b12x_mla._max_dcp_local_cache_tokens(config) == 131_072
+
+    config.model_config.max_model_len = 1_048_577
+    config.parallel_config.cp_kv_cache_interleave_size = 4
+    assert b12x_mla._max_dcp_local_cache_tokens(config) == 131_076

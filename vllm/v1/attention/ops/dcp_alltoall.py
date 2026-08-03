@@ -41,6 +41,8 @@ logger = init_logger(__name__)
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
+_B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
+_B12X_DCP_CAPTURE_SEQUENCES: dict[int, int] = {}
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -53,9 +55,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = (
-        stride_batch == heads * head_dim and stride_head == head_dim
-    )
+    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
     capacity_strided_head_major = (
         stride_batch == head_dim and stride_head >= batch * head_dim
     )
@@ -131,7 +131,11 @@ def _get_b12x_dcp_a2a_pool(
             query_head_dim=query_head_dim,
             single_channel=False,
         )
-        pool.for_stream()
+        # SparkInfer identifies independently replayable channels by a stable
+        # semantic name. Stream handles are process-local and can be recycled,
+        # so they are not a valid distributed identity.
+        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+        pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
     except Exception as exc:
         init_error = exc
 
@@ -182,6 +186,9 @@ def capture_b12x_dcp_a2a(
         stream: CUDA stream owned by the enclosing graph capture.
     """
     group_id = id(cp_group.device_group)
+    sequence = _B12X_DCP_CAPTURE_SEQUENCES.get(group_id, 0)
+    _B12X_DCP_CAPTURE_SEQUENCES[group_id] = sequence + 1
+    channel_id = f"vllm:graph:{sequence}"
     matching_pools = sorted(
         (
             (key, pool)
@@ -192,7 +199,7 @@ def capture_b12x_dcp_a2a(
     )
     with ExitStack() as stack:
         for _, pool in matching_pools:
-            stack.enter_context(pool.capture(stream=stream))
+            stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
         yield
 
 
@@ -313,6 +320,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
     )
 
 
@@ -327,7 +335,7 @@ def _try_b12x_dcp_all_gather_heads(
     world_size = cp_group.world_size
     if (
         not local_input.is_cuda
-        or local_input.dtype not in (torch.float16, torch.bfloat16)
+        or local_input.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or world_size not in (2, 4, 8)
         or local_input.ndim != 3
         or not local_input.is_contiguous()
@@ -363,7 +371,10 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
-    return pool.all_gather_heads(local_input)
+    return pool.all_gather_heads(
+        local_input,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+    )
 
 
 def dcp_b12x_all_gather_heads(

@@ -51,7 +51,9 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"
 # Decode-only size-1 graphs: capture memory competes with the last GiB of
 # weights; batch sizes above the capture list run eagerly.
-COMPILATION_CONFIG="${COMPILATION_CONFIG:-{\"mode\": 0, \"cudagraph_mode\": \"PIECEWISE\", \"cudagraph_capture_sizes\": [1]}}"
+if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
+  COMPILATION_CONFIG='{"mode": 0, "cudagraph_mode": "PIECEWISE", "cudagraph_capture_sizes": [1]}'
+fi
 
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \

@@ -13,6 +13,7 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.compilation.b12x_capture import is_b12x_compile_only_warmup
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -1029,6 +1030,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def _supports_activation(activation: MoEActivation) -> bool:
         return activation in (
             MoEActivation.SILU,
+            MoEActivation.SITU,
             MoEActivation.SWIGLUOAI,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         )
@@ -1309,8 +1311,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         layer: torch.nn.Module,
         *,
         token_counts: Iterable[int],
+        direct_token_counts: Iterable[int] = (),
     ) -> int:
-        """Compile one representative of every planned dynamic MoE regime."""
+        """Compile every serving and graph-visible B12X MoE regime.
+
+        ``token_counts`` probes the larger dynamic regimes.  Small W4A16
+        decode launches need their exact M specialization, so graph-visible
+        token counts are supplied separately instead of being promoted to a
+        dynamic warmup size.
+        """
         meta = self._warmup_metadata(layer)
         if meta is None:
             return 0
@@ -1337,6 +1346,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         # execution plan so large prefill regimes are compiled without
         # allocating max-batch inputs.
         launch_tokens: dict[tuple[Any, ...], int] = {}
+        for tokens in sorted(set(int(count) for count in direct_token_counts)):
+            if tokens <= 0:
+                continue
+            launch_plan = _plan_b12x_moe_execution(
+                tokens=tokens,
+                topk=meta.topk,
+                device=meta.device,
+                quant_mode=meta.quant_mode,
+                experts=prepared,
+                apply_router_weight_on_input=meta.apply_router_weight_on_input,
+                swiglu_limit=meta.swiglu_limit,
+                swiglu_alpha=meta.swiglu_alpha,
+                swiglu_beta=meta.swiglu_beta,
+            )
+            launch_tokens.setdefault(
+                _b12x_moe_warmup_plan_signature(launch_plan),
+                tokens,
+            )
         for requested_tokens in sorted(set(int(count) for count in token_counts)):
             tokens = _dynamic_moe_warmup_tokens(
                 topk=meta.topk,
@@ -1557,6 +1584,30 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit = None
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
+        if is_b12x_compile_only_warmup():
+            # Exact graph-visible MoE kernels are compiled by
+            # warmup_dynamic_launches. Do not launch them again while walking
+            # the model solely to resolve attention bindings.
+            output.zero_()
+            return
+        if os.environ.get("VLLM_KIMI_DEBUG_FINITE") == "1":
+            torch.cuda.synchronize()
+            ids_min = int(topk_ids.min().item())
+            ids_max = int(topk_ids.max().item())
+            inputs_ok = bool(torch.isfinite(hidden_states).all().item())
+            weights_ok = bool(torch.isfinite(topk_weights).all().item())
+            if (
+                not inputs_ok
+                or not weights_ok
+                or ids_min < 0
+                or ids_max >= num_experts
+            ):
+                raise RuntimeError(
+                    "B12X MoE received invalid routed inputs: "
+                    f"hidden_finite={inputs_ok}, weights_finite={weights_ok}, "
+                    f"expert_id_range=[{ids_min}, {ids_max}], "
+                    f"num_experts={num_experts}"
+                )
         plan = _plan_b12x_moe_fp4_scratch(
             tokens=int(hidden_states.shape[0]),
             topk=int(topk_ids.shape[1]),
@@ -1610,8 +1661,9 @@ def warmup_b12x_moe_dynamic(
     *,
     max_tokens: int,
     token_counts: Iterable[int] = (),
+    direct_token_counts: Iterable[int] = (),
 ) -> int:
-    """Warm unique b12x dynamic MoE planner regimes in a loaded model."""
+    """Warm unique B12X MoE planner regimes in a loaded model."""
     candidates = _b12x_moe_warmup_token_counts(
         max_tokens=max_tokens,
         token_counts=token_counts,
@@ -1635,6 +1687,7 @@ def warmup_b12x_moe_dynamic(
         warmed += fused_experts.warmup_dynamic_launches(
             routed_experts,
             token_counts=candidates,
+            direct_token_counts=direct_token_counts,
         )
 
     if warmed:

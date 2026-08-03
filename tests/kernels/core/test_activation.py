@@ -18,6 +18,7 @@ from vllm.model_executor.layers.activation import (
     ReLUSquaredActivation,
     SiluAndMul,
     SiluAndMulWithClamp,
+    SituAndMul,
     SwigluOAIAndMul,
     SwigluStepAndMul,
     swiglustep_and_mul_triton,
@@ -31,6 +32,41 @@ SEEDS = [0]
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
 ]
+
+
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+@torch.inference_mode()
+def test_situ_and_mul_cuda_companion(
+    default_vllm_config,
+    linear_beta: float | None,
+) -> None:
+    """The fused SiTU op is available from the main or companion extension."""
+    device = CUDA_DEVICES[0]
+    x = torch.randn(7, 1024, dtype=torch.bfloat16, device=device)
+    layer = SituAndMul(beta=4.0, linear_beta=linear_beta, compile_native=False)
+
+    assert layer.op is not None
+    actual = layer.forward_cuda(x)
+    expected = layer.forward_native(x)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+@torch.inference_mode()
+def test_situ_and_mul_cuda_extension_fallback(
+    default_vllm_config,
+    linear_beta: float | None,
+) -> None:
+    """The source overlay remains usable with a pre-SiTU vLLM binary."""
+    device = CUDA_DEVICES[0]
+    x = torch.randn(7, 1024, dtype=torch.bfloat16, device=device)
+    layer = SituAndMul(beta=4.0, linear_beta=linear_beta, compile_native=False)
+    layer.op = None
+
+    actual = layer.forward_cuda(x)
+    expected = layer.forward_native(x)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
