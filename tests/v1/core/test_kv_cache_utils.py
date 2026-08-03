@@ -2788,7 +2788,9 @@ def test_k3_dspark_window_group_preserves_target_and_kda_layers():
             mamba_cache_mode="none", num_gpu_blocks_override=None
         ),
         kv_transfer_config=None,
-        max_in_flight_tokens=2048,
+        # V1 async scheduling can overlap two 2,048-token batches. Sliding
+        # windows must retain both until the processed-token frontier settles.
+        max_in_flight_tokens=4096,
     )
 
     groups = get_kv_cache_groups(config, specs)
@@ -2848,13 +2850,13 @@ def test_k3_dspark_window_group_preserves_target_and_kda_layers():
     assert (
         kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
         == required_bytes
-        == 2_335_703_040
+        == 2_342_338_560
     )
 
     cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
         config, groups, available_memory=required_bytes
     )
-    assert cache_config.num_blocks == expected_blocks == 1056
+    assert cache_config.num_blocks == expected_blocks == 1059
     capacity, concurrency = get_kv_cache_capacity(config, cache_config)
     assert capacity == 1_048_576
     assert concurrency == pytest.approx(1.0)
