@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Full stock Kimi K3 MXFP4 plus the Inferact MLA-native DSpark-7 draft on
+# 16x RTX PRO 6000 Blackwell. This profile deliberately gives up the physical
+# 1M DCP8 cache: K3 DSpark currently requires DCP1 and adds five draft layers.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+if [[ ! -x "${DEFAULT_PYTHON_BIN}" && -x /opt/venv/bin/python ]]; then
+  DEFAULT_PYTHON_BIN=/opt/venv/bin/python
+fi
+PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
+SPARKINFER_DIR="${SPARKINFER_DIR:-/mnt/luke/sparkinfer-k3-hh-dense-mla-dcp8-latest}"
+export PYTHON_BIN
+
+if [[ -e "${SCRIPT_DIR}/vllm/_C_stable_libtorch.abi3.so" ]]; then
+  export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+if [[ ! -f "${SPARKINFER_DIR}/sparkinfer/attention/dense_mla/__init__.py" ]]; then
+  echo "SparkInfer dense_mla source is missing: ${SPARKINFER_DIR}" >&2
+  exit 1
+fi
+export PYTHONPATH="${SCRIPT_DIR}:${SPARKINFER_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+TP_SIZE="${TP_SIZE:-16}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-500000000}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
+DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND:-B12X_MLA}"
+DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-probabilistic}"
+REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD:-block}"
+
+if (( TP_SIZE != 16 )); then
+  echo "This profile is validated only for TP_SIZE=16, got ${TP_SIZE}" >&2
+  exit 2
+fi
+if (( NUM_SPECULATIVE_TOKENS != 7 )); then
+  echo "Inferact/Kimi-K3-DSpark has a fixed seven-token block; got ${NUM_SPECULATIVE_TOKENS}" >&2
+  exit 2
+fi
+if [[ "${DRAFT_ATTENTION_BACKEND}" != "B12X_MLA" ]]; then
+  echo "This SM120 profile is validated only with DRAFT_ATTENTION_BACKEND=B12X_MLA" >&2
+  exit 2
+fi
+case "${DRAFT_SAMPLE_METHOD}" in
+  probabilistic | greedy) ;;
+  *)
+    echo "DRAFT_SAMPLE_METHOD must be probabilistic or greedy" >&2
+    exit 2
+    ;;
+esac
+case "${REJECTION_SAMPLE_METHOD}" in
+  block | standard | synthetic) ;;
+  *)
+    echo "Unsupported REJECTION_SAMPLE_METHOD=${REJECTION_SAMPLE_METHOD}" >&2
+    exit 2
+    ;;
+esac
+if [[ ! "${KV_CACHE_MEMORY_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KV_CACHE_MEMORY_BYTES must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python interpreter not found or not executable: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
+export MODEL="${MODEL:-/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970}"
+export DRAFT_MODEL="${DRAFT_MODEL:-/root/.cache/huggingface/hub/models--Inferact--Kimi-K3-DSpark/snapshots/cf6b8244620e7ea4b0651d214f28e89eac75bed6}"
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-HH-DSpark7}"
+export TP_SIZE MAX_MODEL_LEN MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
+export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.985}"
+
+if [[ ! -f "${MODEL}/model.safetensors.index.json" ]]; then
+  echo "Kimi K3 target checkpoint is incomplete: ${MODEL}" >&2
+  exit 1
+fi
+if [[ ! -f "${DRAFT_MODEL}/model.safetensors" || ! -f "${DRAFT_MODEL}/config.json" ]]; then
+  echo "Kimi K3 DSpark checkpoint is incomplete: ${DRAFT_MODEL}" >&2
+  exit 1
+fi
+
+# These are the same lossless BF16 projection shards used by the validated
+# full-MXFP4 target. KDA f_a is enabled through additional_config below.
+export VLLM_KIMI_SHARD_QKV_A="${VLLM_KIMI_SHARD_QKV_A:-1}"
+export VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ="${VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ:-1}"
+export VLLM_KIMI_SHARD_ROUTED_UP_PROJ="${VLLM_KIMI_SHARD_ROUTED_UP_PROJ:-1}"
+export VLLM_KIMI_SHARD_ROUTER="${VLLM_KIMI_SHARD_ROUTER:-1}"
+
+export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
+# The base Docker image exports backend=cpp. TP16 is unsupported by that
+# legacy C++ implementation, so select the validated B12X hierarchical path
+# through a profile-specific override instead of inheriting the image value.
+export VLLM_PCIE_ALLREDUCE_BACKEND="${KIMI_DSPARK_PCIE_ALLREDUCE_BACKEND:-b12x}"
+export VLLM_PCIE_ONESHOT_SINGLE_CHANNEL="${KIMI_DSPARK_PCIE_ONESHOT_SINGLE_CHANNEL:-1}"
+export VLLM_USE_B12X_DCP_A2A=0
+
+# K3 has no sparse indexer. DSpark is MLA-native but currently DCP-incompatible,
+# so all GLM sparse/DCP policies remain disabled.
+export VLLM_DCP_INDEXER_SHARDS=0
+export VLLM_DCP_QUERY_SPLIT=0
+export VLLM_DCP_GLOBAL_TOPK=0
+export VLLM_DCP_PROJECT_BEFORE_MERGE=0
+
+export KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-flashkda}"
+export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+export CUDA_MODULE_DATA_LOADING="${CUDA_MODULE_DATA_LOADING:-LAZY}"
+export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE:-8192}"
+
+# Manual cache sizing and measured [1,8] graphs are more accurate than the
+# conservative graph reservation for this extremely tight target+draft fit.
+# At the validated 500 MB/rank setting this creates 8,894 physical KV tokens,
+# enough for max_model_len=8,192 with one request.
+export VLLM_MEMORY_PROFILE_INCLUDE_ATTN="${VLLM_MEMORY_PROFILE_INCLUDE_ATTN:-0}"
+export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
+if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
+  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,8],"pass_config":{"fuse_allreduce_rms":true}}'
+fi
+
+# Fail before loading 1.4 TiB of target weights if either the draft contract or
+# the native K3 runtime is missing.
+export KDA_PREFILL_BACKEND
+"${PYTHON_BIN}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+from sparkinfer.attention import dense_mla
+from vllm.model_executor.models.registry import ModelRegistry
+from vllm.model_executor.layers.activation import ensure_kimi_k3_activation_ops
+from vllm.models.kimi_k3.nvidia.kda import ensure_fused_kda_decode_op
+from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
+    ensure_kimi_k3_cache_ops,
+)
+from vllm.transformers_utils.config import get_config
+from vllm.v1.attention.backends.mla.b12x_mla import (
+    B12xMLABackend,
+    B12xMLAMetadataBuilder,
+    _kernel_query_heads,
+)
+from vllm.platforms.interface import DeviceCapability
+
+draft = Path(os.environ["DRAFT_MODEL"])
+raw = json.loads((draft / "config.json").read_text())
+assert raw["architectures"] == ["K3DSparkModel"]
+assert raw["model_type"] == "k3_dspark"
+assert raw["num_hidden_layers"] == 5
+assert raw["target_layer_ids"] == [2, 23, 47, 71, 89]
+assert raw["max_position_embeddings"] >= int(os.environ["MAX_MODEL_LEN"])
+config = get_config(str(draft), trust_remote_code=False)
+assert type(config).__name__ == "K3DSparkConfig"
+assert ModelRegistry._try_load_model_cls("K3DSparkModel").__name__ == "K3DSparkForCausalLM"
+print(f"K3 DSpark preflight: {draft} ({type(config).__name__})", flush=True)
+
+required = ("Caps", "plan", "bind", "compile", "run")
+missing = [name for name in required if not hasattr(dense_mla, name)]
+if missing:
+    raise RuntimeError(f"incomplete sparkinfer.attention.dense_mla: {missing}")
+print(f"SparkInfer dense MLA preflight: {dense_mla.__file__}", flush=True)
+assert B12xMLABackend.supports_compute_capability(DeviceCapability(12, 0))
+assert B12xMLABackend.supports_block_size(944)
+assert B12xMLABackend.supports_non_causal()
+assert B12xMLAMetadataBuilder.supports_non_causal_multi_token_decode
+assert _kernel_query_heads(6, 1) == 8  # full-K3 target at TP16
+assert _kernel_query_heads(4, 1) == 8  # Inferact draft at TP16
+print("SparkInfer target/draft TP16 MLA contract: OK", flush=True)
+ensure_kimi_k3_cache_ops()
+if not ensure_fused_kda_decode_op():
+    raise RuntimeError("HH Kimi-K3 fused KDA decode op is unavailable")
+if os.environ["KDA_PREFILL_BACKEND"] == "flashkda":
+    import vllm._flashkda_C  # noqa: F401
+if not ensure_kimi_k3_activation_ops():
+    raise RuntimeError("HH Kimi-K3 fused SiTU activation ops are unavailable")
+print("K3 target native-op preflight: OK", flush=True)
+PY
+
+if [[ "${KIMI_DSPARK_PREFLIGHT_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
+printf -v SPECULATIVE_CONFIG \
+  '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"%s","rejection_sample_method":"%s"}' \
+  "${DRAFT_MODEL}" "${DRAFT_ATTENTION_BACKEND}" \
+  "${DRAFT_SAMPLE_METHOD}" "${REJECTION_SAMPLE_METHOD}"
+
+exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
+  --language-model-only \
+  --attention-backend B12X_MLA \
+  --decode-context-parallel-size 1 \
+  --kda-prefill-backend "${KDA_PREFILL_BACKEND}" \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" \
+  --no-enable-prefix-caching \
+  --additional-config '{"kda_shard_f_a":true}' \
+  --speculative-config "${SPECULATIVE_CONFIG}" \
+  "$@"

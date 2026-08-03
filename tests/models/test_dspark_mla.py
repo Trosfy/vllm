@@ -135,9 +135,80 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
             draft_model_config=SimpleNamespace(hf_config=config)
-        )
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
     )
 
     K3DSparkModel(vllm_config=vllm_config, start_layer_id=0, prefix="model")
 
     assert len(markov_head_calls) == 1
+
+
+@pytest.mark.cpu_test
+def test_dspark_context_kv_fusion_supports_sharded_qkv_a(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyShardedProjection(nn.Module):
+        def __init__(self, weight: torch.Tensor, tp_size: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(weight)
+            self.tp_size = tp_size
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "KimiShardedMergedColumnParallelLinear",
+        DummyShardedProjection,
+    )
+    model = object.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    model.quant_config = None
+    model._max_num_context_tokens = 8
+    tp_size = 4
+    q_rank = 8
+    kv_width = 4
+    hidden = 3
+    layers = []
+    expected_kv_weights = []
+    for layer_idx in range(2):
+        weight = torch.arange(
+            (q_rank // tp_size + kv_width // tp_size) * hidden,
+            dtype=torch.float32,
+        ).view(-1, hidden)
+        weight = weight + layer_idx * 100
+        expected_kv_weights.append(weight[q_rank // tp_size :])
+        attn = SimpleNamespace(
+            q_lora_rank=q_rank,
+            kv_lora_rank=2,
+            qk_rope_head_dim=2,
+            fused_qkv_a_proj=DummyShardedProjection(weight, tp_size),
+            kv_a_layernorm=SimpleNamespace(
+                weight=torch.ones(2),
+                variance_epsilon=1e-6,
+            ),
+        )
+        layers.append(SimpleNamespace(self_attn=attn))
+    model.layers = layers
+
+    model._build_fused_context_kv_buffers()
+
+    assert model._context_kv_fusion_available
+    assert model._context_kv_sharded
+    assert model._context_kv_tp_size == tp_size
+    assert model._context_kv_stored_width == kv_width // tp_size
+    torch.testing.assert_close(
+        model._fused_context_kv_weight,
+        torch.cat(expected_kv_weights, dim=0),
+    )
+
+
+@pytest.mark.cpu_test
+def test_restore_layer_major_kv_order() -> None:
+    # Gather order is rank-major; each rank contributes [layer0, layer1].
+    rank_major = torch.tensor([[0, 1, 10, 11, 20, 21]])
+    restored = dspark_mla._restore_layer_major_kv_order(
+        rank_major,
+        num_layers=2,
+        local_kv_width=1,
+        tp_size=3,
+    )
+    torch.testing.assert_close(restored, torch.tensor([[0, 10, 20, 1, 11, 21]]))
