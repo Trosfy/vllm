@@ -28,6 +28,7 @@ from vllm.model_executor.kernels.attention import (
 from vllm.model_executor.layers.attention import mla_attention as mla_attention_module
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
+    MLACommonMetadataBuilder,
     QueryLenSupport,
     _DecodeConcatQuantFP8,
 )
@@ -68,6 +69,26 @@ BACKENDS_TO_TEST = [
 ]
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.cpu_test
+def test_mla_chunked_prefill_workspace_limit(monkeypatch):
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        cache_config=SimpleNamespace(block_size=16),
+        model_config=SimpleNamespace(max_model_len=1_048_576),
+    )
+    monkeypatch.setattr(
+        mla_attention_module.envs,
+        "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE",
+        32 * 1024,
+    )
+
+    workspace_size = MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+        config
+    )
+
+    assert workspace_size == 32 * 1024
 
 
 @pytest.mark.cpu_test
