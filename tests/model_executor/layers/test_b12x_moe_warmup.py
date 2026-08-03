@@ -420,6 +420,56 @@ def test_b12x_moe_warmup_runs_one_launch_per_planner_regime(monkeypatch) -> None
     assert run_tokens == [3, 8]
 
 
+def test_b12x_moe_warmup_preserves_exact_graph_decode_shape(monkeypatch) -> None:
+    planned_tokens = []
+    run_tokens = []
+
+    def fake_execution_plan(**kwargs):
+        tokens = kwargs["tokens"]
+        planned_tokens.append(tokens)
+        execution = f"w4a16-m{tokens}" if tokens <= 8 else "dynamic"
+        return _FakePlan(execution).launch_plan
+
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_execution",
+        fake_execution_plan,
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_fp4_scratch",
+        lambda **kwargs: _FakePlan(),
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_run_b12x_moe_fp4",
+        lambda **kwargs: run_tokens.append(kwargs["a"].shape[0]),
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_dynamic_moe_warmup_tokens",
+        lambda *, topk, quant_mode, requested_tokens: 16,
+    )
+
+    experts = _make_fake_b12x_experts()
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(8, 32, 32, dtype=torch.uint8),
+        w2_weight=torch.empty(8, 64, 8, dtype=torch.uint8),
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        apply_router_weight_on_input=False,
+    )
+
+    warmed = experts.warmup_dynamic_launches(
+        layer,
+        token_counts=(1, 4, 16),
+        direct_token_counts=(1,),
+    )
+
+    assert warmed == 2
+    assert planned_tokens == [1, 16, 16, 16]
+    assert run_tokens == [1, 16]
+
+
 def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
 
@@ -666,8 +716,8 @@ def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
     def fake_signature(self, layer):
         return ("same-signature",)
 
-    def fake_warmup(self, layer, *, token_counts):
-        calls.append((self, layer, token_counts))
+    def fake_warmup(self, layer, *, token_counts, direct_token_counts=()):
+        calls.append((self, layer, token_counts, direct_token_counts))
         return 3
 
     monkeypatch.setattr(
@@ -710,6 +760,10 @@ def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
     assert warmed == 3
     assert len(calls) == 1
     assert calls[0][2] == (1, 2, 3, 4, 5)
+
+
+def test_b12x_supports_situ_activation() -> None:
+    assert b12x_moe.B12xExperts._supports_activation(MoEActivation.SITU)
 
 
 def test_b12x_moe_warmup_token_counts_cover_serving_range() -> None:

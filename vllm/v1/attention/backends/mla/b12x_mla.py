@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
 import torch
 
+from vllm.compilation.b12x_capture import is_b12x_compile_only_warmup
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -27,11 +29,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.v1.worker.workspace import (
-    current_workspace_manager,
-    is_workspace_manager_initialized,
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
 )
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
@@ -59,6 +62,16 @@ def _page_table_width(max_cache_tokens: int, page_size: int) -> int:
         alignment = 128 // page_size
         width = ((width + alignment - 1) // alignment) * alignment
     return width
+
+
+def _max_dcp_local_cache_tokens(vllm_config: VllmConfig) -> int:
+    """Return the largest token shard held by one decode-context rank."""
+    parallel_config = vllm_config.parallel_config
+    dcp_size = int(parallel_config.decode_context_parallel_size)
+    interleave = int(parallel_config.cp_kv_cache_interleave_size)
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    partitions = dcp_size * interleave
+    return ((max_model_len + partitions - 1) // partitions) * interleave
 
 
 def _planned_kv_dtype(vllm_config: VllmConfig) -> torch.dtype:
@@ -89,7 +102,7 @@ def _create_dense_mla_plan(
 ) -> Any:
     dense_mla = _load_dense_mla()
     max_total_q = int(vllm_config.scheduler_config.max_num_seqs)
-    max_cache_tokens = int(vllm_config.model_config.max_model_len)
+    max_cache_tokens = _max_dcp_local_cache_tokens(vllm_config)
     if max_total_q > _MAX_B12X_QUERY_ROWS:
         raise ValueError(
             "B12X_MLA supports at most "
@@ -154,18 +167,18 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             vllm_config,
             device,
             page_size=self.page_size,
-            num_q_heads=self.num_heads,
+            num_q_heads=self.num_heads * self.dcp_world_size,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
-        if is_workspace_manager_initialized():
-            current_workspace_manager().get_simultaneous(*self._workspace_specs)
         logger.info_once(
-            "B12X dense K3 MLA plan: heads=%d, page_size=%d, "
+            "B12X dense K3 MLA plan: local_heads=%d, effective_heads=%d, "
+            "page_size=%d, "
             "max_decode_rows=%d, max_cache_tokens=%d, splits=%d",
             self.num_heads,
+            self.num_heads * self.dcp_world_size,
             self.page_size,
             vllm_config.scheduler_config.max_num_seqs,
-            vllm_config.model_config.max_model_len,
+            _max_dcp_local_cache_tokens(vllm_config),
             self._dense_mla_plan.num_splits,
         )
 
@@ -277,29 +290,34 @@ class B12xMLABackend(MLACommonBackend):
             )
 
         parallel_config = vllm_config.parallel_config
-        if parallel_config.decode_context_parallel_size != 1:
-            return "B12X_MLA does not yet support decode context parallelism"
+        if parallel_config.prefill_context_parallel_size != 1:
+            return "B12X_MLA does not support prefill context parallelism"
+        dcp_size = int(parallel_config.decode_context_parallel_size)
         local_heads = model_config.get_num_attention_heads(parallel_config)
-        if local_heads <= 0 or local_heads % 8:
+        effective_heads = local_heads * dcp_size
+        if local_heads <= 0 or effective_heads % 8:
             return (
-                "B12X_MLA requires a positive multiple of 8 query heads per "
-                f"rank, got {local_heads}"
+                "B12X_MLA requires a positive multiple of 8 query heads after "
+                f"DCP gather, got local={local_heads}, DCP={dcp_size}, "
+                f"effective={effective_heads}"
             )
         if vllm_config.scheduler_config.max_num_seqs > _MAX_B12X_QUERY_ROWS:
             return (
                 "B12X_MLA max_num_seqs exceeds its 1024-row decode capacity: "
                 f"{vllm_config.scheduler_config.max_num_seqs}"
             )
-        if model_config.max_model_len > _MAX_B12X_CACHE_TOKENS:
+        local_cache_tokens = _max_dcp_local_cache_tokens(vllm_config)
+        if local_cache_tokens > _MAX_B12X_CACHE_TOKENS:
             return (
-                "B12X_MLA max_model_len exceeds its 1048576-token capacity: "
-                f"{model_config.max_model_len}"
+                "B12X_MLA local DCP cache exceeds its 1048576-token capacity: "
+                f"{local_cache_tokens}"
             )
         return None
 
 
 class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_quant_query_input: bool = True
 
     def __init__(
         self,
@@ -363,36 +381,51 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"B12xMLAImpl received non-K3 MLA dimensions {actual_dims}; "
                 f"required {required_dims}."
             )
-        if num_heads <= 0 or num_heads % 8:
+        vllm_config = get_current_vllm_config()
+        dcp_world_size = int(vllm_config.parallel_config.decode_context_parallel_size)
+        # KimiK3Attention calls this implementation directly instead of going
+        # through MLAAttention.forward(), where the common MLA path normally
+        # replaces the sentinel value (-1) with the initialized DCP group size.
+        # Keep the configured value here so TP16/DCP8 gathers 6 local heads to
+        # the 48-head shape used by the SparkInfer plan.
+        self.dcp_world_size = dcp_world_size
+        effective_heads = num_heads * dcp_world_size
+        if num_heads <= 0 or effective_heads % 8:
             raise ValueError(
-                "B12xMLAImpl requires a positive multiple of 8 query heads, "
-                f"got {num_heads}."
+                "B12xMLAImpl requires a positive multiple of 8 query heads "
+                "after DCP gather, "
+                f"got local={num_heads}, DCP={dcp_world_size}, "
+                f"effective={effective_heads}."
             )
-        if get_current_vllm_config().parallel_config.decode_context_parallel_size != 1:
+        if vllm_config.parallel_config.prefill_context_parallel_size != 1:
             raise NotImplementedError(
-                "B12xMLAImpl does not yet support decode context parallelism."
+                "B12xMLAImpl does not support prefill context parallelism."
             )
 
         self._dense_mla = _load_dense_mla()
+        self._dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
+        self._dcp_max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
         self._compiled_bindings: set[tuple[object, ...]] = set()
-        self._fallback_scratch: dict[int, torch.Tensor] = {}
+        self._scratch_by_plan: dict[int, torch.Tensor] = {}
 
     def _borrow_scratch(self, plan: Any, device: torch.device) -> torch.Tensor:
-        specs = plan.shapes_and_dtypes()
-        if is_workspace_manager_initialized():
-            (scratch,) = current_workspace_manager().get_simultaneous(*specs)
-            return scratch
+        """Return storage whose address is stable for this backend instance.
 
-        # Unit-test/minimal-runner fallback. Production initializes and
-        # pre-sizes WorkspaceManager before metadata construction.
+        The general vLLM workspace is reused by MoE and other kernels.  A
+        dense-MLA CUDA graph retains this tensor's address, so borrowing that
+        shared allocation lets a later workspace resize invalidate the graph
+        and lets unrelated kernels overwrite split partials.  Keep the small
+        attention scratch allocation private instead.
+        """
+        specs = plan.shapes_and_dtypes()
         key = id(plan)
-        scratch = self._fallback_scratch.get(key)
+        scratch = self._scratch_by_plan.get(key)
         if scratch is None:
             if len(specs) != 1:
                 raise RuntimeError("B12X_MLA expected exactly one scratch buffer.")
             shape, dtype = specs[0]
             scratch = torch.empty(shape, dtype=dtype, device=device)
-            self._fallback_scratch[key] = scratch
+            self._scratch_by_plan[key] = scratch
         return scratch
 
     def forward_mqa(
@@ -426,8 +459,20 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"B12X_MLA expected {self.num_heads} query heads, got {q.shape[1]}."
             )
 
+        dcp_group = None
+        if self.dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_group = get_dcp_group()
+            q = dcp_b12x_all_gather_heads(
+                q,
+                dcp_group,
+                max_batch_size=self._dcp_max_batch_size,
+                output_head_dim=self.kv_lora_rank,
+            )
+
         output = torch.empty(
-            (batch, self.num_heads, self.kv_lora_rank),
+            (batch, int(q.shape[1]), self.kv_lora_rank),
             dtype=torch.bfloat16,
             device=q.device,
         )
@@ -464,7 +509,49 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             self._dense_mla.compile(binding=binding)
             self._compiled_bindings.add(compile_key)
 
-        return self._dense_mla.run(binding=binding)
+        if is_b12x_compile_only_warmup():
+            # The binding above carries the exact FP8/BF16 strides retained by
+            # capture. Compilation is sufficient here: launching the complete
+            # K3 warmup forward against capture-prepared workspaces is unsafe.
+            local_output = output[:, : self.num_heads]
+            local_output.zero_()
+            return local_output, None
+
+        output, lse = self._dense_mla.run(binding=binding)
+        if os.environ.get("VLLM_KIMI_DEBUG_FINITE") == "1":
+            torch.cuda.synchronize()
+            output_ok = bool(torch.isfinite(output).all().item())
+            lse_ok = bool((~torch.isnan(lse) & ~torch.isposinf(lse)).all().item())
+            if not output_ok or not lse_ok:
+                raise RuntimeError(
+                    "B12X_MLA produced invalid local output/LSE: "
+                    f"output_finite={output_ok}, lse_valid={lse_ok}"
+                )
+        if dcp_group is None:
+            return output, lse
+
+        if self._dcp_comm_backend == "a2a":
+            reduced = dcp_a2a_lse_reduce(
+                output,
+                lse,
+                dcp_group,
+                is_lse_base_on_e=True,
+                use_b12x=True,
+                b12x_max_batch_size=self._dcp_max_batch_size,
+                b12x_query_head_dim=_K3_ABSORBED_HEAD_DIM,
+            )
+        else:
+            reduced = cp_lse_ag_out_rs(
+                output,
+                lse,
+                dcp_group,
+                is_lse_base_on_e=True,
+            )
+        if os.environ.get("VLLM_KIMI_DEBUG_FINITE") == "1":
+            torch.cuda.synchronize()
+            if not bool(torch.isfinite(reduced).all().item()):
+                raise RuntimeError("B12X_MLA DCP reduction produced nonfinite output")
+        return reduced, None
 
 
 __all__ = [

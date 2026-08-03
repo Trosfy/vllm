@@ -24,8 +24,9 @@ KV cache, and absorbs ``kv_b_proj`` into ``W_UK_T`` / ``W_UV`` -- mirroring the
 K3 specifics: optional rotary embedding (disabled for the target model's NoPE
 layers, enabled for DSpark) and an optional sigmoid output gate (``g_proj``).
 
-Out of scope (extension points, not wired here): context parallelism (DCP/PCP),
-sparse/indexer MLA, and the ROCm/aiter fp8/fp4 BMM fast paths.
+Out of scope (extension points, not wired here): prefill context parallelism
+(PCP), sparse/indexer MLA, and the ROCm/aiter fp8/fp4 BMM fast paths. Decode
+context parallelism is implemented by the native B12X dense MLA backend.
 """
 
 import math
@@ -34,9 +35,13 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -97,6 +102,67 @@ _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Apply the sigmoid output gate to a precomputed ``g_proj`` projection."""
     return attn_out * gate.sigmoid()
+
+
+def _restore_merged_output_order(
+    rank_major_output: torch.Tensor,
+    output_sizes: list[int],
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert ``[rank0(a,b), rank1(a,b), ...]`` to ``[all_a, all_b]``."""
+    if tp_size == 1:
+        return rank_major_output
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            f"Merged output sizes {output_sizes} must be divisible by TP={tp_size}"
+        )
+    local_sizes = [size // tp_size for size in output_sizes]
+    local_total = sum(local_sizes)
+    expected_width = local_total * tp_size
+    if rank_major_output.shape[-1] != expected_width:
+        raise ValueError(
+            "Unexpected gathered merged projection width: "
+            f"got {rank_major_output.shape[-1]}, expected {expected_width}"
+        )
+    rank_major = rank_major_output.unflatten(-1, (tp_size, local_total))
+    logical_local_shards = rank_major.split(local_sizes, dim=-1)
+    return torch.cat(
+        [shards.flatten(-2) for shards in logical_local_shards],
+        dim=-1,
+    )
+
+
+class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Merged column projection with one gather and logical-shard reorder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size == 1:
+            return output_parallel, output_bias
+        rank_major_output = tensor_model_parallel_all_gather(output_parallel)
+        output = _restore_merged_output_order(
+            rank_major_output,
+            self.output_sizes,
+            self.tp_size,
+        )
+        return output, output_bias
 
 
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
@@ -184,14 +250,26 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # the low-rank latents are shared across TP ranks; TP splitting
             # happens at q_b_proj / kv_b_proj. Checkpoint weights ``q_a_proj``
             # and ``kv_a_proj_with_mqa`` map onto shards 0 and 1 respectively.
-            self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-                disable_tp=True,
-            )
+            qkv_a_output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            if envs.VLLM_KIMI_SHARD_QKV_A and tp_size > 1:
+                self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+            else:
+                self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                    disable_tp=True,
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -305,10 +383,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
-        assert (
-            parallel_config.decode_context_parallel_size <= 1
-            and parallel_config.prefill_context_parallel_size <= 1
-        ), "Kimi-K3 MultiHeadLatentAttention does not support context parallelism."
+        assert parallel_config.prefill_context_parallel_size <= 1, (
+            "Kimi-K3 MultiHeadLatentAttention does not support prefill "
+            "context parallelism."
+        )
+        if parallel_config.decode_context_parallel_size > 1:
+            assert self.attn_backend.get_name() == "B12X_MLA", (
+                "Kimi-K3 decode context parallelism requires the native "
+                f"B12X_MLA backend, got {self.attn_backend.get_name()}."
+            )
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,
             scale=self.scale,
@@ -693,30 +776,55 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
         elif is_quantized_kv_cache(self.kv_cache_dtype):
-            assert fp8_prefill, (
-                "Kimi-K3 fp8 KV cache requires an fp8 prefill query; enable "
-                "--attention-config '{\"use_prefill_query_quantization\": true}'."
-            )
-            # Plain per-tensor fp8: quant q/k/v (unscaled, matching forward_mha's
-            # unscaled `.to(fp8)`) and insert the fp8 latent (scaled by _k_scale).
-            kv_cache = self.kv_cache
-            if kv_cache.dtype != torch.float8_e4m3fn:
-                kv_cache = kv_cache.view(torch.float8_e4m3fn)
-            q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
-                q,
-                k_nope,
-                k_pe,
-                kv_c_normed,
-                v,
-                kv_cache,
-                slot_mapping,
-                self._one_scale,
-                self._one_scale,
-                self._one_scale,
-                self._k_scale_inv,
-                positions,
-                cos_sin_cache,
-            )
+            if fp8_prefill:
+                # Plain per-tensor fp8: quant q/k/v (unscaled, matching
+                # forward_mha's unscaled `.to(fp8)`) and insert the fp8 latent
+                # (scaled by _k_scale).
+                kv_cache = self.kv_cache
+                if kv_cache.dtype != torch.float8_e4m3fn:
+                    kv_cache = kv_cache.view(torch.float8_e4m3fn)
+                q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
+                    q,
+                    k_nope,
+                    k_pe,
+                    kv_c_normed,
+                    v,
+                    kv_cache,
+                    slot_mapping,
+                    self._one_scale,
+                    self._one_scale,
+                    self._one_scale,
+                    self._k_scale_inv,
+                    positions,
+                    cos_sin_cache,
+                )
+            else:
+                # SM120 prefill backends consume bf16 Q/K/V even when the
+                # latent cache is fp8.  Keep the attention operands in bf16
+                # and quantize only [kv_c_normed | k_pe] on cache insertion.
+                # Kimi-K3 is NoPE-only, so no rotary update is needed here.
+                assert positions is None and cos_sin_cache is None, (
+                    "BF16 Kimi-K3 prefill with an FP8 cache currently "
+                    "supports NoPE layers only."
+                )
+                from vllm import _custom_ops as ops
+
+                k_pe = k_pe.reshape(k_pe.shape[0], -1)
+                k = torch.cat(
+                    (
+                        k_nope,
+                        k_pe.unsqueeze(1).expand(-1, self.num_local_heads, -1),
+                    ),
+                    dim=-1,
+                )
+                ops.concat_and_cache_mla(
+                    kv_c_normed,
+                    k_pe,
+                    self.kv_cache,
+                    slot_mapping,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
         else:
             # Concat full K = [k_nope | k_pe] and insert [kv_c_normed | k_pe]
             # into the paged cache for these prefill tokens, in one launch.

@@ -14,8 +14,20 @@ from .moe_runner import MoERunner, _unpack
 logger = init_logger(__name__)
 
 
+def _project_sharded_up_and_reduce(
+    fused_latent: torch.Tensor,
+    shared_output: torch.Tensor,
+    up_proj: torch.nn.Module,
+) -> torch.Tensor:
+    """Project a TP latent slice and reduce routed+shared partials together."""
+    routed_output = up_proj(fused_latent)
+    if isinstance(routed_output, tuple):
+        routed_output = routed_output[0]
+    return tensor_model_parallel_all_reduce(routed_output.add_(shared_output))
+
+
 class LatentMoERunner(MoERunner):
-    """MoE runner for latent MoE with a replicated routed up-projection.
+    """MoE runner for latent MoE routed output projections.
 
     Fused path (tp>1, un-reduced combine output, shared expert, no SP):
     concatenates the un-reduced latent partial (dim d) and the un-reduced
@@ -33,11 +45,21 @@ class LatentMoERunner(MoERunner):
         self,
         *args,
         enable_k3_latent_moe_tail_fusion: bool = False,
+        up_projection_is_sharded: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self.up_projection_is_sharded = up_projection_is_sharded
         self.enable_k3_latent_moe_tail_fusion = enable_k3_latent_moe_tail_fusion
         use_fused_path = self._use_fused_path()
+        if self.up_projection_is_sharded and not use_fused_path:
+            raise ValueError(
+                "A TP-sharded latent up projection requires the fused latent "
+                "MoE path (TP>1, shared experts, and no sequence parallelism)."
+            )
+        if self.up_projection_is_sharded:
+            # The tail op consumes a full replicated up-projection weight.
+            self.enable_k3_latent_moe_tail_fusion = False
         if (
             self.enable_k3_latent_moe_tail_fusion
             and use_fused_path
@@ -170,6 +192,26 @@ class LatentMoERunner(MoERunner):
         transform = self.routed_output_transform
         assert transform is not None
 
+        if self.up_projection_is_sharded:
+            fused_latent = None
+            if transform.norm is not None:
+                fused_latent = self.allreduce_norm_latent_out(
+                    fused_output, transform.norm
+                )
+            else:
+                fused_latent = tensor_model_parallel_all_reduce(fused_output)
+
+            # RowParallelLinear slices the reconstructed latent input and
+            # emits an unreduced hidden-width partial. Shared experts already
+            # emit the matching TP partial, so reduce their sum only once.
+            result = _project_sharded_up_and_reduce(
+                fused_latent, shared_output, transform.up_proj
+            )
+            result = self._maybe_reduce_final_output(
+                result, og_hidden_dim_post_xform, output_is_reduced=True
+            )
+            return self._maybe_add_zero_expert_output(result)
+
         if self.enable_k3_latent_moe_tail_fusion:
             op = self._k3_latent_moe_tail_op
             if 0 < fused_output.shape[0] <= op.contract.max_num_tokens:
@@ -222,7 +264,7 @@ class LatentMoERunner(MoERunner):
         self,
         hidden_states: torch.Tensor,
         norm: RMSNorm,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """All-reduce + add residual + (standard) RMSNorm, fused via flashinfer."""
         from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
             _AR_RESIDUAL_RMS_NORM,

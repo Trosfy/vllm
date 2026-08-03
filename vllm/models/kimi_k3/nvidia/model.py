@@ -15,7 +15,9 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -36,6 +38,7 @@ from vllm.model_executor.layers.fused_moe.runner.latent_moe_runner import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -130,6 +133,80 @@ logger = init_logger(__name__)
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
+def _uses_native_b12x_mxfp4_intermediate_size(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Whether B12X consumes the checkpoint's unpadded MoE shard.
+
+    SparkInfer's native E8M0 W4A16 path supports logical intermediate tails,
+    including Kimi-K3's 3072 / TP16 = 192 shard.  The generic Kimi minimum of
+    256 channels per rank would otherwise inflate every routed-expert layer by
+    one third before the quant backend gets a chance to preserve its shape.
+    """
+    if vllm_config.model_config.quantization != "mxfp4":
+        return False
+    moe_backend = vllm_config.kernel_config.moe_backend
+    return moe_backend == "b12x" or (
+        moe_backend == "auto" and envs.VLLM_USE_B12X_MOE
+    )
+
+
+def _shard_routed_down_projection(tp_size: int) -> bool:
+    return tp_size > 1 and envs.VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ
+
+
+def _shard_routed_up_projection(tp_size: int) -> bool:
+    return tp_size > 1 and envs.VLLM_KIMI_SHARD_ROUTED_UP_PROJ
+
+
+def _shard_router(tp_size: int) -> bool:
+    return tp_size > 1 and envs.VLLM_KIMI_SHARD_ROUTER
+
+
+def _log_construction_memory(stage: str, prefix: str) -> None:
+    if (
+        not envs.VLLM_KIMI_LOG_CONSTRUCTION_MEMORY
+        or get_tensor_model_parallel_rank() != 0
+    ):
+        return
+    gib = 1024**3
+    logger.info(
+        "Kimi-K3 construction %s %s: allocated=%.3f GiB, "
+        "reserved=%.3f GiB",
+        stage,
+        prefix,
+        torch.cuda.memory_allocated() / gib,
+        torch.cuda.memory_reserved() / gib,
+    )
+
+
+class KimiShardedGate(ColumnParallelLinear):
+    """TP-sharded K3 router that returns globally ordered FP32 logits."""
+
+    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+        super().__init__(
+            input_size,
+            output_size,
+            bias=False,
+            gather_output=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
+            output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+        else:
+            output_parallel = torch.nn.functional.linear(
+                x.to(self.weight.dtype), self.weight
+            ).float()
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        return output, None
+
+
 class KimiMLP(nn.Module):
     def __init__(
         self,
@@ -186,7 +263,7 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        up_proj: ReplicatedLinear,
+        up_proj: ReplicatedLinear | RowParallelLinear,
     ) -> None:
         super().__init__()
         self.norm = norm
@@ -397,6 +474,7 @@ class KimiMoE(nn.Module):
         use_sequence_parallel: bool = False,
     ):
         super().__init__()
+        _log_construction_memory("starting", prefix)
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         num_experts = config.num_experts
@@ -444,12 +522,24 @@ class KimiMoE(nn.Module):
         min_moe_intermediate_per_partition = getattr(
             config, "min_moe_intermediate_per_partition", 256
         )
-        if self.tp_size > 1:
+        use_native_b12x_intermediate = (
+            not self.use_mega_moe
+            and _uses_native_b12x_mxfp4_intermediate_size(vllm_config)
+        )
+        if self.tp_size > 1 and not use_native_b12x_intermediate:
             moe_intermediate_per_partition = moe_intermediate_size // self.tp_size
             if moe_intermediate_per_partition < min_moe_intermediate_per_partition:
                 self.padded_moe_intermediate_size = (
                     min_moe_intermediate_per_partition * self.tp_size
                 )
+        elif use_native_b12x_intermediate:
+            logger.info_once(
+                "Kimi-K3 B12X MXFP4 is keeping the native MoE intermediate "
+                "shard (%d / TP%d = %d); no model-level padding is required.",
+                moe_intermediate_size,
+                self.tp_size,
+                moe_intermediate_size // self.tp_size,
+            )
         activation_situ_beta = (
             config.activation_situ_beta if config.hidden_act == "situ" else None
         )
@@ -458,13 +548,26 @@ class KimiMoE(nn.Module):
         )
 
         # Route with fp32 logits for numerically stable expert selection.
-        self.gate = GateLinear(
-            input_size=hidden_size,
-            output_size=num_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
-        )
+        self.shard_router = _shard_router(self.tp_size)
+        if self.shard_router:
+            self.gate = KimiShardedGate(
+                input_size=hidden_size,
+                output_size=num_experts,
+                prefix=f"{prefix}.gate",
+            )
+            logger.info_once(
+                "Kimi-K3 is TP-sharding the BF16 router and gathering FP32 "
+                "logits (TP%d).",
+                self.tp_size,
+            )
+        else:
+            self.gate = GateLinear(
+                input_size=hidden_size,
+                output_size=num_experts,
+                bias=False,
+                out_dtype=torch.float32,
+                prefix=f"{prefix}.gate",
+            )
 
         self.gate.e_score_correction_bias = nn.Parameter(
             torch.empty(num_experts, dtype=torch.float32)
@@ -486,35 +589,64 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.routed_expert_down_proj: ReplicatedLinear | None
+        self.routed_expert_down_proj: (
+            ColumnParallelLinear | ReplicatedLinear | None
+        )
         self.routed_expert_norm: RMSNorm | None
-        self.routed_expert_up_proj: ReplicatedLinear | None
+        self.routed_expert_up_proj: ReplicatedLinear | RowParallelLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = ReplicatedLinear(
+            shard_routed_down = _shard_routed_down_projection(self.tp_size)
+            routed_down_cls = (
+                ColumnParallelLinear if shard_routed_down else ReplicatedLinear
+            )
+            routed_down_kwargs = {"gather_output": True} if shard_routed_down else {}
+            self.routed_expert_down_proj = routed_down_cls(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
                 quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
+                **routed_down_kwargs,
             )
+            if shard_routed_down:
+                logger.info_once(
+                    "Kimi-K3 is TP-sharding the routed-expert down projection "
+                    "and gathering its latent output (TP%d).",
+                    self.tp_size,
+                )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
                 if self.latent_moe_use_norm
                 else None
             )
-            # Replicated up-proj: the full weight lives on every rank and
-            # produces the full hidden dim locally. This lets LatentMoERunner
-            # fuse the latent and shared reductions into a single all-reduce
-            # (concat the two partials, reduce once), then run the up-proj and
-            # shared add locally with no further collective.
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.routed_expert_up_proj",
-            )
+            shard_routed_up = _shard_routed_up_projection(self.tp_size)
+            if shard_routed_up:
+                self.routed_expert_up_proj = RowParallelLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    input_is_parallel=False,
+                    reduce_results=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
+                logger.info_once(
+                    "Kimi-K3 is TP-sharding the routed-expert up projection "
+                    "and reducing its sum with the shared-expert partial "
+                    "(TP%d).",
+                    self.tp_size,
+                )
+            else:
+                # A full local projection lets LatentMoERunner use HH's
+                # replicated-up tail path when enough memory is available.
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
 
             self.routed_output_transform = KimiRoutedOutputTransform(
                 self.routed_expert_norm, self.routed_expert_up_proj
@@ -588,7 +720,10 @@ class KimiMoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
                 runner_args=(
-                    {"enable_k3_latent_moe_tail_fusion": enable_tail_fusion}
+                    {
+                        "enable_k3_latent_moe_tail_fusion": enable_tail_fusion,
+                        "up_projection_is_sharded": shard_routed_up,
+                    }
                     if self.use_latent_moe
                     else None
                 ),
@@ -607,6 +742,7 @@ class KimiMoE(nn.Module):
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
                 moe_intermediate_size // self.tp_size
             )
+        _log_construction_memory("finished", prefix)
 
     def _maybe_overlap_router_and_down_proj(
         self, hidden_states: torch.Tensor
@@ -658,9 +794,15 @@ class KimiMoE(nn.Module):
                 lambda: down_proj(hidden_states),
                 self._down_proj_events[0],
                 self._down_proj_events[1],
-                self._down_proj_stream
-                if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
-                else None,
+                (
+                    self._down_proj_stream
+                    if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                    and not (
+                        self.shard_router
+                        and isinstance(down_proj, ColumnParallelLinear)
+                    )
+                    else None
+                ),
             )
         )
         return routed_hidden_states, router_output, topk_ids

@@ -1205,9 +1205,21 @@ def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     weight_name_prefixes: Sequence[str] | None = None,
+    *,
+    indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using instanttensor library."""
+    using instanttensor library.
+
+    ``InstantTensor.safe_open`` normally streams every physical tensor in its
+    input files. That is incorrect and unnecessarily expensive for composed
+    checkpoints, where the final safetensors index may remap a tensor to an
+    overlay shard while leaving a stale copy in a base shard. When an index
+    is available, restrict InstantTensor's ordered metadata and C++ I/O layout
+    to the indexed byte ranges before opening the loader. Consecutive selected
+    tensors are coalesced into one range; disjoint ranges reuse the same file
+    as independent loader inputs, so skipped payload bytes are never read.
+    """
     try:
         import instanttensor
     except ImportError as e:
@@ -1228,37 +1240,222 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
-    # copy=True yields tensors that own their memory, staying valid after the
-    # context exits or InstantTensor reuses its buffer.
-    with instanttensor.safe_open(
-        hf_weights_files,
+    configured_buffer_size = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
+    max_gpu_tensor_size = None
+    if configured_buffer_size is not None:
+        try:
+            max_gpu_tensor_size = int(configured_buffer_size)
+        except ValueError as e:
+            raise ValueError(
+                "INSTANTTENSOR_BUFFER_SIZE must be an integer number of bytes"
+            ) from e
+        if max_gpu_tensor_size <= 0:
+            raise ValueError("INSTANTTENSOR_BUFFER_SIZE must be greater than zero")
+
+    restrict_before_io = (
+        indexed_tensor_files is not None
+        or bool(weight_name_prefixes)
+        or max_gpu_tensor_size is not None
+    )
+    instant_open = instanttensor.safe_open(
+        list(hf_weights_files),
         framework="pt",
         device=device,
         process_group=process_group,
-        copy=True,
-    ) as f:
-        # Track bytes so the bar reports load throughput (GB/s).
-        pbar = tqdm(
-            total=f.total_tensor_size,
-            desc="Loading safetensors using InstantTensor loader",
-            disable=not enable_tqdm(use_tqdm_on_load),
-            bar_format=_BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            mininterval=1.0,
+        load_now=not restrict_before_io,
+        # Model weight loaders consume and copy every yielded tensor before
+        # requesting the next one. A second owning clone here only doubles
+        # device traffic and transient memory. Our InstantTensor build records
+        # a consumer-stream event before reusing its ring-buffer storage.
+        copy=False,
+    )
+    cpu_fallback_weights: list[tuple[str, str]] = []
+    if restrict_before_io:
+        cpu_fallback_weights = _restrict_instanttensor_to_selected_ranges(
+            instant_open,
+            indexed_tensor_files=indexed_tensor_files,
+            weight_name_prefixes=weight_name_prefixes,
+            max_tensor_size=max_gpu_tensor_size,
         )
-        try:
-            for name, tensor in f.tensors():
-                pbar.update(tensor.numel() * tensor.element_size())
+
+    if instant_open.ordered_tensor_metadatas:
+        with instant_open as f:
+            for name, tensor in tqdm(
+                f.tensors(),
+                desc="Loading safetensors using InstantTensor loader",
+                disable=not enable_tqdm(use_tqdm_on_load),
+                bar_format=_BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+                total=len(f.keys()),
+                mininterval=1.0,
+            ):
                 if weight_name_prefixes and not _matches_weight_name_prefixes(
                     name, weight_name_prefixes
                 ):
                     continue
                 yield name, tensor
-        finally:
-            pbar.close()
+            # A generator frame retains its last loop value. Drop the final
+            # DLPack view before closing InstantTensor so the ring-buffer
+            # allocation cannot outlive the streaming phase.
+            del tensor
+
+    if cpu_fallback_weights:
+        assert max_gpu_tensor_size is not None
+        logger.info_once(
+            "Loading %d tensors larger than the %d-byte InstantTensor ring "
+            "through CPU safetensors",
+            len(cpu_fallback_weights),
+            max_gpu_tensor_size,
+        )
+        fallback_by_file: dict[str, list[str]] = defaultdict(list)
+        for name, filename in cpu_fallback_weights:
+            fallback_by_file[filename].append(name)
+        for filename, names in fallback_by_file.items():
+            with safe_open(filename, framework="pt", device="cpu") as fallback_file:
+                for name in names:
+                    yield name, fallback_file.get_tensor(name)
+
+
+def _restrict_instanttensor_to_selected_ranges(
+    instant_open: Any,
+    *,
+    indexed_tensor_files: dict[str, str] | None,
+    weight_name_prefixes: Sequence[str] | None,
+    max_tensor_size: int | None = None,
+) -> list[tuple[str, str]]:
+    """Replace an unopened InstantTensor layout with selected physical ranges.
+
+    InstantTensor 0.1.9 exposes the metadata and offset arrays used by its C++
+    loader. The C++ API accepts repeated filenames, which lets each contiguous
+    selected run become a separate logical input without copying or repacking
+    the checkpoint. Keep this adapter strict so an upstream API/layout change
+    fails before any weight I/O instead of silently loading the wrong tensor.
+    """
+    required_attrs = (
+        "filename",
+        "ordered_tensor_metadatas",
+        "tensor_offsets",
+        "tensor_sizes",
+        "total_tensor_size",
+        "tensor_name_to_index",
+        "loader_handle",
+        "_determine_buffer_size",
+    )
+    missing = [name for name in required_attrs if not hasattr(instant_open, name)]
+    if missing:
+        raise RuntimeError(
+            "Installed InstantTensor does not expose the metadata layout needed "
+            f"for index-aware loading (missing: {', '.join(missing)})"
+        )
+    if instant_open.loader_handle is not None:
+        raise RuntimeError("InstantTensor selection must be applied before opening I/O")
+
+    filenames = list(instant_open.filename)
+    metadata = list(instant_open.ordered_tensor_metadatas)
+    offsets = list(instant_open.tensor_offsets)
+    selected_filenames: list[str] = []
+    selected_metadata: list[tuple[str, dict[str, object]]] = []
+    selected_offsets: list[tuple[int, int]] = []
+    cpu_fallback_weights: list[tuple[str, str]] = []
+    metadata_pos = 0
+    offset_pos = 0
+
+    for filename in filenames:
+        filename_abs = os.path.abspath(filename)
+        with safe_open(filename, framework="pt") as physical_file:
+            physical_names = list(physical_file.offset_keys())
+        tensor_count = len(physical_names)
+        file_metadata = metadata[metadata_pos : metadata_pos + tensor_count]
+        file_offsets = offsets[offset_pos : offset_pos + tensor_count + 1]
+        if len(file_metadata) != tensor_count or len(file_offsets) != tensor_count + 1:
+            raise RuntimeError(
+                "InstantTensor metadata/offset count does not match safetensors "
+                f"header for {filename}"
+            )
+        metadata_names = [name for name, _ in file_metadata]
+        if metadata_names != physical_names:
+            raise RuntimeError(
+                "InstantTensor tensor order does not match safetensors offset order "
+                f"for {filename}"
+            )
+
+        keep = []
+        for item_index, name in enumerate(physical_names):
+            indexed_here = indexed_tensor_files is None or (
+                indexed_tensor_files.get(name) == filename_abs
+            )
+            prefix_matches = not weight_name_prefixes or _matches_weight_name_prefixes(
+                name, weight_name_prefixes
+            )
+            selected_here = indexed_here and prefix_matches
+            tensor_size = int(file_offsets[item_index + 1][1]) - int(
+                file_offsets[item_index][1]
+            )
+            use_cpu_fallback = (
+                selected_here
+                and max_tensor_size is not None
+                and tensor_size > max_tensor_size
+            )
+            keep.append(selected_here and not use_cpu_fallback)
+            if use_cpu_fallback:
+                cpu_fallback_weights.append((name, filename))
+
+        run_start = 0
+        while run_start < tensor_count:
+            while run_start < tensor_count and not keep[run_start]:
+                run_start += 1
+            if run_start == tensor_count:
+                break
+            run_end = run_start + 1
+            while run_end < tensor_count and keep[run_end]:
+                run_end += 1
+
+            logical_file_index = len(selected_filenames)
+            selected_filenames.append(filename)
+            selected_metadata.extend(file_metadata[run_start:run_end])
+            selected_offsets.extend(
+                (logical_file_index, int(file_offsets[idx][1]))
+                for idx in range(run_start, run_end)
+            )
+            selected_offsets.append((logical_file_index, int(file_offsets[run_end][1])))
+            run_start = run_end
+
+        metadata_pos += tensor_count
+        offset_pos += tensor_count + 1
+
+    if metadata_pos != len(metadata) or offset_pos != len(offsets):
+        raise RuntimeError(
+            "InstantTensor layout contains unaccounted metadata or offsets"
+        )
+    selected_names = [name for name, _ in selected_metadata]
+    if len(selected_names) != len(set(selected_names)):
+        raise RuntimeError(
+            "InstantTensor index-aware selection still contains duplicate tensor names"
+        )
+    selected_sizes = [
+        int(item["data_offsets"][1]) - int(item["data_offsets"][0])
+        for _, item in selected_metadata
+    ]
+    fallback_names = [name for name, _ in cpu_fallback_weights]
+    if len(fallback_names) != len(set(fallback_names)):
+        raise RuntimeError(
+            "InstantTensor CPU fallback selection contains duplicate tensor names"
+        )
+
+    instant_open.filename = selected_filenames
+    instant_open.ordered_tensor_metadatas = selected_metadata
+    instant_open.tensor_name_to_index = {
+        name: idx for idx, name in enumerate(selected_names)
+    }
+    instant_open.tensor_offsets = selected_offsets
+    instant_open.tensor_sizes = selected_sizes
+    instant_open.total_tensor_size = sum(selected_sizes)
+    # Recompute the ring buffer against selected tensors and their I/O layout.
+    if selected_metadata:
+        instant_open._determine_buffer_size(None)
+    elif not cpu_fallback_weights:
+        raise RuntimeError("InstantTensor index/prefix selection matched no tensors")
+    return cpu_fallback_weights
 
 
 def pt_weights_iterator(

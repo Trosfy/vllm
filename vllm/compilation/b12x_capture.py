@@ -3,8 +3,29 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import vllm.envs as envs
+
+_b12x_compile_only_warmup: ContextVar[bool] = ContextVar(
+    "b12x_compile_only_warmup",
+    default=False,
+)
+
+
+def is_b12x_compile_only_warmup() -> bool:
+    """Whether the current forward may compile but must not launch B12X compute."""
+    return _b12x_compile_only_warmup.get()
+
+
+@contextmanager
+def b12x_compile_only_warmup() -> Iterator[None]:
+    """Traverse a model to resolve exact B12X bindings without running them."""
+    token = _b12x_compile_only_warmup.set(True)
+    try:
+        yield
+    finally:
+        _b12x_compile_only_warmup.reset(token)
 
 
 def b12x_cuda_graph_prewarm_enabled() -> bool:

@@ -3,6 +3,7 @@
 """Custom activation functions."""
 
 import math
+from contextlib import suppress
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,14 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.collection_utils import LazyDict
 
 logger = init_logger(__name__)
+
+
+def ensure_kimi_k3_activation_ops() -> bool:
+    """Load the SiTU companion when the preserved main extension is old."""
+    if not hasattr(torch.ops._C, "situ_and_mul"):
+        with suppress(ImportError):
+            import vllm._kimi_k3_activation_ops  # noqa: F401
+    return hasattr(torch.ops._C, "situ_and_mul")
 
 
 @triton.jit
@@ -178,7 +187,13 @@ class SituAndMul(CustomOp):
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.situ_and_mul
+            ensure_kimi_k3_activation_ops()
+            self.op = getattr(torch.ops._C, "situ_and_mul", None)
+            if self.op is None:
+                logger.warning_once(
+                    "The loaded vLLM extension predates _C.situ_and_mul; "
+                    "using the numerically equivalent PyTorch SiTU fallback."
+                )
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -190,6 +205,8 @@ class SituAndMul(CustomOp):
         return (gate * up).to(x.dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         # Fused CUDA kernel: writes straight to `out`, no fp32 temporaries.
         # linear_beta<=0 signals "unset" to the kernel (up passed through).
         d = x.shape[-1] // 2

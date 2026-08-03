@@ -31,6 +31,14 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(VLLM_KIMI_K3_CACHE_OPS_ONLY
+  "Build only the HH Kimi-K3 cache-op compatibility extension" OFF)
+option(VLLM_KIMI_K3_KDA_OPS_ONLY
+  "Build only the HH Kimi-K3 fused-decode compatibility extension" OFF)
+option(VLLM_KIMI_K3_ACTIVATION_OPS_ONLY
+  "Build only the HH Kimi-K3 SiTU compatibility extension" OFF)
+option(VLLM_FLASHKDA_ONLY
+  "Build only the FlashKDA prefill extension" OFF)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -281,6 +289,118 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 endif()
 
+# Keep this tiny target available independently of the rest of vLLM's CUDA
+# extensions.  It is used to run HH Python sources in a preserved image whose
+# full _C_stable_libtorch predates the six Kimi-K3 cache epilogue ops.  The
+# early return deliberately avoids configuring CUTLASS and FlashAttention.
+function(define_kimi_k3_cache_ops_target)
+  set(KIMI_K3_CACHE_OPS_SRC
+    "csrc/libtorch_stable/kimi_k3_cache_ops_bindings.cpp"
+    "csrc/libtorch_stable/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu")
+  set(KIMI_K3_CACHE_OPS_ARCHS)
+  foreach(_ARCH ${CUDA_ARCHS})
+    string(REPLACE "." "" _CMAKE_ARCH "${_ARCH}")
+    list(APPEND KIMI_K3_CACHE_OPS_ARCHS "${_CMAKE_ARCH}-real")
+  endforeach()
+  define_extension_target(
+    _kimi_k3_cache_ops
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${KIMI_K3_CACHE_OPS_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${KIMI_K3_CACHE_OPS_ARCHS}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(_kimi_k3_cache_ops PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA)
+endfunction()
+
+# The preserved GG image predates HH's fused KDA decode kernel.  Keep this
+# independent from the full stable-libtorch extension so updating the Python
+# checkout does not require rebuilding every vLLM CUDA op.
+function(define_kimi_k3_kda_ops_target)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+    message(FATAL_ERROR "HH fused KDA decode requires CUDA >= 13.0")
+  endif()
+  cuda_archs_loose_intersection(KIMI_K3_KDA_OPS_ARCHS
+    "9.0a;10.0f;12.0f" "${CUDA_ARCHS}")
+  if(NOT KIMI_K3_KDA_OPS_ARCHS)
+    message(FATAL_ERROR
+      "No compatible architecture for HH fused KDA decode: ${CUDA_ARCHS}")
+  endif()
+  set(KIMI_K3_KDA_OPS_SRC
+    "csrc/libtorch_stable/kimi_k3_kda_ops_bindings.cpp"
+    "csrc/libtorch_stable/kimi_k3/fused_kda_decode_kernel.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${KIMI_K3_KDA_OPS_SRC}"
+    CUDA_ARCHS "${KIMI_K3_KDA_OPS_ARCHS}")
+  set_property(SOURCE ${KIMI_K3_KDA_OPS_SRC} APPEND PROPERTY
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+  set(KIMI_K3_KDA_OPS_CMAKE_ARCHS)
+  foreach(_ARCH ${CUDA_ARCHS})
+    string(REPLACE "." "" _CMAKE_ARCH "${_ARCH}")
+    list(APPEND KIMI_K3_KDA_OPS_CMAKE_ARCHS "${_CMAKE_ARCH}-real")
+  endforeach()
+  define_extension_target(
+    _kimi_k3_kda_ops
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${KIMI_K3_KDA_OPS_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${KIMI_K3_KDA_OPS_CMAKE_ARCHS}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(_kimi_k3_kda_ops PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    VLLM_ENABLE_FUSED_KDA_DECODE=1
+    USE_CUDA)
+endfunction()
+
+function(define_kimi_k3_activation_ops_target)
+  set(KIMI_K3_ACTIVATION_OPS_SRC
+    "csrc/libtorch_stable/kimi_k3_activation_ops_bindings.cpp"
+    "csrc/libtorch_stable/activation_kernels.cu")
+  set(KIMI_K3_ACTIVATION_OPS_ARCHS)
+  foreach(_ARCH ${CUDA_ARCHS})
+    string(REPLACE "." "" _CMAKE_ARCH "${_ARCH}")
+    list(APPEND KIMI_K3_ACTIVATION_OPS_ARCHS "${_CMAKE_ARCH}-real")
+  endforeach()
+  define_extension_target(
+    _kimi_k3_activation_ops
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${KIMI_K3_ACTIVATION_OPS_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${KIMI_K3_ACTIVATION_OPS_ARCHS}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(_kimi_k3_activation_ops PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL
+    USE_CUDA)
+endfunction()
+
+if((VLLM_KIMI_K3_CACHE_OPS_ONLY AND VLLM_KIMI_K3_KDA_OPS_ONLY) OR
+   (VLLM_KIMI_K3_CACHE_OPS_ONLY AND VLLM_KIMI_K3_ACTIVATION_OPS_ONLY) OR
+   (VLLM_KIMI_K3_KDA_OPS_ONLY AND VLLM_KIMI_K3_ACTIVATION_OPS_ONLY))
+  message(FATAL_ERROR "Select only one Kimi-K3 compatibility-only target")
+endif()
+
+if(VLLM_KIMI_K3_CACHE_OPS_ONLY OR VLLM_KIMI_K3_KDA_OPS_ONLY OR
+   VLLM_KIMI_K3_ACTIVATION_OPS_ONLY)
+  if(NOT VLLM_GPU_LANG STREQUAL "CUDA")
+    message(FATAL_ERROR "Kimi-K3 compatibility targets require CUDA")
+  endif()
+  if(VLLM_KIMI_K3_CACHE_OPS_ONLY)
+    define_kimi_k3_cache_ops_target()
+  elseif(VLLM_KIMI_K3_KDA_OPS_ONLY)
+    define_kimi_k3_kda_ops_target()
+  else()
+    define_kimi_k3_activation_ops_target()
+  endif()
+  return()
+endif()
+
 #
 # Use FetchContent for C++ dependencies that are compiled as part of vLLM's build process.
 # setup.py will override FETCHCONTENT_BASE_DIR to play nicely with sccache.
@@ -290,6 +410,14 @@ endif()
 include(FetchContent)
 file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
 message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
+
+if(VLLM_FLASHKDA_ONLY)
+  if(NOT VLLM_GPU_LANG STREQUAL "CUDA")
+    message(FATAL_ERROR "FlashKDA compatibility target requires CUDA")
+  endif()
+  include(cmake/external_projects/flashkda.cmake)
+  return()
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "HIP")
   #
@@ -1200,6 +1328,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       target_link_libraries(_C_stable_libtorch PRIVATE ${_STABLE_TORCH_AMDHIP64})
     endif()
   endif()
+endif()
+
+# Small compatibility fragment for HH Kimi-K3 cache epilogues. This lets a
+# preserved image reuse its existing full _C_stable_libtorch and compile only
+# the K3 ops added by HH instead of rebuilding the entire vLLM CUDA extension.
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  define_kimi_k3_cache_ops_target()
+  define_kimi_k3_kda_ops_target()
+  define_kimi_k3_activation_ops_target()
 endif()
 
 #

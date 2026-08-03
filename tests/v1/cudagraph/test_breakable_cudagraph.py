@@ -401,6 +401,51 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     assert create_calls[0][1] is not create_calls[1][1]
 
 
+def test_compile_only_prewarm_skips_manager_full_forward(monkeypatch):
+    import vllm.envs as envs
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import (
+        BatchExecutionDescriptor,
+        CudaGraphManager,
+    )
+
+    monkeypatch.setenv("VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM", "1")
+    envs.disable_envs_cache()
+    manager = CudaGraphManager.__new__(CudaGraphManager)
+    desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 1, None)
+    manager.device = torch.device("cpu")
+    manager._capture_descs = {CUDAGraphMode.PIECEWISE: [desc]}
+    manager._graphs_captured = False
+    manager.use_breakable_cg = True
+
+    create_calls = []
+    forward_calls = []
+
+    def create_forward_fn(desc_arg, warmup):
+        assert desc_arg == desc
+        create_calls.append(warmup)
+
+        def forward_fn(cg_mode):
+            forward_calls.append((warmup, cg_mode))
+
+        return forward_fn
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.graph_capture",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
+            return_value=False,
+        ),
+    ):
+        manager.capture(create_forward_fn)
+
+    assert create_calls == [True, False]
+    assert forward_calls == [(False, CUDAGraphMode.PIECEWISE)]
+
+
 @pytest.fixture(autouse=True)
 def _reset_breakable_tls():
     """Defensively clear thread-local capture state between tests so a

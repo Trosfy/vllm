@@ -784,6 +784,9 @@ class precompiled_wheel_utils:
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_flashkda_C.abi3.so",
+                            "vllm/_kimi_k3_cache_ops.abi3.so",
+                            "vllm/_kimi_k3_kda_ops.abi3.so",
+                            "vllm/_kimi_k3_activation_ops.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
@@ -1183,6 +1186,10 @@ if _build_custom_ops():
     if _is_cuda() or _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
+    if _is_cuda():
+        ext_modules.append(CMakeExtension(name="vllm._kimi_k3_cache_ops"))
+        ext_modules.append(CMakeExtension(name="vllm._kimi_k3_kda_ops"))
+        ext_modules.append(CMakeExtension(name="vllm._kimi_k3_activation_ops"))
 
 package_data = {
     "vllm": [

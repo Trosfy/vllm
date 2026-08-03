@@ -477,8 +477,16 @@ class CudaGraphManager:
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
+                    # Warmup. Breakable capture owns its runtime lifecycle and
+                    # can execute attention as eager segments; its direct-model
+                    # warmup is optional because it uses different workspace
+                    # dispatch from the graph wrapper itself.
+                    skip_breakable_warmup = (
+                        self.use_breakable_cg
+                        and envs.VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM
+                    )
+                    if not skip_breakable_warmup:
+                        forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
                     logger.debug(
