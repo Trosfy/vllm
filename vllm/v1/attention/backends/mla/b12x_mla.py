@@ -139,6 +139,7 @@ class B12xMLAMetadata(MLACommonMetadata):
     """Common MLA metadata plus the capture-static b12x launch plan."""
 
     dense_mla_plan: Any | None = None
+    dense_mla_scratch: torch.Tensor | None = None
 
 
 class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
@@ -170,16 +171,29 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             num_q_heads=self.num_heads * self.dcp_world_size,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
+        if len(self._workspace_specs) != 1:
+            raise RuntimeError("B12X_MLA expected exactly one scratch buffer.")
+        scratch_shape, scratch_dtype = self._workspace_specs[0]
+        # All layers represented by this metadata builder execute serially on
+        # the model stream. Give them one stable arena: CUDA graphs retain its
+        # address, while sharing avoids keeping an identical arena per layer.
+        self._dense_mla_scratch = torch.empty(
+            scratch_shape,
+            dtype=scratch_dtype,
+            device=device,
+        )
         logger.info_once(
             "B12X dense K3 MLA plan: local_heads=%d, effective_heads=%d, "
             "page_size=%d, "
-            "max_decode_rows=%d, max_cache_tokens=%d, splits=%d",
+            "max_decode_rows=%d, max_cache_tokens=%d, splits=%d, "
+            "shared_scratch=%.2f MiB",
             self.num_heads,
             self.num_heads * self.dcp_world_size,
             self.page_size,
             vllm_config.scheduler_config.max_num_seqs,
             _max_dcp_local_cache_tokens(vllm_config),
             self._dense_mla_plan.num_splits,
+            self._dense_mla_scratch.nbytes / (1 << 20),
         )
 
     def build(
@@ -197,6 +211,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             ),
         )
         metadata.dense_mla_plan = self._dense_mla_plan
+        metadata.dense_mla_scratch = self._dense_mla_scratch
         return metadata
 
 
@@ -409,13 +424,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         self._scratch_by_plan: dict[int, torch.Tensor] = {}
 
     def _borrow_scratch(self, plan: Any, device: torch.device) -> torch.Tensor:
-        """Return storage whose address is stable for this backend instance.
+        """Return fallback storage stable for this backend instance.
 
-        The general vLLM workspace is reused by MoE and other kernels.  A
-        dense-MLA CUDA graph retains this tensor's address, so borrowing that
-        shared allocation lets a later workspace resize invalidate the graph
-        and lets unrelated kernels overwrite split partials.  Keep the small
-        attention scratch allocation private instead.
+        Production metadata provides a group-shared arena. Direct backend
+        users may not, so retain the old private allocation as a compatibility
+        path rather than borrowing vLLM's resizable general workspace.
         """
         specs = plan.shapes_and_dtypes()
         key = id(plan)
@@ -476,7 +489,12 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             dtype=torch.bfloat16,
             device=q.device,
         )
-        scratch = self._borrow_scratch(plan, q.device)
+        scratch = getattr(attn_metadata, "dense_mla_scratch", None)
+        if scratch is None:
+            # Compatibility fallback for direct backend users and old custom
+            # metadata builders. Production K3 metadata supplies the shared
+            # capture-stable arena allocated above.
+            scratch = self._borrow_scratch(plan, q.device)
         quantized = q.dtype == torch.float8_e4m3fn
         binding = self._dense_mla.bind(
             plan,

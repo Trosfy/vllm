@@ -66,3 +66,52 @@ def test_project_sharded_up_reduces_after_shared_add(monkeypatch) -> None:
     expected_partial = torch.tensor([[5.0, 10.0]])
     torch.testing.assert_close(reduced_inputs[0], expected_partial)
     torch.testing.assert_close(actual, expected_partial + 10.0)
+
+
+def test_project_sharded_up_reuses_full_width_input_buffer(monkeypatch) -> None:
+    fused_latent = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    shared_partial = torch.tensor([[5.0, 6.0]])
+    reusable_input = torch.full_like(shared_partial, -99.0)
+
+    class FakeRowParallelProjection(torch.nn.Module):
+        input_is_parallel = False
+        input_size_per_partition = 2
+        tp_rank = 1
+        bias = None
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.tensor([[2.0, 0.0], [0.0, 3.0]]),
+                requires_grad=False,
+            )
+
+    reduced_inputs: list[torch.Tensor] = []
+
+    def fake_all_reduce_in_place(x: torch.Tensor) -> torch.Tensor:
+        reduced_inputs.append(x.clone())
+        return x + 10.0
+
+    monkeypatch.setattr(
+        latent_moe_runner,
+        "_K3_ROUTED_UP_INPLACE_AR_MIN_BYTES",
+        1,
+    )
+    monkeypatch.setattr(
+        latent_moe_runner,
+        "tensor_model_parallel_all_reduce_in_place",
+        fake_all_reduce_in_place,
+    )
+    actual = _project_sharded_up_and_reduce(
+        fused_latent,
+        shared_partial,
+        FakeRowParallelProjection(),
+        output_buffer=reusable_input,
+    )
+
+    # Rank one consumes latent columns [3, 4], writes [6, 12] directly into
+    # the reusable full-width input, then adds the shared [5, 6] partial.
+    expected_partial = torch.tensor([[11.0, 18.0]])
+    torch.testing.assert_close(reusable_input, expected_partial)
+    torch.testing.assert_close(reduced_inputs[0], expected_partial)
+    torch.testing.assert_close(actual, expected_partial + 10.0)

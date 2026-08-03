@@ -191,6 +191,31 @@ def test_b12x_mla_adapter_passes_fp8_scales(monkeypatch) -> None:
     assert binding.kv_scale is layer._k_scale
 
 
+def test_b12x_mla_adapter_uses_metadata_shared_scratch(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch)
+    shared_scratch = torch.empty(256, dtype=torch.uint8)
+    q = torch.randn(1, 8, 576, dtype=torch.bfloat16)
+    cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=shared_scratch,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(0.25),
+        _k_scale=torch.tensor(0.5),
+    )
+
+    impl.forward_mqa(q, cache, metadata, layer)
+
+    assert dense_mla.bindings[0].scratch is shared_scratch
+    assert impl._scratch_by_plan == {}
+
+
 def test_b12x_mla_compile_only_warmup_resolves_without_launch(monkeypatch) -> None:
     impl, dense_mla = _fake_impl(monkeypatch)
     q = torch.randn(1, 8, 576, dtype=torch.bfloat16)

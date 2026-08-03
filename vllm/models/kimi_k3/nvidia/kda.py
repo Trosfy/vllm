@@ -12,7 +12,11 @@ from torch.nn.parameter import Parameter
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -337,6 +341,26 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.num_heads = kda_config["num_heads"]
         assert self.num_heads % self.tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.tp_size)
+        additional_config = vllm_config.additional_config
+        self.shard_f_a = bool(
+            additional_config.get("kda_shard_f_a", False)
+            if isinstance(additional_config, dict)
+            else False
+        )
+        if self.shard_f_a:
+            assert self.head_dim % self.tp_size == 0, (
+                "KDA f_a output sharding requires head_dim to be divisible "
+                f"by TP size, got head_dim={self.head_dim}, TP={self.tp_size}."
+            )
+        self.local_fa_size = (
+            divide(self.head_dim, self.tp_size) if self.shard_f_a else self.head_dim
+        )
+        if self.shard_f_a:
+            logger.info_once(
+                "TP-sharding the KDA f_a projection output (%d -> %d rows/rank).",
+                self.head_dim,
+                self.local_fa_size,
+            )
         self.projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
@@ -352,20 +376,29 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.num_heads,
         ]
         local_output_size = (
-            4 * self.local_projection_size + self.head_dim + self.local_num_heads
+            4 * self.local_projection_size + self.local_fa_size + self.local_num_heads
         )
         self.in_proj_padding = -local_output_size % 16
         if self.in_proj_padding:
             in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
-        self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
-            self.hidden_size,
-            in_proj_output_sizes,
-            replicated_shard_id=4,
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvgfab",
-        )
+        if self.shard_f_a:
+            self.in_proj_qkvgfab = MergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
+        else:
+            self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                replicated_shard_id=4,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
         if self.in_proj_padding:
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
@@ -440,7 +473,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 f"Got {self.gate_lower_bound}."
             )
 
-        additional_config = vllm_config.additional_config
         backend = (
             additional_config.get("kda_prefill_backend", "auto")
             if isinstance(additional_config, dict)
@@ -494,7 +526,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         split_sizes = [
             3 * self.local_projection_size,
             self.local_projection_size,
-            self.head_dim,
+            self.local_fa_size,
             self.local_num_heads,
         ]
         if self.in_proj_padding:
@@ -502,6 +534,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         projected = projected_qkvgfab.split(split_sizes, dim=-1)
         mixed_qkv, g_proj_states, f_a, beta = projected[:4]
 
+        if self.shard_f_a:
+            f_a = tensor_model_parallel_all_gather(f_a, dim=-1)
         g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
