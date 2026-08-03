@@ -105,8 +105,11 @@ def test_dspark_markov_head_is_replicated(
 
 
 @pytest.mark.cpu_test
-def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
+def test_k3_dspark_shards_context_projection_and_uses_replicated_markov_head(
+    monkeypatch: pytest.MonkeyPatch,
+):
     markov_head_calls = []
+    context_proj_calls = []
 
     class DummyModule(nn.Module):
         def __init__(self, *args, **kwargs):
@@ -116,8 +119,12 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
         markov_head_calls.append((args, kwargs))
         return DummyModule()
 
+    def make_context_proj(*args, **kwargs):
+        context_proj_calls.append((args, kwargs))
+        return DummyModule()
+
     monkeypatch.setattr(dspark_mla, "get_draft_quant_config", lambda _: None)
-    monkeypatch.setattr(dspark_mla, "ReplicatedLinear", DummyModule)
+    monkeypatch.setattr(dspark_mla, "ColumnParallelLinear", make_context_proj)
     monkeypatch.setattr(dspark_mla, "RMSNorm", DummyModule)
     monkeypatch.setattr(dspark_mla, "K3DSparkDecoderLayer", DummyModule)
     monkeypatch.setattr(dspark_mla, "DSparkMarkovHead", make_markov_head)
@@ -142,6 +149,8 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     K3DSparkModel(vllm_config=vllm_config, start_layer_id=0, prefix="model")
 
     assert len(markov_head_calls) == 1
+    assert len(context_proj_calls) == 1
+    assert context_proj_calls[0][1]["gather_output"] is True
 
 
 @pytest.mark.cpu_test

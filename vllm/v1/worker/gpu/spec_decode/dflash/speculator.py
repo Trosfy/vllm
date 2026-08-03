@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     load_dflash_model,
     maybe_load_mask_embedding,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import _create_draft_vllm_config
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
@@ -158,11 +159,14 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
+        # Metadata must use the external draft's parallel geometry.  In
+        # particular, DFlash/DSpark defaults to a complete DCP1 draft cache
+        # even when the target cache is DCP-sharded.
+        draft_vllm_config = _create_draft_vllm_config(self.vllm_config)
         return replace(
-            self.vllm_config,
+            draft_vllm_config,
             attention_config=replace(
-                self.vllm_config.attention_config,
+                draft_vllm_config.attention_config,
                 use_non_causal=self.requires_non_causal,
             ),
         )

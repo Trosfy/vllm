@@ -8,6 +8,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    _create_draft_vllm_config,
     _should_share,
     get_target_lm_head,
 )
@@ -27,20 +28,19 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         # auto-selection may pick one that downgrades the spec-decode
         # cudagraph to PIECEWISE.
         backend = AttentionBackendEnum.FLASH_ATTN
+    # Build from the draft parallel/model config, not the target config.  In
+    # particular, an external DSpark draft is DCP1 by default even when the
+    # target uses DCP: every TP rank keeps the complete five-layer draft KV
+    # sequence while the target KV remains DCP-sharded.  Reusing the target
+    # VllmConfig here silently made the draft DCP8 as well and corrupted its
+    # context, collapsing first-token acceptance from ~75% to ~11%.
+    draft_vllm_config = _create_draft_vllm_config(vllm_config)
     draft_vllm_config = replace(
-        vllm_config,
+        draft_vllm_config,
         attention_config=replace(
-            vllm_config.attention_config,
+            draft_vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=backend,
-        ),
-        cache_config=(
-            replace(
-                vllm_config.cache_config,
-                cache_dtype=speculative_config.kv_cache_dtype,
-            )
-            if speculative_config.kv_cache_dtype is not None
-            else vllm_config.cache_config
         ),
     )
 

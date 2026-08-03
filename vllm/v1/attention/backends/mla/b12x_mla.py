@@ -13,6 +13,7 @@ import torch
 from vllm.compilation.b12x_capture import is_b12x_compile_only_warmup
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
@@ -66,10 +67,14 @@ def _page_table_width(max_cache_tokens: int, page_size: int) -> int:
     return width
 
 
-def _max_dcp_local_cache_tokens(vllm_config: VllmConfig) -> int:
+def _max_dcp_local_cache_tokens(
+    vllm_config: VllmConfig, *, dcp_size: int | None = None
+) -> int:
     """Return the largest token shard held by one decode-context rank."""
     parallel_config = vllm_config.parallel_config
-    dcp_size = int(parallel_config.decode_context_parallel_size)
+    dcp_size = int(
+        parallel_config.decode_context_parallel_size if dcp_size is None else dcp_size
+    )
     interleave = int(parallel_config.cp_kv_cache_interleave_size)
     max_model_len = int(vllm_config.model_config.max_model_len)
     partitions = dcp_size * interleave
@@ -127,6 +132,48 @@ def _kernel_query_heads(local_heads: int, dcp_size: int) -> int:
     )
 
 
+def _dcp_local_seq_lens_from_global(
+    output: torch.Tensor,
+    remainder_scratch: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave: int,
+) -> None:
+    """Convert global lengths to this rank's round-robin DCP lengths.
+
+    This is the allocation-free tensor equivalent of
+    ``prepare_dcp_local_seq_lens``.  DSpark target verification flattens one
+    causal query block into several independent decode rows, so every row
+    needs the local length corresponding to its own global token position.
+    """
+    if output.shape != global_seq_lens.shape or output.shape != remainder_scratch.shape:
+        raise ValueError(
+            "B12X_MLA DCP sequence-length buffers must have identical shapes, "
+            f"got output={output.shape}, scratch={remainder_scratch.shape}, "
+            f"global={global_seq_lens.shape}."
+        )
+    if output.dtype != torch.int32 or remainder_scratch.dtype != torch.int32:
+        raise TypeError("B12X_MLA DCP sequence-length buffers must use int32.")
+    if dcp_size <= 0 or not 0 <= dcp_rank < dcp_size or interleave <= 0:
+        raise ValueError(
+            "Invalid B12X_MLA DCP layout: "
+            f"size={dcp_size}, rank={dcp_rank}, interleave={interleave}."
+        )
+    if dcp_size == 1:
+        output.copy_(global_seq_lens)
+        return
+
+    virtual_block = dcp_size * interleave
+    torch.div(global_seq_lens, virtual_block, rounding_mode="floor", out=output)
+    output.mul_(interleave)
+    torch.remainder(global_seq_lens, virtual_block, out=remainder_scratch)
+    remainder_scratch.sub_(dcp_rank * interleave)
+    remainder_scratch.clamp_(min=0, max=interleave)
+    output.add_(remainder_scratch)
+
+
 def _create_dense_mla_plan(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -134,6 +181,7 @@ def _create_dense_mla_plan(
     page_size: int,
     num_q_heads: int,
     max_total_q: int | None = None,
+    dcp_size: int | None = None,
 ) -> Any:
     dense_mla = _load_dense_mla()
     max_total_q = int(
@@ -141,7 +189,7 @@ def _create_dense_mla_plan(
         if max_total_q is not None
         else vllm_config.scheduler_config.max_num_seqs
     )
-    max_cache_tokens = _max_dcp_local_cache_tokens(vllm_config)
+    max_cache_tokens = _max_dcp_local_cache_tokens(vllm_config, dcp_size=dcp_size)
     if max_total_q > _MAX_B12X_QUERY_ROWS:
         raise ValueError(
             "B12X_MLA supports at most "
@@ -210,11 +258,21 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             vllm_config,
             device,
             B12xMLAMetadata,
+            supports_dcp_with_varlen=True,
         )
+        try:
+            self._dcp_rank = int(get_dcp_group().rank_in_group)
+        except AssertionError:
+            # Unit tests may construct the builder before distributed init.
+            self._dcp_rank = 0
         if self.non_causal_multi_token_decode:
             # Mirror Triton MLA's DSpark policy. The speculative block has
             # 1 + num_speculative_tokens uniform query rows.
-            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+            self._init_reorder_batch_threshold(
+                1,
+                supports_spec_as_decode=True,
+                supports_dcp_with_varlen=True,
+            )
         max_dense_mla_rows = int(vllm_config.scheduler_config.max_num_seqs) * int(
             self.reorder_batch_threshold
         )
@@ -235,6 +293,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             page_size=self.page_size,
             num_q_heads=self._kernel_heads,
             max_total_q=self._max_dense_mla_rows,
+            dcp_size=self.dcp_world_size,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
         if len(self._workspace_specs) != 1:
@@ -266,6 +325,8 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         self._dense_mla_flat_seq_lens: torch.Tensor | None = None
         self._dense_mla_flat_query_start_loc: torch.Tensor | None = None
         self._dense_mla_causal_offsets: torch.Tensor | None = None
+        self._dense_mla_flat_global_seq_lens: torch.Tensor | None = None
+        self._dense_mla_flat_dcp_remainder: torch.Tensor | None = None
         if self.reorder_batch_threshold > 1:
             max_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
             self._dense_mla_flat_block_table = torch.zeros(
@@ -289,6 +350,15 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            if self.dcp_world_size > 1:
+                self._dense_mla_flat_global_seq_lens = torch.empty(
+                    self._max_dense_mla_rows,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self._dense_mla_flat_dcp_remainder = torch.empty_like(
+                    self._dense_mla_flat_global_seq_lens
+                )
         logger.info_once(
             "B12X dense K3 MLA plan: local_heads=%d, effective_heads=%d, "
             "kernel_heads=%d, "
@@ -300,7 +370,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             self._kernel_heads,
             self.page_size,
             self._max_dense_mla_rows,
-            _max_dcp_local_cache_tokens(vllm_config),
+            _max_dcp_local_cache_tokens(vllm_config, dcp_size=self.dcp_world_size),
             self._dense_mla_plan.num_splits,
             self._dense_mla_scratch.nbytes / (1 << 20),
         )
@@ -362,15 +432,44 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             )
             flat_lens = self._dense_mla_flat_seq_lens[:total_q]
             if metadata.causal:
-                # ``source_lens`` includes the complete verification block.
                 # Every flattened row may see the committed prefix and only
-                # the block tokens at or before its own position.
+                # the verification tokens at or before its own position.
                 assert self._dense_mla_causal_offsets is not None
-                torch.add(
-                    source_lens[:, None],
-                    self._dense_mla_causal_offsets[-query_len:],
-                    out=flat_lens.view(metadata.num_decodes, query_len),
-                )
+                if self.dcp_world_size > 1:
+                    # ``source_lens`` is already local under DCP, so it cannot
+                    # be decremented once per *global* verification token.
+                    # Build every row from the preserved global final length,
+                    # then map it through the same round-robin layout used by
+                    # the KV-cache slot mapper.
+                    global_source_lens = metadata.decode.dcp_tot_seq_lens
+                    if global_source_lens is None:
+                        raise RuntimeError(
+                            "B12X_MLA DSpark DCP verification requires global "
+                            "decode sequence lengths."
+                        )
+                    assert self._dense_mla_flat_global_seq_lens is not None
+                    assert self._dense_mla_flat_dcp_remainder is not None
+                    global_flat_lens = self._dense_mla_flat_global_seq_lens[:total_q]
+                    torch.add(
+                        global_source_lens[:, None],
+                        self._dense_mla_causal_offsets[-query_len:],
+                        out=global_flat_lens.view(metadata.num_decodes, query_len),
+                    )
+                    _dcp_local_seq_lens_from_global(
+                        flat_lens,
+                        self._dense_mla_flat_dcp_remainder[:total_q],
+                        global_flat_lens,
+                        dcp_size=self.dcp_world_size,
+                        dcp_rank=self._dcp_rank,
+                        interleave=self.cp_kv_cache_interleave_size,
+                    )
+                else:
+                    # ``source_lens`` includes the complete verification block.
+                    torch.add(
+                        source_lens[:, None],
+                        self._dense_mla_causal_offsets[-query_len:],
+                        out=flat_lens.view(metadata.num_decodes, query_len),
+                    )
             else:
                 flat_lens.copy_(
                     source_lens[:, None].expand(-1, query_len).reshape(total_q)
@@ -663,9 +762,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
         query_start_loc = attn_metadata.query_start_loc
-        flat_block_table = getattr(
-            attn_metadata, "dense_mla_flat_block_table", None
-        )
+        flat_block_table = getattr(attn_metadata, "dense_mla_flat_block_table", None)
         if flat_block_table is not None:
             block_table = flat_block_table
             seq_lens = getattr(attn_metadata, "dense_mla_flat_seq_lens", None)
@@ -689,8 +786,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
 
         dcp_group = None
         if self.dcp_world_size > 1:
-            from vllm.distributed.parallel_state import get_dcp_group
-
             dcp_group = get_dcp_group()
             q = dcp_b12x_all_gather_heads(
                 q,

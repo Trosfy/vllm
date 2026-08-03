@@ -1360,10 +1360,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_alpha=meta.swiglu_alpha,
                 swiglu_beta=meta.swiglu_beta,
             )
-            launch_tokens.setdefault(
-                _b12x_moe_warmup_plan_signature(launch_plan),
-                tokens,
-            )
+            # ModelOpt's small-M direct kernel specializes on the exact M,
+            # even when SparkInfer's high-level execution plan is otherwise
+            # identical. Keep every graph-visible M instead of collapsing the
+            # range to the first plan signature.
+            launch_tokens[
+                (*_b12x_moe_warmup_plan_signature(launch_plan), "direct_m", tokens)
+            ] = tokens
         for requested_tokens in sorted(set(int(count) for count in token_counts)):
             tokens = _dynamic_moe_warmup_tokens(
                 topk=meta.topk,
@@ -1588,6 +1591,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             # Exact graph-visible MoE kernels are compiled by
             # warmup_dynamic_launches. Do not launch them again while walking
             # the model solely to resolve attention bindings.
+            output.zero_()
+            return
+        if int(hidden_states.shape[0]) == 0:
+            # DCP can leave a rank with no local rows for a graph-visible
+            # global batch. There is no routed work to launch, and compiling
+            # an M=0 small-M specialization is both unnecessary and invalid.
             output.zero_()
             return
         if os.environ.get("VLLM_KIMI_DEBUG_FINITE") == "1":

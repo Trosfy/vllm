@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Full stock Kimi K3 MXFP4 plus the Inferact MLA-native DSpark-7 draft on
-# 16x RTX PRO 6000 Blackwell. This profile deliberately gives up the physical
-# 1M DCP8 cache: K3 DSpark currently requires DCP1 and adds five draft layers.
+# Full stock Kimi K3 MXFP4 plus the five-layer Inferact MLA-native DSpark
+# draft (seven-token speculative block) on 16x RTX PRO 6000 Blackwell.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,17 +22,35 @@ fi
 export PYTHONPATH="${SCRIPT_DIR}:${SPARKINFER_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 TP_SIZE="${TP_SIZE:-16}"
+DCP_SIZE="${DCP_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-500000000}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND:-B12X_MLA}"
-DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-probabilistic}"
+DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-greedy}"
 REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD:-block}"
+if (( DCP_SIZE > 1 )); then
+  DCP_COMM_BACKEND="${DCP_COMM_BACKEND:-a2a}"
+else
+  DCP_COMM_BACKEND="${DCP_COMM_BACKEND:-ag_rs}"
+fi
 
 if (( TP_SIZE != 16 )); then
   echo "This profile is validated only for TP_SIZE=16, got ${TP_SIZE}" >&2
+  exit 2
+fi
+if (( DCP_SIZE != 1 && DCP_SIZE != 8 )); then
+  echo "This profile is validated only for DCP_SIZE=1 or 8, got ${DCP_SIZE}" >&2
+  exit 2
+fi
+if (( TP_SIZE % DCP_SIZE != 0 )); then
+  echo "DCP_SIZE=${DCP_SIZE} must divide TP_SIZE=${TP_SIZE}" >&2
+  exit 2
+fi
+if (( DCP_SIZE > 1 )) && [[ "${DCP_COMM_BACKEND}" != "a2a" ]]; then
+  echo "DSpark DCP8 requires DCP_COMM_BACKEND=a2a" >&2
   exit 2
 fi
 if (( NUM_SPECULATIVE_TOKENS != 7 )); then
@@ -70,7 +87,7 @@ fi
 export MODEL="${MODEL:-/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970}"
 export DRAFT_MODEL="${DRAFT_MODEL:-/root/.cache/huggingface/hub/models--Inferact--Kimi-K3-DSpark/snapshots/cf6b8244620e7ea4b0651d214f28e89eac75bed6}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-HH-DSpark7}"
-export TP_SIZE MAX_MODEL_LEN MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
+export TP_SIZE DCP_SIZE MAX_MODEL_LEN MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.985}"
 
 if [[ ! -f "${MODEL}/model.safetensors.index.json" ]]; then
@@ -95,10 +112,24 @@ export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 # through a profile-specific override instead of inheriting the image value.
 export VLLM_PCIE_ALLREDUCE_BACKEND="${KIMI_DSPARK_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_SINGLE_CHANNEL="${KIMI_DSPARK_PCIE_ONESHOT_SINGLE_CHANNEL:-1}"
-export VLLM_USE_B12X_DCP_A2A=0
+if (( DCP_SIZE > 1 )); then
+  export VLLM_USE_B12X_DCP_A2A=1
+  # A single request produces at most eight MLA rows while verifying the
+  # trained seven-token block. Larger prefill batches fall back to NCCL and
+  # do not reserve oversized eager/graph PCIe staging slabs.
+  export VLLM_DCP_A2A_MAX_TOKENS="${VLLM_DCP_A2A_MAX_TOKENS:-8}"
+else
+  export VLLM_USE_B12X_DCP_A2A=0
+fi
+# Keep the external DSpark draft on its native DCP1 layout.  The target still
+# runs with DCP8, but the five draft layers keep a complete KV sequence on each
+# TP rank.  This is vLLM's intentional default for external drafts; forcing the
+# draft itself through DCP8 destroys acceptance because its cached context no
+# longer matches the target-derived hidden-state stream.
+export VLLM_DCP_SHARD_DRAFT="${VLLM_DCP_SHARD_DRAFT:-0}"
 
-# K3 has no sparse indexer. DSpark is MLA-native but currently DCP-incompatible,
-# so all GLM sparse/DCP policies remain disabled.
+# K3 has no sparse indexer. These GLM-specific sparse/DCP policies remain
+# disabled; dense target and draft MLA use the B12X DCP all-to-all path.
 export VLLM_DCP_INDEXER_SHARDS=0
 export VLLM_DCP_QUERY_SPLIT=0
 export VLLM_DCP_GLOBAL_TOPK=0
@@ -188,7 +219,9 @@ printf -v SPECULATIVE_CONFIG \
 exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --language-model-only \
   --attention-backend B12X_MLA \
-  --decode-context-parallel-size 1 \
+  --decode-context-parallel-size "${DCP_SIZE}" \
+  --dcp-comm-backend "${DCP_COMM_BACKEND}" \
+  --dcp-kv-cache-interleave-size 1 \
   --kda-prefill-backend "${KDA_PREFILL_BACKEND}" \
   --kv-cache-dtype fp8 \
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" \

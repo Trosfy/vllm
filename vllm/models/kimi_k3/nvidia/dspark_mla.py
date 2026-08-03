@@ -12,7 +12,7 @@ import vllm._custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import (
@@ -140,10 +140,15 @@ class K3DSparkModel(nn.Module):
         # The frozen target embedding is aliased after the draft checkpoint loads.
         self.embed_tokens: nn.Module | None = None
 
-        self.context_proj = ReplicatedLinear(
+        # The concatenated target auxiliaries are identical on every TP rank.
+        # Shard the 490 MiB BF16 output rows and gather only the small activation
+        # (seven rows at bs=1) instead of storing and evaluating the complete
+        # matrix redundantly on all 16 GPUs.
+        self.context_proj = ColumnParallelLinear(
             self.config.target_hidden_size * self.config.num_target_layers,
             self.config.hidden_size,
             bias=False,
+            gather_output=True,
             return_bias=False,
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "context_proj"),
