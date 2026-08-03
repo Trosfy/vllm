@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import vllm._custom_ops as ops
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -21,7 +22,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops import fused_allreduce_rms_norm
-from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.models.kimi_k3.nvidia.mla import (
+    KimiShardedMergedColumnParallelLinear,
+    MultiHeadLatentAttention,
+)
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
 
@@ -97,6 +101,27 @@ class K3DSparkDecoderLayer(nn.Module):
         # the model's final_norm).
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+
+def _restore_layer_major_kv_order(
+    rank_major: torch.Tensor,
+    *,
+    num_layers: int,
+    local_kv_width: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert ``[rank0(layers), rank1(layers), ...]`` to layer-major KV."""
+    expected_width = tp_size * num_layers * local_kv_width
+    if int(rank_major.shape[-1]) != expected_width:
+        raise ValueError(
+            "Unexpected gathered DSpark context-KV width: "
+            f"got {rank_major.shape[-1]}, expected {expected_width}."
+        )
+    return (
+        rank_major.unflatten(-1, (tp_size, num_layers, local_kv_width))
+        .transpose(-3, -2)
+        .flatten(-3)
+    )
 
 
 class K3DSparkModel(nn.Module):
@@ -235,6 +260,34 @@ class K3DSparkModel(nn.Module):
         attn0 = attentions[0]
         assert attn0.q_lora_rank is not None
         kv_width = attn0.kv_lora_rank + attn0.qk_rope_head_dim
+        sharded = all(
+            isinstance(
+                attn.fused_qkv_a_proj,
+                KimiShardedMergedColumnParallelLinear,
+            )
+            for attn in attentions
+        )
+        if sharded:
+            tp_size = int(attn0.fused_qkv_a_proj.tp_size)
+            if attn0.q_lora_rank % tp_size or kv_width % tp_size:
+                self._context_kv_fusion_available = False
+                return
+            q_weight_offset = attn0.q_lora_rank // tp_size
+            stored_kv_width = kv_width // tp_size
+        else:
+            # A mixed replicated/sharded layer set has no single gather policy.
+            if any(
+                isinstance(
+                    attn.fused_qkv_a_proj,
+                    KimiShardedMergedColumnParallelLinear,
+                )
+                for attn in attentions
+            ):
+                self._context_kv_fusion_available = False
+                return
+            tp_size = 1
+            q_weight_offset = attn0.q_lora_rank
+            stored_kv_width = kv_width
         kv_weights = []
         for attn in attentions:
             assert attn.q_lora_rank is not None
@@ -245,16 +298,19 @@ class K3DSparkModel(nn.Module):
                 and attn.kv_a_layernorm.variance_epsilon
                 == attn0.kv_a_layernorm.variance_epsilon
             ), "All MLA DSpark layers must share their latent KV geometry."
-            kv_weights.append(
-                attn.fused_qkv_a_proj.weight.detach().narrow(
-                    0, attn.q_lora_rank, kv_width
-                )
-            )
+            weight = attn.fused_qkv_a_proj.weight.detach()
+            if int(weight.shape[0]) < q_weight_offset + stored_kv_width:
+                self._context_kv_fusion_available = False
+                return
+            kv_weights.append(weight.narrow(0, q_weight_offset, stored_kv_width))
 
-        # [L * (kv_lora_rank + rope_dim), hidden_size]. The underlying fused
-        # A weights are replicated (`disable_tp=True`), so this is valid on
-        # every TP rank without communication.
+        # Replicated layout: [L * kv_width, hidden]. Sharded layout keeps only
+        # [L * (kv_width / TP), hidden] and restores layer-major ordering with
+        # one all-gather after the fused local GEMM.
         self._fused_context_kv_weight = torch.cat(kv_weights, dim=0)
+        self._context_kv_sharded = sharded
+        self._context_kv_tp_size = tp_size
+        self._context_kv_stored_width = stored_kv_width
         self._context_kv_norm_weights = torch.stack(
             [attn.kv_a_layernorm.weight.detach() for attn in attentions], dim=0
         ).contiguous()
@@ -282,6 +338,13 @@ class K3DSparkModel(nn.Module):
         # One KV-only GEMM replaces five full Q+KV GEMMs. For K3 this projects
         # 5*576 rows rather than 5*2112 rows (72.7% fewer A-projection FLOPs).
         all_kv = F.linear(context_states, self._fused_context_kv_weight)
+        if self._context_kv_sharded:
+            all_kv = _restore_layer_major_kv_order(
+                tensor_model_parallel_all_gather(all_kv),
+                num_layers=num_layers,
+                local_kv_width=self._context_kv_stored_width,
+                tp_size=self._context_kv_tp_size,
+            )
         all_kv = all_kv.view(num_ctx, num_layers, self._context_kv_width)
         all_kv_c = all_kv[..., : self._context_kv_lora_rank]
         all_k_pe = all_kv[..., self._context_kv_lora_rank :]
