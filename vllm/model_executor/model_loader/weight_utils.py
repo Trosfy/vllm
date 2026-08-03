@@ -1219,6 +1219,7 @@ def instanttensor_weights_iterator(
     weight_name_prefixes: Sequence[str] | None = None,
     *,
     indexed_tensor_files: dict[str, str] | None = None,
+    owning_tensors: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using instanttensor library.
@@ -1275,11 +1276,13 @@ def instanttensor_weights_iterator(
         device=device,
         process_group=process_group,
         load_now=not restrict_before_io,
-        # Model weight loaders consume and copy every yielded tensor before
-        # requesting the next one. A second owning clone here only doubles
-        # device traffic and transient memory. Our InstantTensor build records
-        # a consumer-stream event before reusing its ring-buffer storage.
-        copy=False,
+        # Ordinary model weight loaders consume and copy every yielded tensor
+        # before requesting the next one, so the zero-copy path is preferable.
+        # Online quantization is different: its layerwise loader may retain a
+        # yielded tensor until the remaining shards for that layer arrive.  In
+        # that case request owning tensors so InstantTensor can safely recycle
+        # its ring-buffer storage while the deferred repack is pending.
+        copy=owning_tensors,
     )
     cpu_fallback_weights: list[tuple[str, str]] = []
     if restrict_before_io:

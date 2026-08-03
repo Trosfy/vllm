@@ -104,5 +104,36 @@ def test_instanttensor_falls_back_for_tensor_larger_than_ring(
     torch.testing.assert_close(weights["model.large"], large)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="InstantTensor requires NVIDIA GPUs",
+)
+def test_instanttensor_owning_tensors_survive_ring_reuse(tmp_path, monkeypatch):
+    shard = tmp_path / "model.safetensors"
+    # Five 4 MiB tensors force an 8 MiB ring to wrap more than once.  Keep the
+    # yielded CUDA tensors alive, exactly as online layerwise quantization does
+    # while waiting for a layer's remaining checkpoint shards.
+    source = {
+        f"model.weight_{index}": torch.full(
+            (2 * 1024 * 1024,), index, dtype=torch.bfloat16
+        )
+        for index in range(5)
+    }
+    save_file(source, shard)
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(8 * 1024 * 1024))
+
+    retained = dict(
+        instanttensor_weights_iterator(
+            [str(shard)],
+            use_tqdm_on_load=False,
+            owning_tensors=True,
+        )
+    )
+    torch.cuda.synchronize()
+
+    for name, expected in source.items():
+        torch.testing.assert_close(retained[name].cpu(), expected)
+
+
 if __name__ == "__main__":
     test_instanttensor_model_loader()
