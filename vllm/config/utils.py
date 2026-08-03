@@ -121,8 +121,15 @@ def replace(dataclass_instance: ConfigT, /, **kwargs) -> ConfigT:
     but compatible with Pydantic dataclasses which use `pydantic.fields.Field` instead
     of `dataclasses.field`"""
     cls = type(dataclass_instance)
-    dataclass_dict = dataclass_instance.__dict__
-    dataclass_dict = {k: v for k, v in dataclass_dict.items() if is_init_field(cls, k)}
+    # Match dataclasses.replace semantics: copy declared init fields only.
+    # Configs may cache derived/runtime attributes in __dict__ (for example,
+    # ModelConfig.model_arch_config); asking get_field() about those dynamic
+    # names raises before the requested replacement can be applied.
+    dataclass_dict = {
+        named_field.name: getattr(dataclass_instance, named_field.name)
+        for named_field in fields(cls)
+        if is_init_field(cls, named_field.name)
+    }
     dataclass_dict.update(kwargs)
     return cls(**dataclass_dict)
 

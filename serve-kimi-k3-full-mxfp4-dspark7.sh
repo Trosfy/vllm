@@ -200,7 +200,7 @@ import os
 from pathlib import Path
 
 from sparkinfer.attention import dense_mla
-from vllm.config import LoadConfig, ModelConfig
+from vllm.config import LoadConfig, ModelConfig, replace
 from vllm.config.quantization import resolve_quantization_config
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
@@ -288,6 +288,13 @@ if os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8":
             "draft MXFP8 resolved to "
             f"{type(draft_quant_config).__name__}, expected OnlineQuantizationConfig"
         )
+    draft_window = int(os.environ["VLLM_DSPARK_DRAFT_KV_WINDOW"])
+    if draft_window:
+        bounded_draft_config = replace(
+            draft_model_config,
+            max_model_len=draft_window + 768 - 1,
+        )
+        assert bounded_draft_config.max_model_len == draft_window + 768 - 1
     print(f"K3 DSpark MXFP8 kernel preflight: {selected}", flush=True)
 PY
 

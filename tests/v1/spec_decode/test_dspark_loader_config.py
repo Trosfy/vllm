@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -95,9 +96,55 @@ def test_dspark_metadata_builders_use_draft_parallel_config(monkeypatch) -> None
     speculator = object.__new__(dflash_speculator.DFlashSpeculator)
     speculator.vllm_config = target_config
     speculator.requires_non_causal = True
+    speculator.draft_kv_window = None
+    speculator.draft_kv_window_block_size = None
 
     attn_config = speculator.attn_vllm_config
 
     assert attn_config.parallel_config.decode_context_parallel_size == 1
     assert attn_config.attention_config.backend == AttentionBackendEnum.B12X_MLA
+    assert attn_config.attention_config.use_non_causal is True
+
+
+def test_dspark_bounded_metadata_caps_only_draft_attention_plan(monkeypatch) -> None:
+    """The bounded plan must copy a ModelConfig with cached runtime fields."""
+
+    @dataclass
+    class DraftModelConfig:
+        max_model_len: int
+
+    @dataclass
+    class DraftAttentionConfig:
+        use_non_causal: bool
+
+    @dataclass
+    class DraftConfig:
+        model_config: DraftModelConfig
+        attention_config: DraftAttentionConfig
+
+    original_model_config = DraftModelConfig(max_model_len=1_048_576)
+    # Mirrors ModelConfig's derived cache that is deliberately not a declared
+    # dataclass field and triggered the production startup regression.
+    original_model_config.model_arch_config = object()
+    draft_config = DraftConfig(
+        model_config=original_model_config,
+        attention_config=DraftAttentionConfig(use_non_causal=False),
+    )
+    target_config = object()
+    monkeypatch.setattr(
+        dflash_speculator,
+        "_create_draft_vllm_config",
+        lambda config: draft_config if config is target_config else None,
+    )
+
+    speculator = object.__new__(dflash_speculator.DFlashSpeculator)
+    speculator.vllm_config = target_config
+    speculator.requires_non_causal = True
+    speculator.draft_kv_window = 65_536
+    speculator.draft_kv_window_block_size = 768
+
+    attn_config = speculator.attn_vllm_config
+
+    assert original_model_config.max_model_len == 1_048_576
+    assert attn_config.model_config.max_model_len == 65_536 + 768 - 1
     assert attn_config.attention_config.use_non_causal is True
