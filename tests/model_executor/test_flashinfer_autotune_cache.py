@@ -6,6 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.model_executor.warmup import flashinfer_autotune_cache, kernel_warmup
@@ -133,7 +134,10 @@ def _patch_flashinfer_autotune_deps(monkeypatch):
     return calls
 
 
-def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
+@pytest.mark.parametrize(("draft_dcp", "expected_warmups"), [(1, 1), (2, 2)])
+def test_b12x_dcp_warmup_uses_each_module_dcp_geometry(
+    monkeypatch, draft_dcp: int, expected_warmups: int
+) -> None:
     from vllm.distributed import parallel_state
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm.v1.attention.ops import dcp_alltoall
@@ -149,22 +153,42 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
     attention.num_heads = 16
     attention.kv_lora_rank = 512
     attention.qk_rope_head_dim = 64
+    attention.impl = SimpleNamespace(dcp_world_size=2)
+
+    draft_attention = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(draft_attention)
+    draft_attention.register_parameter(
+        "device_probe",
+        torch.nn.Parameter(torch.empty(1)),
+    )
+    draft_attention.dcp_b12x = True
+    draft_attention.num_heads = 8
+    draft_attention.kv_lora_rank = 512
+    draft_attention.qk_rope_head_dim = 64
+    draft_attention.impl = SimpleNamespace(dcp_world_size=draft_dcp)
 
     model = torch.nn.Module()
     model.add_module("attention", attention)
+    draft_model = torch.nn.Module()
+    draft_model.add_module("attention", draft_attention)
     compilation_config = SimpleNamespace(
         static_forward_context={"model.layers.0.attn": attention}
     )
     worker = SimpleNamespace(
         get_model=lambda: model,
         use_v2_model_runner=True,
-        model_runner=SimpleNamespace(is_pooling_model=True),
+        model_runner=SimpleNamespace(
+            is_pooling_model=True,
+            speculator=SimpleNamespace(model=draft_model),
+        ),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(
                 decode_context_parallel_size=2,
-                dcp_comm_backend="a2a",
+                # The explicit B12X path also accelerates query all-gather
+                # when the output reduction uses the AG+RS fallback.
+                dcp_comm_backend="ag_rs",
             ),
             compilation_config=compilation_config,
             model_config=SimpleNamespace(),
@@ -179,8 +203,8 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
-    assert kernel_warmup._warmup_b12x_dcp_a2a(worker) == 1
-    assert calls == [
+    assert kernel_warmup._warmup_b12x_dcp_a2a(worker) == expected_warmups
+    expected_calls = [
         (
             (group,),
             {
@@ -193,6 +217,21 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
             },
         )
     ]
+    if draft_dcp > 1:
+        expected_calls.append(
+            (
+                (group,),
+                {
+                    "device": torch.device("cpu"),
+                    "dtype": torch.bfloat16,
+                    "max_batch_size": 4096,
+                    "total_heads": 16,
+                    "head_dim": 512,
+                    "query_head_dim": 576,
+                },
+            )
+        )
+    assert calls == expected_calls
 
 
 def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
@@ -326,6 +365,7 @@ def test_kernel_warmup_runs_b12x_moe_warmup(monkeypatch) -> None:
             {
                 "max_tokens": 4096,
                 "token_counts": [2048, 1, 2, 4, 8, 17, 4096, 3072],
+                "direct_token_counts": range(1, 9),
             },
         )
     ]

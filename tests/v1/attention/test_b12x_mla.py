@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.compilation.b12x_capture import b12x_compile_only_warmup
@@ -292,6 +293,7 @@ def test_b12x_mla_builder_flattens_causal_target_verify_block(monkeypatch) -> No
     builder._dense_mla_flat_seq_lens = torch.empty(8, dtype=torch.int32)
     builder._dense_mla_flat_query_start_loc = torch.arange(9, dtype=torch.int32)
     builder._dense_mla_causal_offsets = torch.arange(-7, 1, dtype=torch.int32)
+    builder.dcp_world_size = 1
 
     source_table = torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
     metadata = SimpleNamespace(
@@ -324,6 +326,90 @@ def test_b12x_mla_builder_flattens_causal_target_verify_block(monkeypatch) -> No
     torch.testing.assert_close(
         result.dense_mla_flat_query_start_loc,
         torch.arange(9, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("dcp_rank", range(8))
+@pytest.mark.parametrize("interleave", [1, 4])
+def test_dcp_local_seq_lens_from_global_matches_round_robin_layout(
+    dcp_rank: int,
+    interleave: int,
+) -> None:
+    global_lens = torch.arange(1, 130, dtype=torch.int32)
+    output = torch.empty_like(global_lens)
+    scratch = torch.empty_like(global_lens)
+
+    b12x_mla._dcp_local_seq_lens_from_global(
+        output,
+        scratch,
+        global_lens,
+        dcp_size=8,
+        dcp_rank=dcp_rank,
+        interleave=interleave,
+    )
+
+    expected = []
+    for length in global_lens.tolist():
+        rounds, remainder = divmod(length, 8 * interleave)
+        rank_remainder = min(max(remainder - dcp_rank * interleave, 0), interleave)
+        expected.append(rounds * interleave + rank_remainder)
+    torch.testing.assert_close(output, torch.tensor(expected, dtype=torch.int32))
+
+
+@pytest.mark.parametrize("dcp_rank", range(8))
+def test_b12x_mla_builder_flattens_causal_dspark_block_for_dcp8(
+    monkeypatch,
+    dcp_rank: int,
+) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 8
+    builder._dense_mla_flat_block_table = torch.zeros(8, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(9, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-7, 1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_dcp_remainder = torch.empty(8, dtype=torch.int32)
+    builder.dcp_world_size = 8
+    builder._dcp_rank = dcp_rank
+    builder.cp_kv_cache_interleave_size = 1
+
+    source_table = torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
+    final_global_len = 32
+    final_local_len = final_global_len // 8
+    metadata = SimpleNamespace(
+        causal=True,
+        num_decodes=1,
+        num_decode_tokens=8,
+        decode=SimpleNamespace(
+            block_table=source_table,
+            seq_lens=torch.tensor([final_local_len], dtype=torch.int32),
+            dcp_tot_seq_lens=torch.tensor([final_global_len], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    global_rows = range(25, 33)
+    expected = torch.tensor(
+        [
+            sum(1 for position in range(length) if position % 8 == dcp_rank)
+            for length in global_rows
+        ],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(result.dense_mla_flat_seq_lens, expected)
+    torch.testing.assert_close(
+        result.dense_mla_flat_block_table,
+        source_table.expand(8, -1),
     )
 
 
@@ -430,7 +516,7 @@ def test_b12x_mla_adapter_gathers_and_reduces_dcp_heads(monkeypatch) -> None:
     impl._effective_heads = 48
     impl._kernel_heads = 48
     group = SimpleNamespace(world_size=8)
-    monkeypatch.setattr("vllm.distributed.parallel_state.get_dcp_group", lambda: group)
+    monkeypatch.setattr(b12x_mla, "get_dcp_group", lambda: group)
 
     gather_calls = []
 
@@ -483,6 +569,7 @@ def test_max_dcp_local_cache_tokens_respects_interleave() -> None:
         ),
     )
     assert b12x_mla._max_dcp_local_cache_tokens(config) == 131_072
+    assert b12x_mla._max_dcp_local_cache_tokens(config, dcp_size=1) == 1_048_576
 
     config.model_config.max_model_len = 1_048_577
     config.parallel_config.cp_kv_cache_interleave_size = 4

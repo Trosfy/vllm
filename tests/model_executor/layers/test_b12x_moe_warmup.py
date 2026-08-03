@@ -470,6 +470,45 @@ def test_b12x_moe_warmup_preserves_exact_graph_decode_shape(monkeypatch) -> None
     assert run_tokens == [1, 16]
 
 
+def test_b12x_moe_warmup_preserves_every_direct_m_specialization(
+    monkeypatch,
+) -> None:
+    run_tokens = []
+
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_execution",
+        lambda **kwargs: _FakePlan("same-small-m-plan").launch_plan,
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_fp4_scratch",
+        lambda **kwargs: _FakePlan(),
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_run_b12x_moe_fp4",
+        lambda **kwargs: run_tokens.append(kwargs["a"].shape[0]),
+    )
+
+    experts = _make_fake_b12x_experts()
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(8, 32, 32, dtype=torch.uint8),
+        w2_weight=torch.empty(8, 64, 8, dtype=torch.uint8),
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        apply_router_weight_on_input=False,
+    )
+
+    warmed = experts.warmup_dynamic_launches(
+        layer,
+        token_counts=(),
+        direct_token_counts=(1, 2, 3, 4, 5, 6, 7, 8),
+    )
+
+    assert warmed == 8
+    assert run_tokens == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
 def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
 

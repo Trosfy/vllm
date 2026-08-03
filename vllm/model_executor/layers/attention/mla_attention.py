@@ -1344,9 +1344,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q_pe = mqa_pe_padded
 
             fused_mqa_q = (
-                None
-                if qrep_decode
-                else self._try_fused_mla_query(mqa_q_nope, mqa_q_pe)
+                None if qrep_decode else self._try_fused_mla_query(mqa_q_nope, mqa_q_pe)
             )
 
             if fused_mqa_q is not None:
@@ -1377,9 +1375,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 if getattr(self, "_use_b12x_absorb_bmm", False):
                     L = self.kv_lora_rank
                 else:
-                    W_UK_T = (
-                        self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
-                    )
+                    W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
                     assert W_UK_T is not None
                     _, _, L = W_UK_T.shape
 
@@ -1472,8 +1468,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     or num_mqa_tokens <= self.dcp_a2a_max_tokens
                 )
                 dcp_use_b12x = self.dcp_b12x and dcp_small_batch and not qrep_decode
-                dcp_use_a2a = self.dcp_a2a and not qrep_decode and (
-                    dcp_small_batch or self.dcp_a2a_large_backend != "ag_rs"
+                dcp_use_a2a = (
+                    self.dcp_a2a
+                    and not qrep_decode
+                    and (dcp_small_batch or self.dcp_a2a_large_backend != "ag_rs")
                 )
                 # The project-before path currently targets eager AG/RS
                 # prefill. A2A retains its established merge-then-project path.
@@ -2944,11 +2942,17 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             vllm_config, self.model_config.dtype
         )
 
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
+        # Metadata builders can be initialized with a model-specific config:
+        # an external MLA draft normally uses DCP1 even when its target runs
+        # with DCP.  Reading the process-wide group here silently applies the
+        # target geometry to the draft.  The config is the source of truth for
+        # this builder; dcp_replicated additionally collapses a cache group to
+        # one effective shard when it shares the target config.
+        self.dcp_world_size = (
+            1
+            if getattr(kv_cache_spec, "dcp_replicated", False)
+            else int(parallel_config.decode_context_parallel_size)
+        )
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
