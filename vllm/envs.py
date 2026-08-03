@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
     VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
     VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
+    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 64 * 1024
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
@@ -1167,6 +1168,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 os.getenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", "0"),
             )
         )
+    ),
+    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", str(64 * 1024))
     ),
     # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
     # with more tokens than this bypass the one-shot A2A/B12X path, which is

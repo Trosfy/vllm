@@ -2834,6 +2834,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
+        workspace_limit = envs.VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE
+        if workspace_limit <= 0:
+            raise ValueError(
+                "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE must be positive, "
+                f"got {workspace_limit}"
+            )
 
         chunked_prefill_workspace_size = min(
             # Try for 8 full length request or at least 4 pages per-request
@@ -2841,15 +2847,15 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 8 * model_config.max_model_len,
                 4 * scheduler_config.max_num_seqs * cache_config.block_size,
             ),
-            # For long-context models try not to over-allocate limiting
-            # kv-cache space, limiting it to 64k tokens,
+            # For long-context models avoid over-allocating KV-cache space by
+            # applying the configured workspace limit (64k tokens by default),
             # which would result in the workspace being:
             #   2*(576)*(64*1024) = 144mb
             # (assuming 576 MLA head dim, and fp16)
             # which would result in up-projected context being
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
+            workspace_limit,
         )
 
         # Enforce that we enough for at least 1 page per request

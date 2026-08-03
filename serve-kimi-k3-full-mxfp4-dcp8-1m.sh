@@ -127,6 +127,10 @@ export VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE="${VLLM_B12X_MLA_DCP_GATHER_IN_WORK
 export VLLM_MEMORY_PROFILE_INCLUDE_ATTN="${KIMI_MEMORY_PROFILE_INCLUDE_ATTN:-0}"
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${KIMI_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
 
+# Bound context-gather and expanded Q/K/V transients while retaining the full
+# physical 1M cache. Long contexts are merged from additional exact chunks.
+export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE:-32768}"
+
 # The 24 dense MLA q_a/kv_a projections are BF16 in the checkpoint. Shard
 # their output rows across TP16 and gather the 2112-element latent result,
 # saving about 0.63 GiB/rank without changing checkpoint precision.
