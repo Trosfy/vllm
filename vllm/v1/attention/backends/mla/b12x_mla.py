@@ -419,14 +419,15 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             assert self._dense_mla_flat_seq_lens is not None
             assert self._dense_mla_flat_query_start_loc is not None
             flat_table = self._dense_mla_flat_block_table[:total_q]
-            source_width = int(source_table.shape[1])
-            if source_width > int(flat_table.shape[1]):
-                raise ValueError(
-                    "B12X_MLA DSpark block table exceeds planned width: "
-                    f"actual={source_width}, planned={flat_table.shape[1]}."
-                )
+            # A bounded DSpark cache keeps a position-indexed worker table for
+            # the target's complete context, but compacts its resident tail to
+            # the beginning before this builder runs. Copy only the page-table
+            # prefix the bounded dense-MLA plan can consume. cache_seqlens is
+            # shortened by the same compaction, so entries beyond this prefix
+            # are unreachable.
+            source_width = min(int(source_table.shape[1]), int(flat_table.shape[1]))
             flat_table[:, :source_width].copy_(
-                source_table[:, None, :]
+                source_table[:, None, :source_width]
                 .expand(-1, query_len, -1)
                 .reshape(total_q, source_width)
             )

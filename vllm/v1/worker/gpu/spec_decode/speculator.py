@@ -311,7 +311,7 @@ class DraftModelSpeculator(BaseSpeculator):
             step,
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
-        draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
+        draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.draft_max_seq_len)
         if max_seq_len_upper_bound is None:
             max_seq_len_upper_bound = (
                 int(draft_seq_lens_cpu_upper_bound[:num_reqs].max().item())

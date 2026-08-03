@@ -742,6 +742,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     compress_ratio: int = 1
     model_version: str | None = None
     dcp_sharded: bool = False
+    # DSpark flattens its non-causal query block into independent decode rows.
+    # Keep this execution marker when its MLA cache is window-bounded.
+    non_causal_multi_token_decode: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -834,6 +837,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
             dcp_sharded=dcp_sharded_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
     def is_uniform_with_collection(

@@ -329,6 +329,53 @@ def test_b12x_mla_builder_flattens_causal_target_verify_block(monkeypatch) -> No
     )
 
 
+def test_b12x_mla_builder_truncates_position_indexed_bounded_draft_table(
+    monkeypatch,
+) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 8
+    builder._dense_mla_flat_block_table = torch.zeros(8, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(9, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-7, 1, dtype=torch.int32)
+    builder.dcp_world_size = 1
+
+    # The worker table remains addressable by absolute positions, while the
+    # bounded draft tail has already been shifted into its first four entries.
+    source_table = torch.tensor(
+        [[31, 32, 33, 34, 900, 901, 902, 903]], dtype=torch.int32
+    )
+    metadata = SimpleNamespace(
+        causal=False,
+        num_decodes=1,
+        num_decode_tokens=8,
+        decode=SimpleNamespace(
+            block_table=source_table,
+            seq_lens=torch.tensor([49], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    torch.testing.assert_close(
+        result.dense_mla_flat_block_table,
+        source_table[:, :4].expand(8, -1),
+    )
+    torch.testing.assert_close(
+        result.dense_mla_flat_seq_lens,
+        torch.full((8,), 49, dtype=torch.int32),
+    )
+
+
 @pytest.mark.parametrize("dcp_rank", range(8))
 @pytest.mark.parametrize("interleave", [1, 4])
 def test_dcp_local_seq_lens_from_global_matches_round_robin_layout(

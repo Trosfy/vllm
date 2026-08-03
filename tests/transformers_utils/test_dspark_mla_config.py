@@ -6,6 +6,7 @@ import json
 import pytest
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -141,6 +142,38 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]
     assert speculative_config.draft_model_config.hf_config.model_type == "k3_dspark"
     assert speculative_config.draft_model_config.use_mla
+
+
+def test_dspark_mla_accepts_draft_online_quantization(tmp_path):
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_target_config(target_path)
+    _write_dspark_config(draft_path)
+    target_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
+    )
+
+    speculative_config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=7,
+        quantization="mxfp8",
+        quantization_config={
+            "linear": "mxfp8",
+            "ignore": ["re:.*fused_qkv_a_proj$", "model.markov_head.markov_w2"],
+        },
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    draft = speculative_config.draft_model_config
+    assert draft.quantization == "mxfp8"
+    assert isinstance(draft.quantization_config, QuantizationConfigArgs)
+    assert draft.quantization_config.linear == QuantSpec(weight="mxfp8")
+    assert draft.quantization_config.ignore == [
+        "re:.*fused_qkv_a_proj$",
+        "model.markov_head.markov_w2",
+    ]
 
 
 def test_dspark_mla_dcp_requires_b12x_backend(tmp_path):

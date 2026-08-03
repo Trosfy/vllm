@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import SpeculativeConfig
@@ -15,6 +16,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    _bounded_draft_kv_shift,
+)
 
 
 class _FakeBuilder:
@@ -55,6 +59,27 @@ def _make_cad(block_table, slot_mapping) -> CommonAttentionMetadata:
         slot_mapping=slot_mapping,
         causal=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "block_size", "window", "expected"),
+    [
+        (31, 16, 32, (0, 31)),
+        (32, 16, 32, (0, 32)),
+        (33, 16, 32, (0, 33)),
+        (48, 16, 32, (1, 32)),
+        (65, 16, 32, (2, 33)),
+        (1_000_007, 768, 65_536, (1216, 66_119)),
+        (1_000_007, 768, 0, (0, 1_000_007)),
+    ],
+)
+def test_bounded_draft_kv_shift_keeps_one_partial_leading_page(
+    seq_len: int,
+    block_size: int,
+    window: int,
+    expected: tuple[int, int],
+) -> None:
+    assert _bounded_draft_kv_shift(seq_len, block_size, window) == expected
 
 
 def test_dflash_speculators_preserves_swa_config():

@@ -27,6 +27,9 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-500000000}"
+DSPARK_DRAFT_KV_WINDOW="${DSPARK_DRAFT_KV_WINDOW:-0}"
+DSPARK_DRAFT_WEIGHT_FORMAT="${DSPARK_DRAFT_WEIGHT_FORMAT:-bf16}"
+DSPARK_DRAFT_MXFP8_BACKEND="${DSPARK_DRAFT_MXFP8_BACKEND:-marlin}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND:-B12X_MLA}"
 DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-greedy}"
@@ -79,6 +82,24 @@ if [[ ! "${KV_CACHE_MEMORY_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
   echo "KV_CACHE_MEMORY_BYTES must be a positive integer" >&2
   exit 2
 fi
+if [[ ! "${DSPARK_DRAFT_KV_WINDOW}" =~ ^[0-9]+$ ]]; then
+  echo "DSPARK_DRAFT_KV_WINDOW must be a non-negative integer" >&2
+  exit 2
+fi
+case "${DSPARK_DRAFT_WEIGHT_FORMAT}" in
+  bf16 | mxfp8) ;;
+  *)
+    echo "DSPARK_DRAFT_WEIGHT_FORMAT must be bf16 or mxfp8" >&2
+    exit 2
+    ;;
+esac
+case "${DSPARK_DRAFT_MXFP8_BACKEND}" in
+  auto | marlin) ;;
+  *)
+    echo "DSPARK_DRAFT_MXFP8_BACKEND must be auto or marlin" >&2
+    exit 2
+    ;;
+esac
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${PYTHON_BIN}" >&2
   exit 1
@@ -127,6 +148,26 @@ fi
 # draft itself through DCP8 destroys acceptance because its cached context no
 # longer matches the target-derived hidden-state stream.
 export VLLM_DCP_SHARD_DRAFT="${VLLM_DCP_SHARD_DRAFT:-0}"
+export VLLM_DSPARK_DRAFT_KV_WINDOW="${VLLM_DSPARK_DRAFT_KV_WINDOW:-${DSPARK_DRAFT_KV_WINDOW}}"
+
+# At DSpark's fixed eight-row forward, FlashInfer's dynamic W8A8 MXFP8 path
+# measures 7-14x slower than BF16 because every small projection requantizes
+# its activation. Marlin consumes the same block-32 MXFP8 weights as W8A16;
+# our shape harness measures only ~2x per GEMM, or roughly 0.3 ms for the
+# complete five-layer draft. Disable only MXFP8 alternatives, leaving the
+# target model's MXFP4/BF16 kernel selection untouched.
+if [[ "${DSPARK_DRAFT_WEIGHT_FORMAT}" == mxfp8 && "${DSPARK_DRAFT_MXFP8_BACKEND}" == marlin ]]; then
+  for kernel in \
+    B12xMxfp8LinearKernel \
+    FlashInferCutedslMxfp8LinearKernel \
+    FlashInferCutlassMxfp8LinearKernel; do
+    case ",${VLLM_DISABLED_KERNELS:-}," in
+      *,"${kernel}",*) ;;
+      *) VLLM_DISABLED_KERNELS="${VLLM_DISABLED_KERNELS:+${VLLM_DISABLED_KERNELS},}${kernel}" ;;
+    esac
+  done
+  export VLLM_DISABLED_KERNELS
+fi
 
 # K3 has no sparse indexer. These GLM-specific sparse/DCP policies remain
 # disabled; dense target and draft MLA use the B12X DCP all-to-all path.
@@ -152,7 +193,7 @@ fi
 
 # Fail before loading 1.4 TiB of target weights if either the draft contract or
 # the native K3 runtime is missing.
-export KDA_PREFILL_BACKEND
+export KDA_PREFILL_BACKEND DSPARK_DRAFT_WEIGHT_FORMAT DSPARK_DRAFT_MXFP8_BACKEND
 "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -160,6 +201,7 @@ from pathlib import Path
 
 from sparkinfer.attention import dense_mla
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 from vllm.model_executor.layers.activation import ensure_kimi_k3_activation_ops
 from vllm.models.kimi_k3.nvidia.kda import ensure_fused_kda_decode_op
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
@@ -205,16 +247,34 @@ if os.environ["KDA_PREFILL_BACKEND"] == "flashkda":
 if not ensure_kimi_k3_activation_ops():
     raise RuntimeError("HH Kimi-K3 fused SiTU activation ops are unavailable")
 print("K3 target native-op preflight: OK", flush=True)
+if os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8":
+    kernel = init_mxfp8_linear_kernel()
+    selected = type(kernel).__name__
+    requested = os.environ["DSPARK_DRAFT_MXFP8_BACKEND"]
+    if requested == "marlin" and selected != "MarlinMxfp8LinearKernel":
+        raise RuntimeError(
+            f"requested draft MXFP8/Marlin, selected {selected} instead"
+        )
+    print(f"K3 DSpark MXFP8 kernel preflight: {selected}", flush=True)
 PY
 
 if [[ "${KIMI_DSPARK_PREFLIGHT_ONLY:-0}" == 1 ]]; then
   exit 0
 fi
 
+if [[ "${DSPARK_DRAFT_WEIGHT_FORMAT}" == mxfp8 ]]; then
+  # The five TP-sharded transformer layers and context projection are
+  # quantized online and execute through the W8A16 backend selected above.
+  # Keep qkv-a in BF16 so the cross-layer KV-only context fusion remains
+  # active, and keep the replicated Markov vocabulary head in BF16.
+  DRAFT_QUANT_JSON=',"quantization":"mxfp8","quantization_config":{"linear":"mxfp8","ignore":["re:.*fused_qkv_a_proj$","model.markov_head.markov_w2"]}'
+else
+  DRAFT_QUANT_JSON=''
+fi
 printf -v SPECULATIVE_CONFIG \
-  '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"%s","rejection_sample_method":"%s"}' \
+  '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"%s","rejection_sample_method":"%s"%s}' \
   "${DRAFT_MODEL}" "${DRAFT_ATTENTION_BACKEND}" \
-  "${DRAFT_SAMPLE_METHOD}" "${REJECTION_SAMPLE_METHOD}"
+  "${DRAFT_SAMPLE_METHOD}" "${REJECTION_SAMPLE_METHOD}" "${DRAFT_QUANT_JSON}"
 
 exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --language-model-only \

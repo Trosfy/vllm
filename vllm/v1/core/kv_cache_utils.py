@@ -1011,9 +1011,7 @@ def get_max_concurrency_for_kv_cache_config(
             vllm_config, groups
         )
         memory_per_block = _pool_bytes_per_block(vllm_config, groups)
-        num_blocks_per_request = cdiv(
-            max_memory_usage_per_request, memory_per_block
-        )
+        num_blocks_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     else:
         num_blocks_per_request = sum(
             cdiv(
@@ -1781,6 +1779,15 @@ def group_and_unify_kv_cache_specs(
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
+    # Recurrent state pages (for example Kimi K3's KDA layers) must go through
+    # the generic hybrid-cache planner.  Packing them into the DeepSeek-V4
+    # tuple layout makes the much larger Mamba state page part of every packed
+    # block and can reduce MLA capacity by orders of magnitude.  The generic
+    # path instead unifies physical page sizes and shares pools across the
+    # 24 MLA, 69 KDA, and optional draft-MLA layer buckets.
+    if any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.values()):
+        return None
+
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )

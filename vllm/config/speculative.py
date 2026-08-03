@@ -17,6 +17,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.quantization import QuantizationConfigArgs, resolve_quantization_config
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -127,6 +128,7 @@ def _extend_unique(values: list[str], additions: list[str]) -> None:
             values.append(value)
             seen.add(value)
 
+
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "mimo_mtp",
@@ -206,6 +208,13 @@ class SpeculativeConfig:
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
+    quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None
+    """Optional online/per-layer quantization settings for the draft model.
+
+    This is independent of the target model's quantization configuration. It
+    permits, for example, an MXFP8 draft loaded from a BF16 checkpoint while
+    selected latency-sensitive projections remain unquantized.
+    """
     moe_backend: MoEBackend | None = None
     """MoE backend to use for the draft model. When `None`, the draft model
     inherits the target model's `--moe-backend` setting. Useful when the
@@ -1116,6 +1125,9 @@ class SpeculativeConfig:
                     max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
+                    quantization_config=resolve_quantization_config(
+                        self.quantization, self.quantization_config
+                    ),
                     enforce_eager=self.target_model_config.enforce_eager,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,

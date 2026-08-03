@@ -85,7 +85,12 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
@@ -195,6 +200,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        self.draft_kv_window = (
+            int(envs.VLLM_DSPARK_DRAFT_KV_WINDOW)
+            if non_causal_multi_token_decode
+            else 0
+        )
+        if self.draft_kv_window < 0:
+            raise ValueError(
+                "VLLM_DSPARK_DRAFT_KV_WINDOW must be non-negative, got "
+                f"{self.draft_kv_window}."
+            )
         # Latent "head" seen by the attention kernel / KV cache.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = self.qk_head_dim**-0.5
@@ -418,14 +433,41 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
-        return MLAAttentionSpec(  # type: ignore[call-arg]
+        raw_shard_draft = envs.VLLM_DCP_SHARD_DRAFT
+        shard_draft = (
+            False
+            if raw_shard_draft is None
+            else raw_shard_draft.lower() in ("1", "true", "yes")
+        )
+        dcp_replicated = bool(
+            self.non_causal_multi_token_decode
+            and not shard_draft
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
+        common_kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dcp_replicated=dcp_replicated,
+        )
+        if self.draft_kv_window:
+            if self.draft_kv_window < vllm_config.cache_config.block_size:
+                raise ValueError(
+                    "VLLM_DSPARK_DRAFT_KV_WINDOW must be at least one KV "
+                    f"block ({vllm_config.cache_config.block_size}), got "
+                    f"{self.draft_kv_window}."
+                )
+            return SlidingWindowMLASpec(
+                **common_kwargs,
+                sliding_window=self.draft_kv_window,
+                non_causal_multi_token_decode=(self.non_causal_multi_token_decode),
+            )
+        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
+        return MLAAttentionSpec(  # type: ignore[call-arg]
+            **common_kwargs,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 

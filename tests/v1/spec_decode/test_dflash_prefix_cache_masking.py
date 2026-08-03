@@ -168,3 +168,37 @@ def test_shift_copy_bounded_by_seq_len():
 
     torch.testing.assert_close(block_table[0, :4], original[0, 4:8])
     torch.testing.assert_close(block_table[0, 4:], original[0, 4:])
+
+
+@pytest.mark.parametrize("num_cached_blocks", [0, 2])
+def test_shift_compacts_bounded_draft_tail(num_cached_blocks: int):
+    block_table = _make_block_table(1)
+    original = block_table.clone()
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    num_cached_tokens = torch.full(
+        (MAX_NUM_REQS,),
+        num_cached_blocks * BLOCK_SIZE,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    # This is already shortened by any cache-restored prefix. A 32-token
+    # window at sequence length 100 retains one partial leading block:
+    # floor((100 - 32) / 16) = 4 blocks are dropped, leaving length 36.
+    seq_lens = torch.tensor([100], dtype=torch.int32, device=DEVICE)
+
+    shift_draft_block_tables(
+        block_table,
+        idx_mapping,
+        num_cached_tokens,
+        seq_lens,
+        BLOCK_SIZE,
+        draft_kv_window=32,
+    )
+
+    total_shift = num_cached_blocks + 4
+    torch.testing.assert_close(
+        block_table[0, :3], original[0, total_shift : total_shift + 3]
+    )
+    # Only the three resident pages are copied; unrelated table tail remains.
+    torch.testing.assert_close(block_table[0, 3:], original[0, 3:])
+    assert seq_lens.item() == 36

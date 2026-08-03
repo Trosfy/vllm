@@ -249,10 +249,6 @@ class K3DSparkModel(nn.Module):
 
     def _build_fused_context_kv_buffers(self) -> None:
         """Build a cross-layer KV-only A projection after checkpoint loading."""
-        if self.quant_config is not None:
-            self._context_kv_fusion_available = False
-            return
-
         attentions = [layer.self_attn for layer in self.layers]
         if not attentions or any(
             attn.fused_qkv_a_proj is None
@@ -304,6 +300,12 @@ class K3DSparkModel(nn.Module):
                 == attn0.kv_a_layernorm.variance_epsilon
             ), "All MLA DSpark layers must share their latent KV geometry."
             weight = attn.fused_qkv_a_proj.weight.detach()
+            # Serialized quantized qkv-a weights cannot be consumed directly
+            # by F.linear. Selective online MXFP8 leaves this small projection
+            # in BF16, allowing the cross-layer KV-only fusion to stay active.
+            if weight.element_size() < 2 or not weight.dtype.is_floating_point:
+                self._context_kv_fusion_available = False
+                return
             if int(weight.shape[0]) < q_weight_offset + stored_kv_width:
                 self._context_kv_fusion_available = False
                 return

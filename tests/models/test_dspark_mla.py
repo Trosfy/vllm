@@ -13,11 +13,56 @@ from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
+from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
     assert ModelRegistry._try_load_model_cls("K3DSparkModel") is K3DSparkForCausalLM
     assert not issubclass(K3DSparkModel, TorchCompileWithNoGuardsWrapper)
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_mla_uses_bounded_replicated_kv_spec(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DCP_SHARD_DRAFT", "0")
+    layer = object.__new__(MultiHeadLatentAttention)
+    layer.kv_cache_dtype = "auto"
+    layer.head_size = 576
+    layer.non_causal_multi_token_decode = True
+    layer.draft_kv_window = 65536
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=768),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8),
+    )
+
+    spec = MultiHeadLatentAttention.get_kv_cache_spec(layer, config)
+
+    assert isinstance(spec, SlidingWindowMLASpec)
+    assert spec.sliding_window == 65536
+    assert spec.block_size == 768
+    assert spec.dcp_replicated is True
+    assert spec.non_causal_multi_token_decode is True
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_full_kv_spec_can_be_explicitly_dcp_sharded(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DCP_SHARD_DRAFT", "1")
+    layer = object.__new__(MultiHeadLatentAttention)
+    layer.kv_cache_dtype = "auto"
+    layer.head_size = 576
+    layer.non_causal_multi_token_decode = True
+    layer.draft_kv_window = 0
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=768),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=8),
+    )
+
+    spec = MultiHeadLatentAttention.get_kv_cache_spec(layer, config)
+
+    assert isinstance(spec, MLAAttentionSpec)
+    assert spec.dcp_replicated is False
 
 
 @pytest.mark.parametrize(
@@ -170,7 +215,10 @@ def test_dspark_context_kv_fusion_supports_sharded_qkv_a(
     )
     model = object.__new__(K3DSparkModel)
     nn.Module.__init__(model)
-    model.quant_config = None
+    # A model-level quant config does not imply this particular projection is
+    # quantized: selective online MXFP8 keeps qkv-a in BF16 specifically so
+    # context KV fusion remains available.
+    model.quant_config = object()
     model._max_num_context_tokens = 8
     tp_size = 4
     q_rank = 8
