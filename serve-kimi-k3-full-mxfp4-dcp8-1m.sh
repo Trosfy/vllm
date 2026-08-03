@@ -25,7 +25,9 @@ DCP_COMM_BACKEND="${DCP_COMM_BACKEND:-a2a}"
 # the tight 1M-cache fit without accelerating a size-1 decode.
 DCP_A2A_MAX_TOKENS="${DCP_A2A_MAX_TOKENS:-1}"
 DCP_A2A_LARGE_BACKEND="${DCP_A2A_LARGE_BACKEND:-ag_rs}"
-KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-triton}"
+KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-flashkda}"
+export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+export CUDA_MODULE_DATA_LOADING="${CUDA_MODULE_DATA_LOADING:-LAZY}"
 
 if (( TP_SIZE != 16 )); then
   echo "This profile is validated only for TP_SIZE=16, got ${TP_SIZE}" >&2
@@ -115,12 +117,10 @@ export VLLM_DCP_GLOBAL_TOPK="${VLLM_DCP_GLOBAL_TOPK:-0}"
 export VLLM_DCP_PROJECT_BEFORE_MERGE="${VLLM_DCP_PROJECT_BEFORE_MERGE:-0}"
 export VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE="${VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE:-0}"
 
-# FlashKDA's first SM120 launch commits about 3.74 GiB of non-PyTorch CUDA
-# module state. The full stock checkpoint plus a physical 1M cache has only
-# about 0.45 GiB free after graph capture. Triton KDA prefill commits about
-# 0.12 GiB for the same 69-layer warmup, while decode still uses the separate
-# fused conv+KDA+norm companion. FlashKDA remains an explicit override for
-# smaller-cache experiments, but it cannot fit this profile as currently built.
+# The vendored SM120 FlashKDA patch preserves K1's swizzled workspace byte
+# images but reloads them in K2 through raw-layout tensor TMA. This avoids the
+# CUDA syscall backing allocation triggered by non-tensor G2S bulk copies
+# (~3.80 GiB/rank) while remaining bit-exact with the original recurrence.
 
 # Manual KV sizing and a measured size-1 graph make both conservative memory
 # reservations unnecessary on this very tight full-MXFP4 fit.

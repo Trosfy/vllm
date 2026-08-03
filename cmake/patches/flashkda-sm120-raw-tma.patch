@@ -1,0 +1,321 @@
+diff --git a/csrc/flash_kda.cpp b/csrc/flash_kda.cpp
+index 576f259..35a88dc 100644
+--- a/csrc/flash_kda.cpp
++++ b/csrc/flash_kda.cpp
+@@ -185,0 +186,14 @@ void fwd(
++#ifdef FLASH_KDA_KIMI_K3_ONLY
++    TORCH_CHECK(
++        has_state_in && has_state_out && state_fp32 && is_varlen &&
++            cu_seqlens_is_int32,
++        "Kimi-K3-only FlashKDA requires FP32 initial/final state and "
++        "int32 cu_seqlens");
++    launch_fwd<128, true, true, true, true, int32_t>(
++        q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr,
++        initial_state_raw, scale_f, final_state_raw, out_ptr,
++        workspace_ptr, total_tiles,
++        int(T_total), int(H), int(N_val),
++        static_cast<int32_t const*>(cu_seqlens_dev),
++        A_log_ptr, dt_bias_ptr, gate_scale, stream);
++#else
+@@ -226,0 +241 @@ void fwd(
++#endif
+diff --git a/csrc/smxx/fwd_kernel1.cuh b/csrc/smxx/fwd_kernel1.cuh
+index 4902ae8..cac10ac 100644
+--- a/csrc/smxx/fwd_kernel1.cuh
++++ b/csrc/smxx/fwd_kernel1.cuh
+@@ -506,3 +505,0 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-        // Private K1→K2 ABI: preserve each swizzled shared-memory byte image
+-        // so K2 can restore it directly without TensorMap segmentation.
+-        BF16* k_decayed_dst = ws_kd + int64_t(ws_idx) * (CHUNK * D);
+@@ -510 +507,3 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-            shared_storage.k_decayed.begin(), k_decayed_dst, int32_t(CHUNK * D * sizeof(BF16)));
++            shared_storage.k_decayed.begin(),
++            ws_kd + int64_t(ws_idx) * (CHUNK * D),
++            int32_t(CHUNK * D * sizeof(BF16)));
+@@ -512,2 +510,0 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-
+-        BF16* q_decayed_dst = ws_qd + int64_t(ws_idx) * (CHUNK * D);
+@@ -515 +512,3 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-            shared_storage.q_decayed.begin(), q_decayed_dst, int32_t(CHUNK * D * sizeof(BF16)));
++            shared_storage.q_decayed.begin(),
++            ws_qd + int64_t(ws_idx) * (CHUNK * D),
++            int32_t(CHUNK * D * sizeof(BF16)));
+@@ -517,2 +515,0 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-
+-        BF16* k_restored_dst = ws_kr + int64_t(ws_idx) * (CHUNK * D);
+@@ -520 +517,3 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-            shared_storage.k_restored.begin(), k_restored_dst, int32_t(CHUNK * D * sizeof(BF16)));
++            shared_storage.k_restored.begin(),
++            ws_kr + int64_t(ws_idx) * (CHUNK * D),
++            int32_t(CHUNK * D * sizeof(BF16)));
+@@ -522,2 +520,0 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-
+-        float* g_total_dst = ws_gt + int64_t(ws_idx) * D;
+@@ -525 +522,2 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-            shared_storage.g_total.begin(), g_total_dst, int32_t(D * sizeof(float)));
++            shared_storage.g_total.begin(), ws_gt + int64_t(ws_idx) * D,
++            int32_t(D * sizeof(float)));
+@@ -527,2 +524,0 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-
+-        BF16* inv_dst = ws_inv + int64_t(ws_idx) * (CHUNK * CHUNK);
+@@ -530 +526,3 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-            shared_storage.INV.begin(), inv_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
++            shared_storage.INV.begin(),
++            ws_inv + int64_t(ws_idx) * (CHUNK * CHUNK),
++            int32_t(CHUNK * CHUNK * sizeof(BF16)));
+@@ -532,2 +529,0 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-
+-        BF16* mqk_dst = ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK);
+@@ -535 +531,3 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
+-            shared_storage.Mqk.begin(), mqk_dst, int32_t(CHUNK * CHUNK * sizeof(BF16)));
++            shared_storage.Mqk.begin(),
++            ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK),
++            int32_t(CHUNK * CHUNK * sizeof(BF16)));
+diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
+index 410d94f..d238316 100644
+--- a/csrc/smxx/fwd_kernel2.cuh
++++ b/csrc/smxx/fwd_kernel2.cuh
+@@ -29,0 +30,4 @@ struct K2Layouts {
++    using RawQKVLayout = decltype(make_layout(
++        make_shape(Int<CHUNK>{}, Int<D>{}), LayoutRight{}));
++    using RawLMLayout = decltype(make_layout(
++        make_shape(Int<CHUNK>{}, Int<CHUNK>{}), LayoutRight{}));
+@@ -46,0 +51,6 @@ struct K2Layouts {
++    // K1 writes its swizzled shared-memory byte images to the workspace.
++    // These row-major TMA views restore those bytes without reinterpreting
++    // their logical matrix layout.
++    using TMARawQKVLayout = decltype(prepend(RawQKVLayout{}));
++    using TMARawGTLayout = decltype(prepend(GTotalLayout{}));
++    using TMARawLMLayout = decltype(prepend(RawLMLayout{}));
+@@ -122,0 +133,6 @@ template <
++    class TmaLoadWsKD,
++    class TmaLoadWsQD,
++    class TmaLoadWsKR,
++    class TmaLoadWsGT,
++    class TmaLoadWsINV,
++    class TmaLoadWsMqk,
+@@ -139,0 +156,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
++    CUTE_GRID_CONSTANT TmaLoadWsKD const tma_load_ws_kd,
++    CUTE_GRID_CONSTANT TmaLoadWsQD const tma_load_ws_qd,
++    CUTE_GRID_CONSTANT TmaLoadWsKR const tma_load_ws_kr,
++    CUTE_GRID_CONSTANT TmaLoadWsGT const tma_load_ws_gt,
++    CUTE_GRID_CONSTANT TmaLoadWsINV const tma_load_ws_inv,
++    CUTE_GRID_CONSTANT TmaLoadWsMqk const tma_load_ws_mqk,
+@@ -148,7 +170 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+-    int total_tiles,
+-    cutlass::bfloat16_t const* ws_kd,
+-    cutlass::bfloat16_t const* ws_qd,
+-    cutlass::bfloat16_t const* ws_kr,
+-    float const* ws_gt,
+-    cutlass::bfloat16_t const* ws_inv,
+-    cutlass::bfloat16_t const* ws_mqk
++    int total_tiles
+@@ -167,0 +184,3 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
++    using TMARawQKVLayout = typename Layouts::TMARawQKVLayout;
++    using TMARawGTLayout = typename Layouts::TMARawGTLayout;
++    using TMARawLMLayout = typename Layouts::TMARawLMLayout;
+@@ -329,0 +349,12 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
++        auto g_ws_kd = tma_load_ws_kd.get_tma_tensor(
++            make_shape(H * total_tiles, CHUNK, D));
++        auto g_ws_qd = tma_load_ws_qd.get_tma_tensor(
++            make_shape(H * total_tiles, CHUNK, D));
++        auto g_ws_kr = tma_load_ws_kr.get_tma_tensor(
++            make_shape(H * total_tiles, CHUNK, D));
++        auto g_ws_gt = tma_load_ws_gt.get_tma_tensor(
++            make_shape(H * total_tiles, D));
++        auto g_ws_inv = tma_load_ws_inv.get_tma_tensor(
++            make_shape(H * total_tiles, CHUNK, CHUNK));
++        auto g_ws_mqk = tma_load_ws_mqk.get_tma_tensor(
++            make_shape(H * total_tiles, CHUNK, CHUNK));
+@@ -333,0 +365,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
++        auto cta_ws_kd = tma_load_ws_kd.get_slice(Int<0>{});
++        auto cta_ws_qd = tma_load_ws_qd.get_slice(Int<0>{});
++        auto cta_ws_kr = tma_load_ws_kr.get_slice(Int<0>{});
++        auto cta_ws_gt = tma_load_ws_gt.get_slice(Int<0>{});
++        auto cta_ws_inv = tma_load_ws_inv.get_slice(Int<0>{});
++        auto cta_ws_mqk = tma_load_ws_mqk.get_slice(Int<0>{});
+@@ -359,33 +396,80 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+-            // K1 stores byte images of its swizzled shared-memory tensors.
+-            // K2 uses the same layouts, so raw bulk copies restore them
+-            // directly without tensor-map coordinate work or repacking.
+-            cute::SM90_BULK_COPY_G2S::copy(
+-                ws_kd + int64_t(ws_idx) * (CHUNK * D),
+-                reinterpret_cast<uint64_t*>(tma_barrier),
+-                shared_storage.input[stage].k_decayed.begin(),
+-                int32_t(CHUNK * D * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
+-                ws_qd + int64_t(ws_idx) * (CHUNK * D),
+-                reinterpret_cast<uint64_t*>(tma_barrier),
+-                shared_storage.input[stage].q_decayed.begin(),
+-                int32_t(CHUNK * D * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
+-                ws_kr + int64_t(ws_idx) * (CHUNK * D),
+-                reinterpret_cast<uint64_t*>(tma_barrier),
+-                shared_storage.input[stage].k_restored.begin(),
+-                int32_t(CHUNK * D * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
+-                ws_gt + int64_t(ws_idx) * D,
+-                reinterpret_cast<uint64_t*>(tma_barrier),
+-                shared_storage.input[stage].g_total.begin(),
+-                int32_t(D * sizeof(float)));
+-            cute::SM90_BULK_COPY_G2S::copy(
+-                ws_inv + int64_t(ws_idx) * (CHUNK * CHUNK),
+-                reinterpret_cast<uint64_t*>(tma_barrier),
+-                shared_storage.input[stage].INV.begin(),
+-                int32_t(CHUNK * CHUNK * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
+-                ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK),
+-                reinterpret_cast<uint64_t*>(tma_barrier),
+-                shared_storage.input[stage].Mqk.begin(),
+-                int32_t(CHUNK * CHUNK * sizeof(BF16)));
++            {
++                auto off = g_ws_kd.layout()(ws_idx, 0, 0);
++                Tensor g_tile = make_tensor(
++                    g_ws_kd.data() + off,
++                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}),
++                                stride(g_ws_kd.layout())));
++                Tensor s_tile = make_tensor(
++                    make_smem_ptr(shared_storage.input[stage].k_decayed.begin()),
++                    TMARawQKVLayout{});
++                cute::copy(tma_load_ws_kd.with(*tma_barrier),
++                           cta_ws_kd.partition_S(g_tile),
++                           cta_ws_kd.partition_D(s_tile));
++            }
++            {
++                auto off = g_ws_qd.layout()(ws_idx, 0, 0);
++                Tensor g_tile = make_tensor(
++                    g_ws_qd.data() + off,
++                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}),
++                                stride(g_ws_qd.layout())));
++                Tensor s_tile = make_tensor(
++                    make_smem_ptr(shared_storage.input[stage].q_decayed.begin()),
++                    TMARawQKVLayout{});
++                cute::copy(tma_load_ws_qd.with(*tma_barrier),
++                           cta_ws_qd.partition_S(g_tile),
++                           cta_ws_qd.partition_D(s_tile));
++            }
++            {
++                auto off = g_ws_kr.layout()(ws_idx, 0, 0);
++                Tensor g_tile = make_tensor(
++                    g_ws_kr.data() + off,
++                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}),
++                                stride(g_ws_kr.layout())));
++                Tensor s_tile = make_tensor(
++                    make_smem_ptr(shared_storage.input[stage].k_restored.begin()),
++                    TMARawQKVLayout{});
++                cute::copy(tma_load_ws_kr.with(*tma_barrier),
++                           cta_ws_kr.partition_S(g_tile),
++                           cta_ws_kr.partition_D(s_tile));
++            }
++            {
++                auto off = g_ws_gt.layout()(ws_idx, 0);
++                Tensor g_tile = make_tensor(
++                    g_ws_gt.data() + off,
++                    make_layout(make_shape(Int<1>{}, Int<D>{}),
++                                stride(g_ws_gt.layout())));
++                Tensor s_tile = make_tensor(
++                    make_smem_ptr(shared_storage.input[stage].g_total.begin()),
++                    TMARawGTLayout{});
++                cute::copy(tma_load_ws_gt.with(*tma_barrier),
++                           cta_ws_gt.partition_S(g_tile),
++                           cta_ws_gt.partition_D(s_tile));
++            }
++            {
++                auto off = g_ws_inv.layout()(ws_idx, 0, 0);
++                Tensor g_tile = make_tensor(
++                    g_ws_inv.data() + off,
++                    make_layout(
++                        make_shape(Int<1>{}, Int<CHUNK>{}, Int<CHUNK>{}),
++                        stride(g_ws_inv.layout())));
++                Tensor s_tile = make_tensor(
++                    make_smem_ptr(shared_storage.input[stage].INV.begin()),
++                    TMARawLMLayout{});
++                cute::copy(tma_load_ws_inv.with(*tma_barrier),
++                           cta_ws_inv.partition_S(g_tile),
++                           cta_ws_inv.partition_D(s_tile));
++            }
++            {
++                auto off = g_ws_mqk.layout()(ws_idx, 0, 0);
++                Tensor g_tile = make_tensor(
++                    g_ws_mqk.data() + off,
++                    make_layout(
++                        make_shape(Int<1>{}, Int<CHUNK>{}, Int<CHUNK>{}),
++                        stride(g_ws_mqk.layout())));
++                Tensor s_tile = make_tensor(
++                    make_smem_ptr(shared_storage.input[stage].Mqk.begin()),
++                    TMARawLMLayout{});
++                cute::copy(tma_load_ws_mqk.with(*tma_barrier),
++                           cta_ws_mqk.partition_S(g_tile),
++                           cta_ws_mqk.partition_D(s_tile));
++            }
+diff --git a/csrc/smxx/fwd_launch.cu b/csrc/smxx/fwd_launch.cu
+index 5b2120c..8dc2402 100644
+--- a/csrc/smxx/fwd_launch.cu
++++ b/csrc/smxx/fwd_launch.cu
+@@ -45,2 +45,2 @@ void launch_fwd(
+-    // Raw bulk copies make the swizzled shared-memory layout a private ABI
+-    // between K1 and K2. Fail at compile time if either side changes alone.
++    // The workspace preserves each swizzled shared-memory byte image as a
++    // private K1-to-K2 ABI. Fail at compile time if either side changes alone.
+@@ -61,0 +62,3 @@ void launch_fwd(
++    using TMARawQKVLayout = typename K2L::TMARawQKVLayout;
++    using TMARawGTLayout = typename K2L::TMARawGTLayout;
++    using TMARawLMLayout = typename K2L::TMARawLMLayout;
+@@ -86,0 +90,20 @@ void launch_fwd(
++    auto ws_qkv_gmem_layout =
++        make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
++    auto ws_gt_gmem_layout =
++        make_layout(make_shape(int(n_ht), D), LayoutRight{});
++    auto ws_lm_gmem_layout =
++        make_layout(make_shape(int(n_ht), CHUNK, CHUNK), LayoutRight{});
++
++    Tensor m_ws_kd =
++        make_tensor(make_gmem_ptr(ws_kd), ws_qkv_gmem_layout);
++    Tensor m_ws_qd =
++        make_tensor(make_gmem_ptr(ws_qd), ws_qkv_gmem_layout);
++    Tensor m_ws_kr =
++        make_tensor(make_gmem_ptr(ws_kr), ws_qkv_gmem_layout);
++    Tensor m_ws_gt =
++        make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
++    Tensor m_ws_inv =
++        make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
++    Tensor m_ws_mqk =
++        make_tensor(make_gmem_ptr(ws_mqk), ws_lm_gmem_layout);
++
+@@ -99,2 +122,4 @@ void launch_fwd(
+-    // --- TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
+-    // use the raw bulk-copy pointers above rather than tensor maps.
++    // --- TMA descriptors for Kernel 2 inputs and outputs. K1 stores raw
++    // shared-memory byte images. K2 reloads those images through row-major
++    // tensor maps: unlike non-tensor G2S bulk copies, this does not use the
++    // multi-GiB CUDA syscall compatibility path on SM120.
+@@ -102,0 +128,12 @@ void launch_fwd(
++    auto tma_load_ws_kd =
++        make_tma_copy(SM90_TMA_LOAD{}, m_ws_kd, TMARawQKVLayout{});
++    auto tma_load_ws_qd =
++        make_tma_copy(SM90_TMA_LOAD{}, m_ws_qd, TMARawQKVLayout{});
++    auto tma_load_ws_kr =
++        make_tma_copy(SM90_TMA_LOAD{}, m_ws_kr, TMARawQKVLayout{});
++    auto tma_load_ws_gt =
++        make_tma_copy(SM90_TMA_LOAD{}, m_ws_gt, TMARawGTLayout{});
++    auto tma_load_ws_inv =
++        make_tma_copy(SM90_TMA_LOAD{}, m_ws_inv, TMARawLMLayout{});
++    auto tma_load_ws_mqk =
++        make_tma_copy(SM90_TMA_LOAD{}, m_ws_mqk, TMARawLMLayout{});
+@@ -170,0 +208,3 @@ void launch_fwd(
++            decltype(tma_load_ws_kd), decltype(tma_load_ws_qd),
++            decltype(tma_load_ws_kr), decltype(tma_load_ws_gt),
++            decltype(tma_load_ws_inv), decltype(tma_load_ws_mqk),
+@@ -186,0 +227,2 @@ void launch_fwd(
++            tma_load_ws_kd, tma_load_ws_qd, tma_load_ws_kr,
++            tma_load_ws_gt, tma_load_ws_inv, tma_load_ws_mqk,
+@@ -190,2 +232 @@ void launch_fwd(
+-            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+-            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
++            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
+@@ -214,0 +256,3 @@ void launch_fwd(
++#ifdef FLASH_KDA_KIMI_K3_ONLY
++INSTANTIATE_LAUNCH_FWD(128, true, true, true, true, int32_t)
++#else
+@@ -218,0 +263 @@ INSTANTIATE_STATE_VARIANTS(false, int64_t)
++#endif

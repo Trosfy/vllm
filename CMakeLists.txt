@@ -39,6 +39,8 @@ option(VLLM_KIMI_K3_ACTIVATION_OPS_ONLY
   "Build only the HH Kimi-K3 SiTU compatibility extension" OFF)
 option(VLLM_FLASHKDA_ONLY
   "Build only the FlashKDA prefill extension" OFF)
+option(VLLM_FLASHKDA_KIMI_K3_ONLY
+  "Compile only the FlashKDA variant used by Kimi-K3 serving" OFF)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 

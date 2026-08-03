@@ -10,12 +10,19 @@ if(FLASH_KDA_SRC_DIR)
     SOURCE_DIR ${FLASH_KDA_SRC_DIR}
   )
 else()
+  set(FLASH_KDA_SM120_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/../patches/flashkda-sm120-raw-tma.patch")
   FetchContent_Declare(
     flashkda
     GIT_REPOSITORY https://github.com/vllm-project/FlashKDA.git
     GIT_TAG a3e42bbbece3bb38f7c426b880315294a336e82f
     GIT_PROGRESS TRUE
     GIT_SUBMODULES cutlass
+    PATCH_COMMAND
+      ${CMAKE_COMMAND}
+      -DSOURCE_DIR=<SOURCE_DIR>
+      -DPATCH_FILE=${FLASH_KDA_SM120_PATCH}
+      -P ${CMAKE_CURRENT_LIST_DIR}/../apply_patch_once.cmake
   )
 endif()
 
@@ -66,6 +73,10 @@ if(FLASH_KDA_ARCHS)
   target_compile_options(_flashkda_C PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -O3>
     $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+  if(VLLM_FLASHKDA_KIMI_K3_ONLY)
+    target_compile_definitions(_flashkda_C PRIVATE FLASH_KDA_KIMI_K3_ONLY=1)
+    message(STATUS "FlashKDA is restricted to the Kimi-K3 FP32 varlen path")
+  endif()
 else()
   message(STATUS
     "FlashKDA will not compile: CUDA >=12.0 and a supported architecture "
