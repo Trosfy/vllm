@@ -77,21 +77,15 @@ def test_dspark_metadata_builders_use_draft_parallel_config(monkeypatch) -> None
     )
     draft_config = SimpleNamespace(
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        attention_config=SimpleNamespace(backend=AttentionBackendEnum.B12X_MLA),
+        attention_config=SimpleNamespace(
+            backend=AttentionBackendEnum.B12X_MLA, use_non_causal=False
+        ),
     )
     monkeypatch.setattr(
         dflash_speculator,
         "_create_draft_vllm_config",
         lambda config: draft_config if config is target_config else None,
     )
-
-    def fake_replace(value, **updates):
-        result = copy.copy(value)
-        for key, update in updates.items():
-            setattr(result, key, update)
-        return result
-
-    monkeypatch.setattr(dflash_speculator, "replace", fake_replace)
 
     speculator = object.__new__(dflash_speculator.DFlashSpeculator)
     speculator.vllm_config = target_config
@@ -104,6 +98,7 @@ def test_dspark_metadata_builders_use_draft_parallel_config(monkeypatch) -> None
     assert attn_config.parallel_config.decode_context_parallel_size == 1
     assert attn_config.attention_config.backend == AttentionBackendEnum.B12X_MLA
     assert attn_config.attention_config.use_non_causal is True
+    assert draft_config.attention_config.use_non_causal is False
 
 
 def test_dspark_bounded_metadata_caps_only_draft_attention_plan(monkeypatch) -> None:
@@ -121,6 +116,14 @@ def test_dspark_bounded_metadata_caps_only_draft_attention_plan(monkeypatch) -> 
     class DraftConfig:
         model_config: DraftModelConfig
         attention_config: DraftAttentionConfig
+        enable_prefix_caching: bool = False
+        mamba_block_size: int | None = None
+
+        def __post_init__(self):
+            if self.mamba_block_size is not None and not self.enable_prefix_caching:
+                raise ValueError(
+                    "mamba_block_size is derived runtime state, not constructor input"
+                )
 
     original_model_config = DraftModelConfig(max_model_len=1_048_576)
     # Mirrors ModelConfig's derived cache that is deliberately not a declared
@@ -130,6 +133,9 @@ def test_dspark_bounded_metadata_caps_only_draft_attention_plan(monkeypatch) -> 
         model_config=original_model_config,
         attention_config=DraftAttentionConfig(use_non_causal=False),
     )
+    # Cache planning mutates this after the original config has already passed
+    # validation. Reconstructing the dataclass would now fail its validator.
+    draft_config.mamba_block_size = 768
     target_config = object()
     monkeypatch.setattr(
         dflash_speculator,
@@ -148,3 +154,4 @@ def test_dspark_bounded_metadata_caps_only_draft_attention_plan(monkeypatch) -> 
     assert original_model_config.max_model_len == 1_048_576
     assert attn_config.model_config.max_model_len == 65_536 + 768 - 1
     assert attn_config.attention_config.use_non_causal is True
+    assert draft_config.attention_config.use_non_causal is False

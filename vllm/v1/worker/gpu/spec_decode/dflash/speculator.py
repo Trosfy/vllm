@@ -9,6 +9,7 @@ states, which are fc-combined, normed, projected to K/V by every draft
 layer, and written into the draft KV cache.
 """
 
+import copy
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
@@ -17,7 +18,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -190,28 +191,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Metadata must use the external draft's parallel geometry.  In
         # particular, DFlash/DSpark defaults to a complete DCP1 draft cache
         # even when the target cache is DCP-sharded.
-        draft_vllm_config = _create_draft_vllm_config(self.vllm_config)
+        # This is an ephemeral metadata-builder view of an already validated
+        # runtime config. Do not reconstruct VllmConfig through its Pydantic
+        # constructor: cache planning has populated derived fields such as
+        # mamba_block_size, and re-running CLI validation on that internal
+        # state can reject an otherwise valid running configuration.
+        draft_vllm_config = copy.copy(
+            _create_draft_vllm_config(self.vllm_config)
+        )
         if self.draft_kv_window is not None:
             # This config is used only to size/build the draft attention plan;
             # token positions and the target's admitted context remain global.
             # Retain one partial leading page beyond the requested window.
             assert self.draft_kv_window_block_size is not None
-            draft_vllm_config = replace(
-                draft_vllm_config,
-                model_config=replace(
-                    draft_vllm_config.model_config,
-                    max_model_len=(
-                        self.draft_kv_window + self.draft_kv_window_block_size - 1
-                    ),
-                ),
+            draft_model_config = copy.copy(draft_vllm_config.model_config)
+            draft_model_config.max_model_len = (
+                self.draft_kv_window + self.draft_kv_window_block_size - 1
             )
-        return replace(
-            draft_vllm_config,
-            attention_config=replace(
-                draft_vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
-        )
+            draft_vllm_config.model_config = draft_model_config
+        draft_attention_config = copy.copy(draft_vllm_config.attention_config)
+        draft_attention_config.use_non_causal = self.requires_non_causal
+        draft_vllm_config.attention_config = draft_attention_config
+        return draft_vllm_config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
