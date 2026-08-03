@@ -855,9 +855,20 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         if has_context:
-            context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
-                q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
-            )
+            if self.impl.dcp_world_size > 1:
+                context_output, context_lse = (  # type: ignore[attr-defined]
+                    self.impl._context_parallel_compute_prefill_context(
+                        q,
+                        self._attn_read_kv_cache(),
+                        attn_metadata,
+                        k_scale=self._k_scale,
+                        dcp_world_size=self.impl.dcp_world_size,
+                    )
+                )
+            else:
+                context_output, context_lse = self.impl._compute_prefill_context(  # type: ignore[attr-defined]
+                    q, self._attn_read_kv_cache(), attn_metadata, self._k_scale
+                )
             suffix_output, suffix_lse = output_prefill
             out = out.view(-1, self.num_local_heads, self.v_head_dim)
             merge_attn_states(
