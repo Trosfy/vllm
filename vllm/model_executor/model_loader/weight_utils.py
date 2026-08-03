@@ -294,12 +294,20 @@ def get_quant_config(
     # if hf_quant_config is None, we will try to get config from
     # hf_overrides
     hf_overrides = model_config.hf_overrides
-    if not isinstance(hf_overrides, dict):
+    if not isinstance(hf_overrides, dict) and model_config.quantization_config is None:
         raise ValueError(
             "hf_overrides must be a dict for get_quant_config "
             "to get the quantization config from it."
         )
-    quantization_config_file = hf_overrides.get("quantization_config_file", None)
+    # Callable HF overrides cannot carry checkpoint-side quantization metadata,
+    # but are valid with online quantization: its complete configuration lives
+    # in ModelConfig.quantization_config.  Draft models commonly inherit a
+    # callable override from the target.
+    quantization_config_file = (
+        hf_overrides.get("quantization_config_file", None)
+        if isinstance(hf_overrides, dict)
+        else None
+    )
     if quantization_config_file is not None:
         if hasattr(quant_cls, "from_config_file"):
             return quant_cls.from_config_file(quantization_config_file)
@@ -309,7 +317,11 @@ def get_quant_config(
                 "but quant_cls.from_config_file is not implemented in "
                 f"{quant_cls}"
             )
-    quantization_config_json = hf_overrides.get("quantization_config_dict_json", None)
+    quantization_config_json = (
+        hf_overrides.get("quantization_config_dict_json", None)
+        if isinstance(hf_overrides, dict)
+        else None
+    )
     if quantization_config_json is not None:
         if hasattr(quant_cls, "from_config_dict_json"):
             return quant_cls.from_config_dict_json(quantization_config_json)

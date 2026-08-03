@@ -200,6 +200,12 @@ import os
 from pathlib import Path
 
 from sparkinfer.attention import dense_mla
+from vllm.config import LoadConfig, ModelConfig
+from vllm.config.quantization import resolve_quantization_config
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
+from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 from vllm.model_executor.layers.activation import ensure_kimi_k3_activation_ops
@@ -254,6 +260,33 @@ if os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8":
     if requested == "marlin" and selected != "MarlinMxfp8LinearKernel":
         raise RuntimeError(
             f"requested draft MXFP8/Marlin, selected {selected} instead"
+        )
+    # Resolve the same online-quantized draft ModelConfig used by the worker.
+    # In particular, exercise callable hf_overrides here so a config-regression
+    # fails before the multi-terabyte target checkpoint is loaded.
+    draft_model_config = ModelConfig(
+        model=str(draft),
+        runner="draft",
+        tokenizer_mode="skip",
+        max_model_len=int(os.environ["MAX_MODEL_LEN"]),
+        quantization="mxfp8",
+        quantization_config=resolve_quantization_config(
+            "mxfp8",
+            {
+                "linear": "mxfp8",
+                "ignore": [
+                    "re:.*fused_qkv_a_proj$",
+                    "model.markov_head.markov_w2",
+                ],
+            },
+        ),
+        hf_overrides=lambda hf_config: hf_config,
+    )
+    draft_quant_config = get_quant_config(draft_model_config, LoadConfig())
+    if not isinstance(draft_quant_config, OnlineQuantizationConfig):
+        raise RuntimeError(
+            "draft MXFP8 resolved to "
+            f"{type(draft_quant_config).__name__}, expected OnlineQuantizationConfig"
         )
     print(f"K3 DSpark MXFP8 kernel preflight: {selected}", flush=True)
 PY

@@ -5,8 +5,12 @@ import json
 
 import pytest
 
-from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config import LoadConfig, ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
+from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -174,6 +178,14 @@ def test_dspark_mla_accepts_draft_online_quantization(tmp_path):
         "re:.*fused_qkv_a_proj$",
         "model.markov_head.markov_w2",
     ]
+
+    # The target can supply hf_overrides as a callable.  The draft inherits it,
+    # and online quantization must not require that callable to be a dict because
+    # its complete configuration already lives on the draft ModelConfig.
+    draft.hf_overrides = lambda hf_config: hf_config
+    quant_config = get_quant_config(draft, LoadConfig())
+    assert isinstance(quant_config, OnlineQuantizationConfig)
+    assert quant_config.args == draft.quantization_config
 
 
 def test_dspark_mla_dcp_requires_b12x_backend(tmp_path):
