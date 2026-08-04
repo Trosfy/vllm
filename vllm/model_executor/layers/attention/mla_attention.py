@@ -815,10 +815,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.dcp_a2a
             and envs.VLLM_USE_B12X_DCP_A2A
             and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
-            # The B12X PCIe DCP channel only exists for world sizes 2/4/8;
+            # The B12X PCIe DCP channel supports world sizes 2/4/8/16;
             # other DCP sizes (e.g. TP6 with DCP3/DCP6) use NCCL collectives.
             and _vllm_config is not None
-            and _vllm_config.parallel_config.decode_context_parallel_size in (2, 4, 8)
+            and _vllm_config.parallel_config.decode_context_parallel_size
+            in (2, 4, 8, 16)
         )
         configured_dcp_world_size = (
             _vllm_config.parallel_config.decode_context_parallel_size
@@ -2462,6 +2463,10 @@ class MLACommonPrefillMetadata:
     query_lens_cpu: torch.Tensor | None = None
     use_dense_mha: bool = False
     topk_mask_workspace: torch.Tensor | None = None
+    # Optional caller-owned storage that a prefill backend may reuse for
+    # short-lived padding. Kimi-K3 supplies its dead full-width layer input so
+    # FlashAttention does not allocate a new padded V tensor at runtime.
+    v_padding_buffer: torch.Tensor | None = None
 
 
 @dataclass

@@ -66,6 +66,9 @@ if TYPE_CHECKING:
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
+    VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -196,6 +199,8 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
+    VLLM_DSPARK_PROFILE_SPS_ONLY: bool = False
+    VLLM_DSPARK_SPS_DEBUG: int = 0
     VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: int = 0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1132,6 +1137,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
     ),
+    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
+    ),
+    "VLLM_K3_KV_GROUP_SIZE": lambda: int(
+        os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")
+    ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
@@ -1597,6 +1611,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW", "8")
+    ),
+    "VLLM_DSPARK_PROFILE_SPS_ONLY": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_PROFILE_SPS_ONLY", "0"))
+    ),
+    "VLLM_DSPARK_SPS_DEBUG": lambda: int(
+        os.getenv("VLLM_DSPARK_SPS_DEBUG", "0")
     ),
     # Capture low-load DSpark draft graphs without confidence/capacity kernels.
     # 0 keeps capacity active at every batch size; a positive value must match

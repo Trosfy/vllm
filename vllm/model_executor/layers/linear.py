@@ -233,6 +233,46 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
+    def apply_with_output_buffer(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output_buffer: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply a bias-free GEMM directly into caller-owned storage."""
+        if bias is not None:
+            raise NotImplementedError(
+                "Unquantized output-buffer projection does not support bias"
+            )
+        expected_shape = (*x.shape[:-1], layer.weight.shape[0])
+        if output_buffer.shape != expected_shape:
+            raise ValueError(
+                "Unquantized output buffer has the wrong shape: "
+                f"expected {expected_shape}, got {tuple(output_buffer.shape)}"
+            )
+        if output_buffer.dtype != x.dtype or output_buffer.dtype != layer.weight.dtype:
+            raise ValueError(
+                "Unquantized output buffer, input, and weight must have the "
+                f"same dtype, got {output_buffer.dtype}, {x.dtype}, and "
+                f"{layer.weight.dtype}"
+            )
+        if (
+            output_buffer.device != x.device
+            or output_buffer.device != layer.weight.device
+        ):
+            raise ValueError(
+                "Unquantized output buffer, input, and weight must share a device"
+            )
+        if not output_buffer.is_contiguous():
+            raise ValueError("Unquantized output buffer must be contiguous")
+        torch.mm(
+            x.reshape(-1, x.shape[-1]),
+            layer.weight.t(),
+            out=output_buffer.view(-1, layer.weight.shape[0]),
+        )
+        return output_buffer
+
 
 class LinearBase(PluggableLayer):
     """Base linear layer.
@@ -2164,6 +2204,47 @@ class RowParallelLinear(LinearBase):
         else:
             output = output_parallel
 
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+    def forward_with_output_buffer(
+        self,
+        input_: torch.Tensor,
+        output_buffer: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Run a non-reducing row-parallel projection into caller storage."""
+        if self.reduce_results and self.tp_size > 1:
+            raise ValueError("An output buffer cannot hold a reduced TP result")
+        return self.forward_local_with_output_buffer(input_, output_buffer)
+
+    def forward_local_with_output_buffer(
+        self,
+        input_: torch.Tensor,
+        output_buffer: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Write only this rank's projection partial into caller storage.
+
+        This explicit local API lets large-prefill callers donate a dead
+        tensor and reduce it in place while leaving ordinary/decode calls on
+        ``forward``'s original reduce-results path.
+        """
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        apply = getattr(self.quant_method, "apply_with_output_buffer", None)
+        if apply is None:
+            raise NotImplementedError(
+                f"{type(self.quant_method).__name__} has no output-buffer path"
+            )
+        output = apply(self, input_parallel, output_buffer, bias_)
         if not self.return_bias:
             return output
         output_bias = self.bias if self.skip_bias_add else None

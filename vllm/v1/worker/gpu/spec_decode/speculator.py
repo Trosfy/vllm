@@ -40,6 +40,7 @@ class BaseSpeculator(ABC):
     use_draft_token_capacity: bool = False
     online_sts: "DSparkOnlineSTS | None" = None
     wants_auto_sps_curve: bool = False
+    wants_sps_profile_only: bool = False
 
     def warmup_capacity_kernels(self) -> None:  # noqa: B027
         pass

@@ -43,6 +43,7 @@ _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
 _B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
 _B12X_DCP_CAPTURE_SEQUENCES: dict[int, int] = {}
+_B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -253,7 +254,7 @@ def _try_b12x_dcp_lse_reduce(
         or not cp_attn_out.is_cuda
         or cp_attn_out.dtype not in (torch.float16, torch.bfloat16)
         or cp_attn_lse.dtype != torch.float32
-        or world_size not in (2, 4, 8)
+        or world_size not in _B12X_DCP_WORLD_SIZES
         or cp_attn_out.ndim != 3
         or cp_attn_lse.shape != cp_attn_out.shape[:2]
     ):
@@ -336,7 +337,7 @@ def _try_b12x_dcp_all_gather_heads(
     if (
         not local_input.is_cuda
         or local_input.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-        or world_size not in (2, 4, 8)
+        or world_size not in _B12X_DCP_WORLD_SIZES
         or local_input.ndim != 3
         or not local_input.is_contiguous()
     ):
@@ -411,12 +412,12 @@ def warmup_b12x_dcp_a2a(
     """Create and exercise the B12X DCP channel before CUDA graph capture."""
     if not envs.VLLM_USE_B12X_DCP_A2A:
         return
-    if cp_group.world_size not in (2, 4, 8):
+    if cp_group.world_size not in _B12X_DCP_WORLD_SIZES:
         # The PCIe channel only exists for these world sizes. The runtime
         # dispatchers already fall back to NCCL collectives per call, so an
         # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
         logger.warning_once(
-            "B12X PCIe DCP collectives support world sizes 2/4/8; "
+            "B12X PCIe DCP collectives support world sizes 2/4/8/16; "
             "DCP world size %d uses NCCL collectives instead.",
             cp_group.world_size,
         )
@@ -970,6 +971,28 @@ def dcp_a2a_lse_reduce(
         )
         if b12x_result is not None:
             return b12x_result
+        token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+        if (
+            token_cap > 0
+            and cp_attn_out.shape[0] > token_cap
+            and envs.VLLM_DCP_A2A_LARGE_BACKEND == "ag_rs"
+        ):
+            # ProcessGroupNCCL lazily reserves a sizable transport workspace
+            # on its first all-to-all.  That hidden allocation can fail after
+            # an explicitly sized, near-capacity KV cache has been created.
+            # PyNccl AG+RS uses the already-warmed DCP communicator and keeps
+            # the low-latency B12X path unchanged for decode-sized batches.
+            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+            return cp_lse_ag_out_rs(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                ctx=ctx,
+                return_lse=return_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+                head_major_output=True,
+            )
 
     B, H, D = cp_attn_out.shape
     if H % world_size != 0:

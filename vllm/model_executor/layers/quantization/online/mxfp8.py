@@ -107,6 +107,29 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer, x, bias)
 
+    def apply_with_output_buffer(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output_buffer: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply Marlin MXFP8 directly into caller-owned storage."""
+        from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+            MarlinMxfp8LinearKernel,
+        )
+
+        if not isinstance(self.kernel, MarlinMxfp8LinearKernel):
+            raise NotImplementedError(
+                f"{type(self.kernel).__name__} does not support an output buffer"
+            )
+        return self.kernel.apply_weights(
+            layer,
+            x,
+            bias,
+            output_buffer=output_buffer,
+        )
+
 
 class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
     """MoE method for online MXFP8 (block) quantization."""

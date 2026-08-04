@@ -70,6 +70,10 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_key_concat_kv_cache_insert,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    reduce_kimi_full_width_output,
+    should_reuse_kimi_full_width_output,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
@@ -253,6 +257,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
+        self.tp_size = tp_size
         self.num_heads = num_heads
         self.num_local_heads = num_heads // tp_size
 
@@ -550,6 +555,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
+        prefill_scratch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attention front-end: fused qkv-a proj -> norms -> q_b -> attention.
 
@@ -588,14 +595,24 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe, attn_out)
+        self._attention(
+            positions,
+            q,
+            kv_c_normed,
+            k_pe,
+            attn_out,
+            rope_cos_sin_cache=rope_cos_sin_cache,
+            prefill_scratch=prefill_scratch,
+        )
         return attn_out
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        output_buffer = hidden_states
         # Both branches produce (attn_out, gate); they differ only in whether
         # the g_proj GEMM is overlapped on the aux stream.
         g_proj = self.g_proj
@@ -607,24 +624,43 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
         ):
             attn_out, gate = maybe_execute_in_parallel(
-                lambda: self._forward_attn(positions, hidden_states),
+                lambda: self._forward_attn(
+                    positions, hidden_states, rope_cos_sin_cache
+                ),
                 lambda: g_proj(hidden_states)[0],
                 events[0],
                 events[1],
                 self.aux_stream,
             )
         else:
-            attn_out = self._forward_attn(positions, hidden_states)
             gate = g_proj(hidden_states)[0] if g_proj is not None else None
+            # For large eager prefills, compute the only remaining consumer of
+            # the layer input first. The attention path can then borrow that
+            # dead full-width buffer for padded V instead of asking the CUDA
+            # allocator for another transient beside the physical 1M cache.
+            prefill_scratch = (
+                hidden_states
+                if should_reuse_kimi_full_width_output(hidden_states)
+                else None
+            )
+            attn_out = self._forward_attn(
+                positions,
+                hidden_states,
+                rope_cos_sin_cache,
+                prefill_scratch=prefill_scratch,
+            )
 
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)
 
-        # ``o_proj`` (RowParallelLinear + out-of-place all-reduce) returns a
-        # fresh private tensor, so return it directly rather than copying into a
-        # caller buffer -- the previous ``output[:] = ...`` convention forced an
-        # extra [num_tokens, hidden] copy per layer.
-        return self.o_proj(attn_out)[0]
+        if should_reuse_kimi_full_width_output(output_buffer):
+            output = self.o_proj.forward_local_with_output_buffer(
+                attn_out,
+                output_buffer,
+            )[0]
+            return reduce_kimi_full_width_output(output, self.tp_size)
+        else:
+            return self.o_proj(attn_out)[0]
 
     @eager_break_during_capture
     def _attention(
@@ -634,6 +670,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         attn_out: torch.Tensor,
+        *,
+        rope_cos_sin_cache: torch.Tensor | None = None,
+        prefill_scratch: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_by_layer = forward_context.attn_metadata
@@ -661,7 +700,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.rotary_emb is not None:
             # Pass the fp32 cos/sin table straight to the fused epilogue (it reads
             # fp32 and does the RoPE math in fp32) -- no per-forward dtype cast.
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            cos_sin_cache = (
+                rope_cos_sin_cache
+                if rope_cos_sin_cache is not None
+                else self.rotary_emb.cos_sin_cache
+            )
             rope_positions = positions
 
         # Decode tokens are laid out first, prefill tokens after. The fused
@@ -684,6 +727,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 slot_mapping[num_mqa_tokens:num_actual_toks],
                 attn_metadata,
                 attn_out[num_mqa_tokens:],
+                prefill_scratch,
             )
 
         # ---- Decode: latent multi-query attention ----
@@ -777,6 +821,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         slot_mapping: torch.Tensor,
         attn_metadata,
         out: torch.Tensor,
+        prefill_scratch: torch.Tensor | None,
     ) -> None:
         """Prefill using the fused key-concat + cache-insert kernel.
 
@@ -792,6 +837,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         prefill = attn_metadata.prefill
         has_context = prefill.chunked_context is not None
         fp8_prefill = prefill.q_data_type == current_platform.fp8_dtype()
+        prefill.v_padding_buffer = prefill_scratch
 
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -923,3 +969,4 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         elif not writes_out:
             out.copy_(output_prefill[..., : self.v_head_dim].flatten(start_dim=-2))
+        prefill.v_padding_buffer = None

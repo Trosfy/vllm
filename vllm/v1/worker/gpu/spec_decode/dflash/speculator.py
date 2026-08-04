@@ -20,6 +20,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -196,9 +197,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # constructor: cache planning has populated derived fields such as
         # mamba_block_size, and re-running CLI validation on that internal
         # state can reject an otherwise valid running configuration.
-        draft_vllm_config = copy.copy(
-            _create_draft_vllm_config(self.vllm_config)
-        )
+        draft_vllm_config = copy.copy(_create_draft_vllm_config(self.vllm_config))
         if self.draft_kv_window is not None:
             # This config is used only to size/build the draft attention plan;
             # token positions and the target's admitted context remain global.
@@ -241,6 +240,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        # Target graph capture may finish at different times in independent
+        # DCP groups. The draft graph contains TP collectives spanning those
+        # groups, so starting it as soon as one DCP group returns can overlap
+        # two different collective schedules on the same ranks. Drain the
+        # target capture work and align the complete TP group first.
+        torch.accelerator.synchronize()
+        get_tp_group().barrier()
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to prevent stale values from prior dummy runs
         # from being baked into the captured graph. Mapping rows stay inert.
@@ -258,6 +264,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        # Do not let one DCP subgroup enter post-capture target warmups while
+        # another subgroup still has draft TP graph work in flight.
+        torch.accelerator.synchronize()
+        get_tp_group().barrier()
 
     def get_cudagraph_managers(self) -> tuple[DFlashCudaGraphManager, ...]:
         if self.query_cudagraph_manager is None:
@@ -550,6 +560,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
         num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
         if num_query_per_req is None:
             num_speculative_steps = self.num_speculative_steps
@@ -584,6 +595,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs, :num_speculative_steps] = draft_tokens.view(
             num_reqs, num_speculative_steps
         )
+
+    def _finish_captured_draft(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens_padded: int,
+        num_query_per_req: int,
+        is_profile: bool,
+    ) -> None:
+        """Run work intentionally kept outside a full draft CUDA graph."""
 
     def _build_draft_attn_metadata(
         self,
@@ -680,9 +701,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+            context_states = (
+                aux_hidden_states[0]
+                if len(aux_hidden_states) == 1
+                else torch.cat(aux_hidden_states, dim=-1)
             )
+            hidden_states = self.model.combine_hidden_states(context_states)
         else:
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
@@ -823,6 +847,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self._finish_captured_draft(
+                num_reqs=num_reqs,
+                num_tokens_padded=num_tokens_padded,
+                num_query_per_req=active_query_len,
+                is_profile=is_profile,
+            )
         else:
             self._generate_draft(
                 num_reqs,

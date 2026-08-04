@@ -16,6 +16,8 @@ from vllm.models.kimi_k3.nvidia.model import (
 
 def _make_kimi_linear_model() -> KimiLinearModel:
     model = object.__new__(KimiLinearModel)
+    torch.nn.Module.__init__(model)
+    model.register_buffer("_attn_res_workspace", None, persistent=False)
     object.__setattr__(model, "aux_hidden_state_layers", (2,))
     object.__setattr__(model, "use_sequence_parallel", False)
     return model
@@ -128,3 +130,76 @@ def test_kimi_linear_forward_extracts_attn_res_aux_hidden_states(monkeypatch):
     torch.testing.assert_close(aux_hidden_states[0], initial_hidden_states)
     torch.testing.assert_close(aux_hidden_states[1], prefix_sum + layer_hidden_states)
     assert final_attn_res.call_args.args[2] is block_residual
+
+
+def test_kimi_attn_res_workspace_is_reused_and_sliced():
+    model = _make_kimi_linear_model()
+    object.__setattr__(model, "num_attn_res_blocks", 3)
+
+    largest = model._get_attn_res_workspace(torch.empty(8, 4))
+    smaller = model._get_attn_res_workspace(torch.empty(2, 4))
+
+    assert largest.shape == (8, 3, 4)
+    assert smaller.shape == (2, 3, 4)
+    assert smaller.untyped_storage().data_ptr() == largest.untyped_storage().data_ptr()
+
+    grown = model._get_attn_res_workspace(torch.empty(16, 4))
+    assert grown.shape == (16, 3, 4)
+    assert grown.untyped_storage().data_ptr() != largest.untyped_storage().data_ptr()
+
+
+def test_kimi_attn_res_workspace_can_be_reserved_before_prefill():
+    model = _make_kimi_linear_model()
+    object.__setattr__(model, "use_attn_res", True)
+    object.__setattr__(model, "num_attn_res_blocks", 3)
+    object.__setattr__(model, "_max_num_batched_tokens", 16)
+    object.__setattr__(model, "_model_dtype", torch.bfloat16)
+    object.__setattr__(model, "config", SimpleNamespace(hidden_size=4))
+    model.register_parameter(
+        "reference_weight",
+        torch.nn.Parameter(torch.empty(1, dtype=torch.bfloat16)),
+    )
+
+    model.reserve_attn_res_workspace()
+
+    workspace = model._attn_res_workspace
+    assert workspace is not None
+    assert workspace.shape == (16, 3, 4)
+    assert workspace.dtype == torch.bfloat16
+    ptr = workspace.untyped_storage().data_ptr()
+    sliced = model._get_attn_res_workspace(torch.empty(8, 4, dtype=torch.bfloat16))
+    assert sliced.untyped_storage().data_ptr() == ptr
+
+
+def test_kimi_aux_hidden_states_remain_separate_for_decode():
+    aux_hidden_states = [torch.randn(8, 7168, dtype=torch.bfloat16) for _ in range(5)]
+    block_residual = torch.empty(16, 2048, 7168, dtype=torch.bfloat16).permute(
+        1, 0, 2
+    )[:8]
+
+    result = kimi_model._pack_aux_hidden_states_into_attn_res_workspace(
+        aux_hidden_states,
+        block_residual,
+    )
+
+    assert result is aux_hidden_states
+
+
+def test_kimi_aux_hidden_states_pack_for_large_prefill():
+    aux_hidden_states = [
+        torch.randn(1024, 512, dtype=torch.bfloat16) for _ in range(3)
+    ]
+    expected = torch.cat(aux_hidden_states, dim=-1)
+    block_residual = torch.empty(3, 1024, 512, dtype=torch.bfloat16).permute(1, 0, 2)
+
+    result = kimi_model._pack_aux_hidden_states_into_attn_res_workspace(
+        aux_hidden_states,
+        block_residual,
+    )
+
+    assert len(result) == 1
+    torch.testing.assert_close(result[0], expected, rtol=0, atol=0)
+    assert (
+        result[0].untyped_storage().data_ptr()
+        == block_residual.untyped_storage().data_ptr()
+    )

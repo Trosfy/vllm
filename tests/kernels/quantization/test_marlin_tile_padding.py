@@ -457,6 +457,57 @@ def test_mxfp8_marlin_padded_round_trip(shape):
 
 
 @pytest.mark.skipif(
+    _gpu_marlin_unsupported() or not is_fp8_marlin_supported(),
+    reason="FP8 Marlin is not supported on this GPU type.",
+)
+def test_mxfp8_marlin_uses_caller_output_buffer():
+    size_n, size_k = 256, 256
+    dtype = torch.bfloat16
+    layer = torch.nn.Module()
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    layer.weight = torch.nn.Parameter(
+        (torch.randn(size_n, size_k, dtype=dtype, device="cuda") / 4).to(
+            torch.float8_e4m3fn
+        ),
+        requires_grad=False,
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.full(
+            (size_n, size_k // 32),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        requires_grad=False,
+    )
+    prepare_mxfp8_layer_for_marlin(layer)
+
+    x = torch.randn(8, size_k, dtype=dtype, device="cuda")
+    expected = apply_mxfp8_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        workspace=layer.workspace,
+        size_n=size_n,
+        size_k=size_k,
+    )
+    output_buffer = torch.empty(8, size_n, dtype=dtype, device="cuda")
+    actual = apply_mxfp8_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        workspace=layer.workspace,
+        size_n=size_n,
+        size_k=size_k,
+        output_buffer=output_buffer,
+    )
+
+    assert actual.data_ptr() == output_buffer.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
     _gpu_marlin_unsupported(),
     reason="Marlin is not supported on this GPU type.",
 )

@@ -3,12 +3,121 @@
 
 import torch
 
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # MXFP8 constants
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+
+
+@triton.jit
+def _mxfp8_embedding_kernel(
+    weight_ptr,
+    scale_ptr,
+    ids_ptr,
+    output_ptr,
+    embedding_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col_block = tl.program_id(1)
+    cols = col_block * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < embedding_dim
+    token_id = tl.load(ids_ptr + row).to(tl.int64)
+    values = tl.load(
+        weight_ptr + token_id * embedding_dim + cols,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    scales_per_row: tl.constexpr = embedding_dim // 32
+    scale_exp = tl.load(
+        scale_ptr
+        + token_id * scales_per_row
+        + cols // 32,
+        mask=mask,
+        other=127,
+    ).to(tl.float32)
+    values *= tl.exp2(scale_exp - 127.0)
+    tl.store(output_ptr + row * embedding_dim + cols, values, mask=mask)
+
+
+def _mxfp8_embedding_impl(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> torch.Tensor:
+    if weight.dtype != MXFP8_VALUE_DTYPE or weight.ndim != 2:
+        raise TypeError(
+            "MXFP8 embedding expects a 2-D float8_e4m3fn weight, got "
+            f"shape={tuple(weight.shape)}, dtype={weight.dtype}."
+        )
+    if weight.shape[1] % MXFP8_BLOCK_SIZE:
+        raise ValueError(
+            f"MXFP8 embedding dimension {weight.shape[1]} must be divisible "
+            f"by {MXFP8_BLOCK_SIZE}."
+        )
+    expected_scale_shape = (
+        weight.shape[0],
+        weight.shape[1] // MXFP8_BLOCK_SIZE,
+    )
+    if weight_scale.dtype != MXFP8_SCALE_DTYPE or tuple(weight_scale.shape) != (
+        expected_scale_shape
+    ):
+        raise TypeError(
+            "MXFP8 embedding scale must be row-major uint8 with shape "
+            f"{expected_scale_shape}, got shape={tuple(weight_scale.shape)}, "
+            f"dtype={weight_scale.dtype}."
+        )
+    if token_ids.device != weight.device:
+        raise ValueError("MXFP8 embedding token ids and weight must share a device.")
+
+    output = torch.empty(
+        (*token_ids.shape, weight.shape[1]),
+        dtype=torch.bfloat16,
+        device=weight.device,
+    )
+    flat_ids = token_ids.reshape(-1)
+    block = min(256, triton.next_power_of_2(weight.shape[1]))
+    _mxfp8_embedding_kernel[(flat_ids.numel(), triton.cdiv(weight.shape[1], block))](
+        weight,
+        weight_scale,
+        flat_ids,
+        output,
+        embedding_dim=weight.shape[1],
+        BLOCK=block,
+    )
+    return output
+
+
+def _mxfp8_embedding_fake(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> torch.Tensor:
+    del weight_scale
+    return torch.empty(
+        (*token_ids.shape, weight.shape[1]),
+        dtype=torch.bfloat16,
+        device=weight.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="mxfp8_embedding",
+    op_func=_mxfp8_embedding_impl,
+    fake_impl=_mxfp8_embedding_fake,
+)
+
+
+def mxfp8_embedding(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Lookup and dequantize only the requested rows of an MXFP8 table."""
+    return torch.ops.vllm.mxfp8_embedding(weight, weight_scale, token_ids)
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:

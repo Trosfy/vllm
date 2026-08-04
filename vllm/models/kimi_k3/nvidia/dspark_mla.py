@@ -9,11 +9,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -28,6 +33,8 @@ from vllm.models.kimi_k3.nvidia.mla import (
 )
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
+
+logger = init_logger(__name__)
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -80,6 +87,7 @@ class K3DSparkDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             # First layer: hidden_states is the (already reduced) embedding.
@@ -93,6 +101,7 @@ class K3DSparkDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            rope_cos_sin_cache=rope_cos_sin_cache,
         )
         hidden_states, residual = fused_allreduce_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
@@ -122,6 +131,38 @@ def _restore_layer_major_kv_order(
         .transpose(-3, -2)
         .flatten(-3)
     )
+
+
+def _fill_compact_rope_cache(
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+    freqs_workspace: torch.Tensor,
+    cache_workspace: torch.Tensor,
+    *,
+    mscale: float,
+) -> torch.Tensor:
+    """Materialize only the RoPE rows consumed by the current draft step.
+
+    K3 DSpark uses absolute target positions up to 1M, but a proposal step has
+    at most ``max_num_batched_tokens`` rows.  Computing those rows into stable
+    workspaces is exact with respect to the normal fp32 table and avoids
+    retaining a 256 MiB table on every TP rank.
+    """
+    num_positions = int(positions.shape[0])
+    if num_positions > int(freqs_workspace.shape[0]):
+        raise ValueError(
+            "K3 DSpark compact RoPE workspace is too small: "
+            f"positions={num_positions}, capacity={freqs_workspace.shape[0]}."
+        )
+    freqs = freqs_workspace[:num_positions]
+    cache = cache_workspace[:num_positions]
+    half_dim = int(inv_freq.shape[0])
+    torch.mul(positions[:, None], inv_freq[None, :], out=freqs)
+    torch.cos(freqs, out=cache[:, :half_dim])
+    torch.sin(freqs, out=cache[:, half_dim:])
+    if mscale != 1.0:
+        cache.mul_(mscale)
+    return cache
 
 
 class K3DSparkModel(nn.Module):
@@ -175,11 +216,112 @@ class K3DSparkModel(nn.Module):
             self.config.draft_vocab_size,
             self.config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+            quant_config=self.quant_config,
         )
         self._context_kv_fusion_available: bool | None = None
         self._max_num_context_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self._compact_rope_enabled = bool(envs.VLLM_DSPARK_COMPACT_ROPE)
+        if self._compact_rope_enabled:
+            self._init_compact_rope()
+
+    def _init_compact_rope(self) -> None:
+        rotary_modules = [layer.self_attn.rotary_emb for layer in self.layers]
+        if not rotary_modules or any(rotary is None for rotary in rotary_modules):
+            raise RuntimeError("K3 DSpark compact RoPE requires rotary draft layers.")
+        rotary = rotary_modules[0]
+        assert rotary is not None
+        if any(candidate is not rotary for candidate in rotary_modules[1:]):
+            raise RuntimeError(
+                "K3 DSpark compact RoPE requires all draft layers to share one "
+                "immutable rotary embedding."
+            )
+        if not hasattr(rotary, "scaling_factor"):
+            raise TypeError(
+                "K3 DSpark compact RoPE currently requires a YaRN rotary "
+                f"embedding, got {type(rotary).__name__}."
+            )
+
+        full_cache = rotary.cos_sin_cache
+        if full_cache.dtype != torch.float32 or full_cache.ndim != 2:
+            raise TypeError(
+                "K3 DSpark compact RoPE requires a 2-D fp32 source cache, got "
+                f"shape={tuple(full_cache.shape)}, dtype={full_cache.dtype}."
+            )
+        # Recompute on the same device on which the original table was built.
+        # YaRN's fp32 inverse frequencies can differ slightly when evaluated on
+        # CPU and then copied to CUDA, which would defeat exact replacement.
+        with torch.device(full_cache.device):
+            inv_freq = rotary._compute_inv_freq(  # noqa: SLF001
+                rotary.scaling_factor
+            )
+        inv_freq = inv_freq.to(dtype=torch.float32)
+        half_dim = int(inv_freq.shape[0])
+        if int(full_cache.shape[1]) != 2 * half_dim:
+            raise ValueError(
+                "K3 DSpark compact RoPE frequency width does not match its "
+                f"source table: inv_freq={half_dim}, cache={full_cache.shape[1]}."
+            )
+
+        self.register_buffer("_compact_rope_inv_freq", inv_freq, persistent=False)
+        self.register_buffer(
+            "_compact_rope_freqs",
+            torch.empty(
+                (self._max_num_context_tokens, half_dim),
+                dtype=torch.float32,
+                device=full_cache.device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_compact_rope_cache",
+            torch.empty(
+                (self._max_num_context_tokens, 2 * half_dim),
+                dtype=torch.float32,
+                device=full_cache.device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_compact_rope_positions",
+            torch.arange(
+                self._max_num_context_tokens,
+                dtype=torch.int64,
+                device=full_cache.device,
+            ),
+            persistent=False,
+        )
+        self._compact_rope_mscale = float(rotary.mscale)
+
+        released_bytes = full_cache.numel() * full_cache.element_size()
+        # ``get_rope`` interns this module, so replacing its registered buffer
+        # releases the single table shared by all five draft layers.
+        rotary.cos_sin_cache = torch.empty(
+            (0, 2 * half_dim), dtype=torch.float32, device=full_cache.device
+        )
+        logger.info_once(
+            "K3 DSpark compact RoPE released %.2f MiB/rank; materializing at "
+            "most %d fp32 rows per forward.",
+            released_bytes / (1024**2),
+            self._max_num_context_tokens,
+        )
+
+    def _get_rope_inputs(
+        self, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rotary = self.layers[0].self_attn.rotary_emb
+        assert rotary is not None
+        if not self._compact_rope_enabled:
+            return positions, rotary.cos_sin_cache
+        cache = _fill_compact_rope_cache(
+            positions,
+            self._compact_rope_inv_freq,
+            self._compact_rope_freqs,
+            self._compact_rope_cache,
+            mscale=self._compact_rope_mscale,
+        )
+        return self._compact_rope_positions[: positions.shape[0]], cache
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -206,6 +348,7 @@ class K3DSparkModel(nn.Module):
 
         # Quantized fallback. Directly invoking the projection modules preserves
         # their quantization methods, at the cost of also computing unused Q rows.
+        rope_positions, rope_cos_sin_cache = self._get_rope_inputs(context_positions)
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.self_attn
             assert attn.fused_qkv_a_proj is not None
@@ -223,11 +366,11 @@ class K3DSparkModel(nn.Module):
             # consumes the same (possibly scaled fp32) cos/sin cache.
             rotary_emb = attn.rotary_emb
             ops.rotary_embedding(
-                context_positions,
+                rope_positions,
                 k_pe,
                 None,
                 rotary_emb.head_size,
-                rotary_emb.cos_sin_cache,
+                rope_cos_sin_cache,
                 rotary_emb.is_neox_style,
             )
 
@@ -370,7 +513,8 @@ class K3DSparkModel(nn.Module):
         all_k_pe = all_k_pe.permute(1, 0, 2).contiguous()
         all_k_pe_flat = all_k_pe.view(num_layers * num_ctx, 1, self._context_rope_dim)
         repeated_positions = self._context_positions_repeated[: num_layers * num_ctx]
-        repeated_positions.view(num_layers, num_ctx).copy_(context_positions)
+        rope_positions, rope_cos_sin_cache = self._get_rope_inputs(context_positions)
+        repeated_positions.view(num_layers, num_ctx).copy_(rope_positions)
         # Keep the single-tensor context RoPE on vLLM's optimized CUDA op;
         # DeepSeek YaRN's FlashInfer wrapper assumes a non-null key tensor.
         rotary_emb = self.layers[0].self_attn.rotary_emb
@@ -380,7 +524,7 @@ class K3DSparkModel(nn.Module):
             all_k_pe_flat,
             None,
             rotary_emb.head_size,
-            rotary_emb.cos_sin_cache,
+            rope_cos_sin_cache,
             rotary_emb.is_neox_style,
         )
         all_k_pe = all_k_pe_flat.view(num_layers, num_ctx, 1, self._context_rope_dim)
@@ -486,11 +630,13 @@ class K3DSparkModel(nn.Module):
 
         hidden_states = inputs_embeds
         residual = None
+        rope_positions, rope_cos_sin_cache = self._get_rope_inputs(positions)
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions=positions,
+                positions=rope_positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                rope_cos_sin_cache=rope_cos_sin_cache,
             )
         hidden_states, _ = fused_allreduce_rms_norm(
             hidden_states, residual, self.final_norm
@@ -570,6 +716,64 @@ class K3DSparkForCausalLM(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
 
+    def supports_local_draft_argmax(self) -> bool:
+        """Validate the no-full-vocab-gather path for sharded Markov sampling."""
+        markov_head = self.model.markov_head
+        if not markov_head.shard_across_tp:
+            return False
+        if not isinstance(self.lm_head, VocabParallelEmbedding):
+            raise TypeError(
+                "K3 local draft argmax requires a vocab-parallel target LM head."
+            )
+        markov_w2 = markov_head.markov_w2
+        if not isinstance(markov_w2, VocabParallelEmbedding):
+            raise TypeError(
+                "K3 local draft argmax requires a vocab-parallel Markov W2."
+            )
+        layout_fields = (
+            "tp_size",
+            "tp_rank",
+            "num_embeddings",
+            "org_vocab_size",
+            "num_embeddings_padded",
+            "num_embeddings_per_partition",
+        )
+        mismatches = [
+            field
+            for field in layout_fields
+            if getattr(self.lm_head, field) != getattr(markov_w2, field)
+        ]
+        if mismatches or self.lm_head.shard_indices != markov_w2.shard_indices:
+            raise ValueError(
+                "Target LM head and Markov W2 use different TP vocabulary "
+                f"layouts (mismatches={mismatches})."
+            )
+        if self.logits_processor.soft_cap is not None:
+            raise ValueError(
+                "K3 local draft argmax cannot combine base and Markov logits "
+                "exactly when logit soft-capping is enabled."
+            )
+        if self.logits_processor.scale <= 0.0:
+            raise ValueError("K3 local draft sampling requires a positive logit scale.")
+        return True
+
+    def compute_local_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
+        return self.logits_processor._apply_head(self.lm_head, hidden_states, None)
+
+    def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
+
+    def sample_local_draft_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
+        # A full gather is faster than a tiny pair gather on this TP16 PCIe
+        # topology (0.55 vs 0.79 ms for all seven Markov steps). Base and
+        # Markov logits are added locally first, so this remains one collective
+        # per step and no collective is captured in the draft CUDA graph.
+        logits = tensor_model_parallel_all_gather(logits, dim=-1)
+        logits = logits[..., : self.logits_processor.org_vocab_size]
+        return logits.argmax(dim=-1)
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
@@ -587,5 +791,10 @@ class K3DSparkForCausalLM(nn.Module):
             skip_substrs=list(self.checkpoint_skip_substrs),
         )
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # The replicated Markov embedding is not a LinearBase, so finalize its
+        # online MXFP8 representation explicitly after its BF16 checkpoint row
+        # has loaded.  This only affects draft acceptance; target verification
+        # and final output probabilities remain those of the full model.
+        self.model.markov_head.process_weights_after_loading()
         self.model._build_fused_context_kv_buffers()
         return loaded_weights

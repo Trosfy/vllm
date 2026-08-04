@@ -30,6 +30,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -39,6 +40,8 @@ from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -66,6 +69,17 @@ class DSparkSpeculator(DFlashSpeculator):
         self.hidden_states = torch.zeros(
             self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
         )
+
+        # NCCL collectives from a TP-sharded Markov head must not be captured
+        # in the draft's full CUDA graph. Replaying that graph immediately
+        # before target DCP collectives can poison the next communicator with
+        # ``NCCL Error 1: unhandled cuda error``. Keep the five-layer draft
+        # backbone captured, copy its tiny query output to a stable buffer in
+        # the graph, and run only the sequential Markov head eagerly.
+        self._markov_outside_cudagraph = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+        self._use_local_draft_argmax = False
+        self._captured_markov_hidden: torch.Tensor | None = None
+        self._captured_base_logits: torch.Tensor | None = None
 
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
@@ -120,6 +134,12 @@ class DSparkSpeculator(DFlashSpeculator):
         sps_curve = self.speculative_config.dspark_sps_curve
         self.sps_table: torch.Tensor | None = None
         self.wants_auto_sps_curve = sps_curve == "auto"
+        self.wants_sps_profile_only = envs.VLLM_DSPARK_PROFILE_SPS_ONLY
+        if self.wants_auto_sps_curve and self.wants_sps_profile_only:
+            raise ValueError(
+                "VLLM_DSPARK_PROFILE_SPS_ONLY cannot be combined with "
+                'dspark_sps_curve="auto".'
+            )
         if sps_curve is not None:
             # Sized for the pow2-padded request count the allocator kernel
             # can index under CUDA graph capture.
@@ -189,27 +209,74 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
+        if self._markov_outside_cudagraph:
+            supports_local_argmax = getattr(model, "supports_local_draft_argmax", None)
+            if supports_local_argmax is None or not supports_local_argmax():
+                raise RuntimeError(
+                    "A TP-sharded DSpark Markov head requires model support "
+                    "for local draft argmax."
+                )
+            if self.draft_logits is not None:
+                raise ValueError(
+                    "TP-sharded DSpark Markov sampling currently supports "
+                    "deterministic draft sampling only."
+                )
+            self._use_local_draft_argmax = True
+            max_markov_rows = self.max_num_reqs * self.num_speculative_steps
+            local_vocab_size = model.lm_head.num_embeddings_per_partition
+            logits_dtype = model.logits_processor.head_dtype or self.dtype
+            self._captured_markov_hidden = torch.empty(
+                max_markov_rows,
+                self.draft_model_config.get_hidden_size(),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._captured_base_logits = torch.empty(
+                max_markov_rows,
+                local_vocab_size,
+                dtype=logits_dtype,
+                device=self.device,
+            )
+            logger.info_once(
+                "DSpark keeps its TP-sharded Markov collectives outside the "
+                "draft CUDA graph and combines base/Markov logits locally "
+                "before one eager vocabulary gather per draft step; the "
+                "draft backbone and local base logits remain captured."
+            )
         return model
 
     def _sample_sequential(
         self,
         num_reqs: int,
-        head_hidden: torch.Tensor,
+        head_hidden: torch.Tensor | None,
         num_speculative_steps: int,
         num_query_per_req: int,
         is_profile: bool = False,
         use_capacity: bool = True,
+        prepared_sample_hidden: torch.Tensor | None = None,
+        precomputed_base_logits: torch.Tensor | None = None,
     ) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        sample_hidden = sample_hidden.view(num_reqs, n_spec, -1)
+        if prepared_sample_hidden is None:
+            assert head_hidden is not None
+            sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+            sample_hidden = sample_hidden.view(num_reqs, n_spec, -1)
+        else:
+            sample_hidden = prepared_sample_hidden.view(num_reqs, n_spec, -1)
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(
-            sample_hidden.reshape(num_sample, -1)
-        )
+        if precomputed_base_logits is not None:
+            base_logits = precomputed_base_logits
+        elif self._use_local_draft_argmax:
+            base_logits = self.model.compute_local_draft_logits(
+                sample_hidden.reshape(num_sample, -1)
+            )
+        else:
+            base_logits = self.model.compute_draft_logits(
+                sample_hidden.reshape(num_sample, -1)
+            )
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
@@ -241,7 +308,10 @@ class DSparkSpeculator(DFlashSpeculator):
                         "confidence-head weights."
                     )
                 confidence_logits[:, i] = confidence_i
-            bias = self.model.markov_bias(markov_embed)
+            if self._use_local_draft_argmax:
+                bias = self.model.compute_local_markov_bias(markov_embed)
+            else:
+                bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             if self.draft_logits is not None:
                 # Probabilistic: sample in target vocab (a reduced draft vocab is
@@ -263,6 +333,8 @@ class DSparkSpeculator(DFlashSpeculator):
                     draft_step=self._step_cols[i],
                     draft_logits=self.draft_logits,
                 )
+            elif self._use_local_draft_argmax:
+                draft_sampled_i = self.model.sample_local_draft_logits(logits_i)
             else:
                 draft_sampled_i = self.model.map_draft_to_target(
                     logits_i.argmax(dim=-1)
@@ -400,6 +472,7 @@ class DSparkSpeculator(DFlashSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
         num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
         if num_query_per_req is None:
             num_query_per_req = self.num_query_per_req
@@ -413,6 +486,25 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        if self._markov_outside_cudagraph:
+            assert self._captured_markov_hidden is not None
+            assert self._captured_base_logits is not None
+            num_sample = num_reqs * num_speculative_steps
+            if num_sample > self._captured_markov_hidden.shape[0]:
+                raise ValueError(
+                    "DSpark captured Markov buffer is too small: "
+                    f"rows={num_sample}, "
+                    f"capacity={self._captured_markov_hidden.shape[0]}."
+                )
+            # CudaGraphManager runs an eager descriptor warmup before entering
+            # torch.cuda.graph(). That call is still part of graph creation,
+            # and must not launch the sharded Markov TP collectives either.
+            if capture_only or torch.cuda.is_current_stream_capturing():
+                sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+                base_logits = self.model.compute_local_draft_logits(sample_hidden)
+                self._captured_markov_hidden[:num_sample].copy_(sample_hidden)
+                self._captured_base_logits[:num_sample].copy_(base_logits)
+                return
         self._sample_sequential(
             num_reqs,
             head_hidden,
@@ -423,4 +515,32 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.capacity_activation_batch_size <= 0
                 or num_reqs >= self.capacity_activation_batch_size
             ),
+        )
+
+    def _finish_captured_draft(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens_padded: int,
+        num_query_per_req: int,
+        is_profile: bool,
+    ) -> None:
+        if not self._markov_outside_cudagraph:
+            return
+        assert self._captured_markov_hidden is not None
+        assert self._captured_base_logits is not None
+        num_speculative_steps = self._speculative_steps_for_query_len(num_query_per_req)
+        num_sample = num_reqs * num_speculative_steps
+        self._sample_sequential(
+            num_reqs,
+            None,
+            num_speculative_steps,
+            num_query_per_req,
+            is_profile=is_profile,
+            use_capacity=(
+                self.capacity_activation_batch_size <= 0
+                or num_reqs >= self.capacity_activation_batch_size
+            ),
+            prepared_sample_hidden=self._captured_markov_hidden[:num_sample],
+            precomputed_base_logits=self._captured_base_logits[:num_sample],
         )

@@ -814,6 +814,52 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     assert result is None
 
 
+def test_oversized_b12x_batch_routes_to_head_major_ag_rs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import common, dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    monkeypatch.setenv("VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs")
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_lse_reduce", lambda *a, **k: None)
+    sentinel = torch.zeros(1)
+    captured: dict[str, Any] = {}
+
+    def fake_ag_rs(output, lse, group, **kwargs):
+        captured.update(output=output, lse=lse, group=group, **kwargs)
+        return sentinel
+
+    monkeypatch.setattr(common, "cp_lse_ag_out_rs", fake_ag_rs)
+    group = _FakeCPGroup(2, None)  # type: ignore[arg-type]
+    output = torch.zeros(5, 8, 16, dtype=torch.bfloat16)
+    lse = torch.zeros(5, 8, dtype=torch.float32)
+    ctx = object()
+
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        output,
+        lse,
+        group,  # type: ignore[arg-type]
+        ctx=ctx,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        use_b12x=True,
+        b12x_max_batch_size=4,
+        b12x_query_head_dim=16,
+    )
+
+    assert actual is sentinel
+    assert captured == {
+        "output": output,
+        "lse": lse,
+        "group": group,
+        "ctx": ctx,
+        "return_lse": False,
+        "is_lse_base_on_e": True,
+        "head_major_output": True,
+    }
+
+
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
@@ -1370,8 +1416,8 @@ def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
     from sparkinfer.comm.pcie.pcie_dcp_a2a import _load_extension
 
     world_size = int(os.getenv("VLLM_TEST_B12X_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8):
-        pytest.skip("B12X DCP A2A supports world sizes 2, 4, and 8")
+    if world_size not in (2, 4, 8, 16):
+        pytest.skip("B12X DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs")
     _load_extension()

@@ -1218,6 +1218,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    group_size_override: int | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1333,6 +1334,13 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    if group_size_override is not None:
+        if group_size_override <= 0:
+            raise ValueError(
+                f"KV cache group size override must be positive, got "
+                f"{group_size_override}."
+            )
+        group_size = group_size_override
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -2088,7 +2096,38 @@ def get_kv_cache_groups(
         if fallback_groups is None:
             raise
         return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    k3_group_size = envs.VLLM_K3_KV_GROUP_SIZE
+    use_k3_group_size_override = (
+        k3_group_size > 0
+        and model_type == "kimi_k3"
+        and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+        and any(
+            isinstance(spec, SlidingWindowMLASpec)
+            and spec.non_causal_multi_token_decode
+            for spec in filtered_spec.values()
+        )
+    )
+    if use_k3_group_size_override:
+        # K3's default group size of five pads its 24 target MLA layers and 69
+        # KDA states. A singleton layout removes all padding but creates 98 GPU
+        # block tables, which costs substantially more memory than it saves.
+        # Six is the useful compromise for target+KDA+five-layer DSpark: it
+        # produces only 17 groups (three fewer than the default) and, with a
+        # 32K draft tail, also removes about 44.7 MiB/rank of cache padding.
+        groups = _get_kv_cache_groups_uniform_page_size(
+            filtered_spec, group_size_override=k3_group_size
+        )
+        logger.info_once(
+            "Kimi-K3 is using hybrid KV group size %d (%d groups) to reduce "
+            "cache padding and block-table overhead.",
+            k3_group_size,
+            len(groups),
+        )
+    else:
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:

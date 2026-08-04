@@ -20,18 +20,51 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    Mxfp8OnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
+    mxfp8_embedding,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    VocabParallelEmbedding,
 )
+from vllm.model_executor.utils import replace_parameter
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
 logger = init_logger(__name__)
+
+
+class DSparkMarkovEmbedding(nn.Embedding):
+    """Replicated Markov lookup with an optional online MXFP8 representation."""
+
+    def __init__(self, vocab_size: int, markov_rank: int, *, use_mxfp8: bool):
+        super().__init__(vocab_size, markov_rank)
+        self.use_mxfp8 = use_mxfp8
+        self._mxfp8_processed = False
+
+    @torch.inference_mode()
+    def process_weights_after_loading(self) -> None:
+        if not self.use_mxfp8 or self._mxfp8_processed:
+            return
+        weight, weight_scale = mxfp8_e4m3_quantize(self.weight.contiguous())
+        replace_parameter(self, "weight", weight.data)
+        self.register_buffer("weight_scale", weight_scale, persistent=False)
+        self._mxfp8_processed = True
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if not self._mxfp8_processed:
+            return super().forward(token_ids)
+        return mxfp8_embedding(self.weight, self.weight_scale, token_ids)
 
 
 class DSparkMarkovHead(nn.Module):
@@ -42,9 +75,10 @@ class DSparkMarkovHead(nn.Module):
     (``draft_vocab_size``) added to the base draft logits. The two sizes
     coincide for full-vocab drafts.
 
-    Both weights are replicated because the head runs sequentially for every
-    draft position. Sharding them would add an all-reduce and a full-vocab
-    gather to each position.
+    By default both weights are replicated because the head runs sequentially
+    for every draft position. Large-vocabulary deployments can opt into TP
+    sharding; model-specific deterministic samplers may then reduce only the
+    local argmax pairs instead of gathering the full vocabulary.
     """
 
     def __init__(
@@ -53,16 +87,46 @@ class DSparkMarkovHead(nn.Module):
         draft_vocab_size: int,
         markov_rank: int,
         prefix: str,
+        quant_config=None,
     ) -> None:
         super().__init__()
-        self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+        self.shard_across_tp = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+        if self.shard_across_tp:
+            # This is the original DSpark layout.  It removes almost all of
+            # the 160 MiB replicated BF16 head at TP16.  The sequential path
+            # pays one 256-element all-reduce and one vocab all-gather for
+            # each proposed token, so keep replication as the default for
+            # models that have enough memory.
+            self.markov_w1 = VocabParallelEmbedding(
+                vocab_size,
+                markov_rank,
+                prefix=maybe_prefix(prefix, "markov_w1"),
+            )
+            self.markov_w2 = ParallelLMHead(
+                draft_vocab_size,
+                markov_rank,
+                bias=False,
+                prefix=maybe_prefix(prefix, "markov_w2"),
+            )
+            return
+
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size,
             markov_rank,
             bias=False,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "markov_w2"),
             disable_tp=True,
         )
+        self.markov_w1 = DSparkMarkovEmbedding(
+            vocab_size,
+            markov_rank,
+            use_mxfp8=isinstance(self.markov_w2.quant_method, Mxfp8OnlineLinearMethod),
+        )
+
+    def process_weights_after_loading(self) -> None:
+        if isinstance(self.markov_w1, DSparkMarkovEmbedding):
+            self.markov_w1.process_weights_after_loading()
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
@@ -75,6 +139,16 @@ class DSparkMarkovHead(nn.Module):
     ) -> torch.Tensor:
         """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
         return logits_processor(self.markov_w2, markov_embed)
+
+    def local_bias(
+        self,
+        markov_embed: torch.Tensor,
+        logits_processor: LogitsProcessor,
+    ) -> torch.Tensor:
+        """Return this TP rank's unprocessed transition-bias shard."""
+        if not self.shard_across_tp:
+            raise RuntimeError("Local Markov bias requires a TP-sharded head.")
+        return logits_processor._apply_head(self.markov_w2, markov_embed, None)
 
 
 class DSparkConfidenceHead(nn.Module):

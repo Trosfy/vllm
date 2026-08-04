@@ -24,6 +24,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.attention.backends.mla.prefill.flash_attn import (
     FlashAttnPrefillBackend,
+    _pad_v_with_optional_buffer,
 )
 
 _FA_MODULE = "vllm.v1.attention.backends.mla.prefill.flash_attn"
@@ -113,6 +114,28 @@ def test_flash_attn_prefill_backend_signature_accepts_fused_kwargs():
     base_params = inspect.signature(MLAPrefillBackend.run_prefill_new_tokens).parameters
     assert "out" in base_params
     assert "output_scale" in base_params
+
+
+def test_flash_attn_v_padding_reuses_caller_buffer():
+    v = torch.arange(2 * 3 * 4, dtype=torch.bfloat16).view(2, 3, 4)
+    buffer = torch.full((128,), -1, dtype=torch.bfloat16)
+
+    padded = _pad_v_with_optional_buffer(v, 7, buffer)
+
+    assert padded.data_ptr() == buffer.data_ptr()
+    torch.testing.assert_close(padded[..., :4], v, atol=0, rtol=0)
+    torch.testing.assert_close(padded[..., 4:], torch.zeros_like(padded[..., 4:]))
+
+
+def test_flash_attn_v_padding_falls_back_for_small_buffer():
+    v = torch.arange(2 * 3 * 4, dtype=torch.bfloat16).view(2, 3, 4)
+    buffer = torch.empty(2, dtype=torch.bfloat16)
+
+    padded = _pad_v_with_optional_buffer(v, 7, buffer)
+
+    assert padded.data_ptr() != buffer.data_ptr()
+    torch.testing.assert_close(padded[..., :4], v, atol=0, rtol=0)
+    torch.testing.assert_close(padded[..., 4:], torch.zeros_like(padded[..., 4:]))
 
 
 def test_mla_impl_forward_mha_accepts_output_scale():

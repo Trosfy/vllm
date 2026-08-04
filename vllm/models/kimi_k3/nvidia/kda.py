@@ -47,6 +47,10 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    reduce_kimi_full_width_output,
+    should_reuse_kimi_full_width_output,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -400,6 +404,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 prefix=f"{prefix}.in_proj_qkvgfab",
             )
         if self.in_proj_padding:
+            self.in_proj_qkvgfab._vllm_online_processing_unloaded = {
+                "weight": self.in_proj_padding * self.hidden_size,
+            }
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
         self.f_b_proj = ColumnParallelLinear(
@@ -522,6 +529,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
+        output_buffer = hidden_states
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
         split_sizes = [
             3 * self.local_projection_size,
@@ -553,7 +561,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        return self.o_proj(core_attn_out)[0]
+        if should_reuse_kimi_full_width_output(output_buffer):
+            output = self.o_proj.forward_local_with_output_buffer(
+                core_attn_out,
+                output_buffer,
+            )[0]
+            return reduce_kimi_full_width_output(output, self.tp_size)
+        else:
+            return self.o_proj(core_attn_out)[0]
 
     @eager_break_during_capture
     def _forward(

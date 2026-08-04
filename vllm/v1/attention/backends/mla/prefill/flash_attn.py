@@ -275,6 +275,43 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
 FA4_MLA_PREFILL_KERNEL = FA4MLAPrefillKernel()
 
 
+def _pad_v_with_optional_buffer(
+    v: torch.Tensor,
+    padded_head_dim: int,
+    buffer: torch.Tensor | None,
+) -> torch.Tensor:
+    """Pad V into caller-owned storage when it is large enough.
+
+    Long-context Kimi-K3 runs keep almost no allocator headroom after the
+    physical 1M KV cache is reserved.  The model can donate a dead full-width
+    activation here; using it avoids a small but fatal late ``F.pad``
+    allocation without retaining another per-layer workspace.
+    """
+    if padded_head_dim < v.shape[-1]:
+        raise ValueError(
+            f"Padded V head dim {padded_head_dim} is smaller than {v.shape[-1]}"
+        )
+    if padded_head_dim == v.shape[-1]:
+        return v
+
+    padded_numel = (v.numel() // v.shape[-1]) * padded_head_dim
+    if (
+        buffer is not None
+        and buffer.device == v.device
+        and buffer.dtype == v.dtype
+        and buffer.is_contiguous()
+        and buffer.numel() >= padded_numel
+    ):
+        padded_v = buffer.flatten()[:padded_numel].view(
+            *v.shape[:-1], padded_head_dim
+        )
+        padded_v[..., : v.shape[-1]].copy_(v)
+        padded_v[..., v.shape[-1] :].zero_()
+        return padded_v
+
+    return torch.nn.functional.pad(v, [0, padded_head_dim - v.shape[-1]], value=0)
+
+
 class FlashAttnPrefillBackend(MLAPrefillBackend):
     """FlashAttention backend for MLA prefill."""
 
@@ -383,8 +420,10 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         maybe_padded_v = v
         if self.requires_v_padding:
-            maybe_padded_v = torch.nn.functional.pad(
-                v, [0, q.shape[-1] - v.shape[-1]], value=0
+            maybe_padded_v = _pad_v_with_optional_buffer(
+                v,
+                q.shape[-1],
+                getattr(self._prefill_metadata, "v_padding_buffer", None),
             )
 
         if self._is_vllm_fa:

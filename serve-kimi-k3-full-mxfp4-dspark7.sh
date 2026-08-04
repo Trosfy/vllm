@@ -30,10 +30,17 @@ KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-500000000}"
 DSPARK_DRAFT_KV_WINDOW="${DSPARK_DRAFT_KV_WINDOW:-0}"
 DSPARK_DRAFT_WEIGHT_FORMAT="${DSPARK_DRAFT_WEIGHT_FORMAT:-bf16}"
 DSPARK_DRAFT_MXFP8_BACKEND="${DSPARK_DRAFT_MXFP8_BACKEND:-marlin}"
+DSPARK_SHARD_MARKOV_HEAD="${DSPARK_SHARD_MARKOV_HEAD:-0}"
+KIMI_TARGET_MXFP8_PROFILE="${KIMI_TARGET_MXFP8_PROFILE:-none}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND:-B12X_MLA}"
 DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-greedy}"
 REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD:-block}"
+DSPARK_SPS_CURVE="${DSPARK_SPS_CURVE:-}"
+DSPARK_SPS_OVERHEAD_MS="${DSPARK_SPS_OVERHEAD_MS:-0.0}"
+DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW="${DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:-0}"
+DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE="${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-0}"
+DSPARK_PROFILE_SPS_ONLY="${DSPARK_PROFILE_SPS_ONLY:-0}"
 if (( DCP_SIZE > 1 )); then
   DCP_COMM_BACKEND="${DCP_COMM_BACKEND:-a2a}"
 else
@@ -44,8 +51,8 @@ if (( TP_SIZE != 16 )); then
   echo "This profile is validated only for TP_SIZE=16, got ${TP_SIZE}" >&2
   exit 2
 fi
-if (( DCP_SIZE != 1 && DCP_SIZE != 8 )); then
-  echo "This profile is validated only for DCP_SIZE=1 or 8, got ${DCP_SIZE}" >&2
+if (( DCP_SIZE != 1 && DCP_SIZE != 8 && DCP_SIZE != 16 )); then
+  echo "This profile supports DCP_SIZE=1, 8, or 16, got ${DCP_SIZE}" >&2
   exit 2
 fi
 if (( TP_SIZE % DCP_SIZE != 0 )); then
@@ -53,7 +60,7 @@ if (( TP_SIZE % DCP_SIZE != 0 )); then
   exit 2
 fi
 if (( DCP_SIZE > 1 )) && [[ "${DCP_COMM_BACKEND}" != "a2a" ]]; then
-  echo "DSpark DCP8 requires DCP_COMM_BACKEND=a2a" >&2
+  echo "DSpark DCP requires DCP_COMM_BACKEND=a2a" >&2
   exit 2
 fi
 if (( NUM_SPECULATIVE_TOKENS != 7 )); then
@@ -78,6 +85,21 @@ case "${REJECTION_SAMPLE_METHOD}" in
     exit 2
     ;;
 esac
+if [[ ! "${DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}" =~ ^[0-9]+$ ]]; then
+  echo "DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW must be a non-negative integer" >&2
+  exit 2
+fi
+if [[ ! "${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE}" =~ ^[0-9]+$ ]]; then
+  echo "DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE must be a non-negative integer" >&2
+  exit 2
+fi
+case "${DSPARK_PROFILE_SPS_ONLY}" in
+  0 | 1) ;;
+  *)
+    echo "DSPARK_PROFILE_SPS_ONLY must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 if [[ ! "${KV_CACHE_MEMORY_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
   echo "KV_CACHE_MEMORY_BYTES must be a positive integer" >&2
   exit 2
@@ -97,6 +119,20 @@ case "${DSPARK_DRAFT_MXFP8_BACKEND}" in
   auto | marlin) ;;
   *)
     echo "DSPARK_DRAFT_MXFP8_BACKEND must be auto or marlin" >&2
+    exit 2
+    ;;
+esac
+case "${DSPARK_SHARD_MARKOV_HEAD}" in
+  0 | 1) ;;
+  *)
+    echo "DSPARK_SHARD_MARKOV_HEAD must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+case "${KIMI_TARGET_MXFP8_PROFILE}" in
+  none | shared_experts | kda_in_proj | attention_o_proj | kda_in_and_o_proj) ;;
+  *)
+    echo "Unsupported KIMI_TARGET_MXFP8_PROFILE=${KIMI_TARGET_MXFP8_PROFILE}" >&2
     exit 2
     ;;
 esac
@@ -139,6 +175,9 @@ if (( DCP_SIZE > 1 )); then
   # trained seven-token block. Larger prefill batches fall back to NCCL and
   # do not reserve oversized eager/graph PCIe staging slabs.
   export VLLM_DCP_A2A_MAX_TOKENS="${VLLM_DCP_A2A_MAX_TOKENS:-8}"
+  # Keep SparkInfer's low-latency A2A for decode, but avoid the large hidden
+  # ProcessGroupNCCL allocation when a prefill chunk exceeds the B12X cap.
+  export VLLM_DCP_A2A_LARGE_BACKEND="${VLLM_DCP_A2A_LARGE_BACKEND:-ag_rs}"
 else
   export VLLM_USE_B12X_DCP_A2A=0
 fi
@@ -149,14 +188,18 @@ fi
 # longer matches the target-derived hidden-state stream.
 export VLLM_DCP_SHARD_DRAFT="${VLLM_DCP_SHARD_DRAFT:-0}"
 export VLLM_DSPARK_DRAFT_KV_WINDOW="${VLLM_DSPARK_DRAFT_KV_WINDOW:-${DSPARK_DRAFT_KV_WINDOW}}"
+export VLLM_DSPARK_SHARD_MARKOV_HEAD="${VLLM_DSPARK_SHARD_MARKOV_HEAD:-${DSPARK_SHARD_MARKOV_HEAD}}"
+export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE="${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE}}"
+export VLLM_DSPARK_PROFILE_SPS_ONLY="${VLLM_DSPARK_PROFILE_SPS_ONLY:-${DSPARK_PROFILE_SPS_ONLY}}"
 
 # At DSpark's fixed eight-row forward, FlashInfer's dynamic W8A8 MXFP8 path
 # measures 7-14x slower than BF16 because every small projection requantizes
 # its activation. Marlin consumes the same block-32 MXFP8 weights as W8A16;
 # our shape harness measures only ~2x per GEMM, or roughly 0.3 ms for the
-# complete five-layer draft. Disable only MXFP8 alternatives, leaving the
-# target model's MXFP4/BF16 kernel selection untouched.
-if [[ "${DSPARK_DRAFT_WEIGHT_FORMAT}" == mxfp8 && "${DSPARK_DRAFT_MXFP8_BACKEND}" == marlin ]]; then
+# complete five-layer draft.  The optional target shared-expert overlay uses
+# the same W8A16 backend; routed MXFP4 experts and every retained BF16 target
+# projection keep their original kernel selection.
+if [[ ( "${DSPARK_DRAFT_WEIGHT_FORMAT}" == mxfp8 || "${KIMI_TARGET_MXFP8_PROFILE}" != none ) && "${DSPARK_DRAFT_MXFP8_BACKEND}" == marlin ]]; then
   for kernel in \
     B12xMxfp8LinearKernel \
     FlashInferCutedslMxfp8LinearKernel \
@@ -179,6 +222,7 @@ export VLLM_DCP_PROJECT_BEFORE_MERGE=0
 export KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-flashkda}"
 export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
 export CUDA_MODULE_DATA_LOADING="${CUDA_MODULE_DATA_LOADING:-LAZY}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE:-8192}"
 
 # Manual cache sizing and measured [1,8] graphs are more accurate than the
@@ -194,6 +238,7 @@ fi
 # Fail before loading 1.4 TiB of target weights if either the draft contract or
 # the native K3 runtime is missing.
 export KDA_PREFILL_BACKEND DSPARK_DRAFT_WEIGHT_FORMAT DSPARK_DRAFT_MXFP8_BACKEND
+export KIMI_TARGET_MXFP8_PROFILE VLLM_DSPARK_SHARD_MARKOV_HEAD
 "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -201,7 +246,7 @@ from pathlib import Path
 
 from sparkinfer.attention import dense_mla
 from vllm.config import LoadConfig, ModelConfig, replace
-from vllm.config.quantization import resolve_quantization_config
+from vllm.config.quantization import QuantizationConfigArgs, resolve_quantization_config
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
@@ -253,14 +298,61 @@ if os.environ["KDA_PREFILL_BACKEND"] == "flashkda":
 if not ensure_kimi_k3_activation_ops():
     raise RuntimeError("HH Kimi-K3 fused SiTU activation ops are unavailable")
 print("K3 target native-op preflight: OK", flush=True)
-if os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8":
+target_mxfp8_profile = os.environ["KIMI_TARGET_MXFP8_PROFILE"]
+target_profiles = {
+    "shared_experts": {
+        "linear": "mxfp8",
+        "shared_experts": "mxfp8",
+        "ignore": ["re:^(?!.*shared_experts).*$"],
+    },
+    "kda_in_proj": {
+        "linear": "mxfp8",
+        "ignore": [
+            "re:^(?!.*self_attn\\.(?:q_proj|k_proj|v_proj|b_proj|f_a_proj)$).*$",
+        ],
+    },
+    "attention_o_proj": {
+        "linear": "mxfp8",
+        "ignore": ["re:^(?!.*self_attn\\.o_proj$).*$"],
+    },
+    "kda_in_and_o_proj": {
+        "linear": "mxfp8",
+        "ignore": [
+            "re:^(?!.*self_attn\\.(?:q_proj|k_proj|v_proj|b_proj|f_a_proj|o_proj)$).*$",
+        ],
+    },
+}
+if target_mxfp8_profile != "none":
+    target_overlay = resolve_quantization_config(
+        "mxfp4",
+        target_profiles[target_mxfp8_profile],
+    )
+    if not isinstance(target_overlay, QuantizationConfigArgs):
+        raise RuntimeError("target selective MXFP8 overlay did not resolve")
+    assert target_overlay.linear is not None
+    print(
+        f"K3 target online MXFP8 preflight: {target_mxfp8_profile}",
+        flush=True,
+    )
+needs_online_mxfp8 = (
+    os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8"
+    or target_mxfp8_profile != "none"
+)
+if needs_online_mxfp8:
     kernel = init_mxfp8_linear_kernel()
     selected = type(kernel).__name__
     requested = os.environ["DSPARK_DRAFT_MXFP8_BACKEND"]
     if requested == "marlin" and selected != "MarlinMxfp8LinearKernel":
         raise RuntimeError(
-            f"requested draft MXFP8/Marlin, selected {selected} instead"
+            f"requested online MXFP8/Marlin, selected {selected} instead"
         )
+
+if os.environ["VLLM_DSPARK_SHARD_MARKOV_HEAD"] == "1":
+    print("K3 DSpark Markov preflight: TP-sharded BF16", flush=True)
+else:
+    print("K3 DSpark Markov preflight: replicated", flush=True)
+
+if os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8":
     # Resolve the same online-quantized draft ModelConfig used by the worker.
     # In particular, exercise callable hf_overrides here so a config-regression
     # fails before the multi-terabyte target checkpoint is loaded.
@@ -276,7 +368,6 @@ if os.environ["DSPARK_DRAFT_WEIGHT_FORMAT"] == "mxfp8":
                 "linear": "mxfp8",
                 "ignore": [
                     "re:.*fused_qkv_a_proj$",
-                    "model.markov_head.markov_w2",
                 ],
             },
         ),
@@ -306,15 +397,49 @@ if [[ "${DSPARK_DRAFT_WEIGHT_FORMAT}" == mxfp8 ]]; then
   # The five TP-sharded transformer layers and context projection are
   # quantized online and execute through the W8A16 backend selected above.
   # Keep qkv-a in BF16 so the cross-layer KV-only context fusion remains
-  # active, and keep the replicated Markov vocabulary head in BF16.
-  DRAFT_QUANT_JSON=',"quantization":"mxfp8","quantization_config":{"linear":"mxfp8","ignore":["re:.*fused_qkv_a_proj$","model.markov_head.markov_w2"]}'
+  # active. The replicated Markov embedding and vocabulary projection use
+  # online MXFP8 too; this saves 77.5 MiB/rank without changing target logits.
+  DRAFT_QUANT_JSON=',"quantization":"mxfp8","quantization_config":{"linear":"mxfp8","ignore":["re:.*fused_qkv_a_proj$"]}'
 else
   DRAFT_QUANT_JSON=''
 fi
+DSPARK_RUNTIME_JSON=""
+if [[ -n "${DSPARK_SPS_CURVE}" ]]; then
+  if [[ "${DSPARK_SPS_CURVE}" == auto ]]; then
+    DSPARK_RUNTIME_JSON+=',"dspark_sps_curve":"auto"'
+  else
+    DSPARK_RUNTIME_JSON+=',"dspark_sps_curve":'"${DSPARK_SPS_CURVE}"
+  fi
+  DSPARK_RUNTIME_JSON+=',"dspark_sps_overhead_ms":'"${DSPARK_SPS_OVERHEAD_MS}"
+fi
+if (( DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW > 0 )); then
+  DSPARK_RUNTIME_JSON+=',"adaptive_speculative_tokens_window":'"${DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}"
+fi
 printf -v SPECULATIVE_CONFIG \
-  '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"%s","rejection_sample_method":"%s"%s}' \
+  '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"%s","rejection_sample_method":"%s"%s%s}' \
   "${DRAFT_MODEL}" "${DRAFT_ATTENTION_BACKEND}" \
-  "${DRAFT_SAMPLE_METHOD}" "${REJECTION_SAMPLE_METHOD}" "${DRAFT_QUANT_JSON}"
+  "${DRAFT_SAMPLE_METHOD}" "${REJECTION_SAMPLE_METHOD}" \
+  "${DRAFT_QUANT_JSON}" "${DSPARK_RUNTIME_JSON}"
+
+TARGET_QUANT_ARGS=()
+case "${KIMI_TARGET_MXFP8_PROFILE}" in
+  none) ;;
+  shared_experts)
+    TARGET_QUANT_JSON='{"linear":"mxfp8","shared_experts":"mxfp8","ignore":["re:^(?!.*shared_experts).*$"]}'
+    ;;
+  kda_in_proj)
+    TARGET_QUANT_JSON='{"linear":"mxfp8","ignore":["re:^(?!.*self_attn\\.(?:q_proj|k_proj|v_proj|b_proj|f_a_proj)$).*$"]}'
+    ;;
+  attention_o_proj)
+    TARGET_QUANT_JSON='{"linear":"mxfp8","ignore":["re:^(?!.*self_attn\\.o_proj$).*$"]}'
+    ;;
+  kda_in_and_o_proj)
+    TARGET_QUANT_JSON='{"linear":"mxfp8","ignore":["re:^(?!.*self_attn\\.(?:q_proj|k_proj|v_proj|b_proj|f_a_proj|o_proj)$).*$"]}'
+    ;;
+esac
+if [[ -n "${TARGET_QUANT_JSON:-}" ]]; then
+  TARGET_QUANT_ARGS+=(--quantization-config "${TARGET_QUANT_JSON}")
+fi
 
 exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --language-model-only \
@@ -328,4 +453,5 @@ exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --no-enable-prefix-caching \
   --additional-config '{"kda_shard_f_a":true}' \
   --speculative-config "${SPECULATIVE_CONFIG}" \
+  "${TARGET_QUANT_ARGS[@]}" \
   "$@"

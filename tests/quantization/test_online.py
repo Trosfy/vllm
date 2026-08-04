@@ -30,6 +30,7 @@ from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
@@ -93,6 +94,26 @@ def test_online_quantization_targets_only_shared_expert_projections(monkeypatch)
         assert isinstance(
             config.get_quant_method(linear, prefix), UnquantizedLinearMethod
         )
+
+
+def test_online_quantization_supports_untied_parallel_lm_head(monkeypatch):
+    sentinel = object()
+    monkeypatch.setitem(
+        online_base._ONLINE_LINEAR_METHODS,
+        kMxfp8Dynamic,
+        lambda: sentinel,
+    )
+    config = OnlineQuantizationConfig(QuantizationConfigArgs(linear="mxfp8"))
+    head = object.__new__(ParallelLMHead)
+
+    assert config.get_quant_method(head, "model.markov_head.markov_w2") is sentinel
+
+    ignored = OnlineQuantizationConfig(
+        QuantizationConfigArgs(
+            linear="mxfp8", ignore=["model.markov_head.markov_w2"]
+        )
+    )
+    assert ignored.get_quant_method(head, "model.markov_head.markov_w2") is None
 
 
 @pytest.mark.skipif(

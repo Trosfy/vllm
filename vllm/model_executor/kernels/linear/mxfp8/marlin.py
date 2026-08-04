@@ -37,6 +37,7 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
             apply_mxfp8_marlin_linear,
@@ -50,4 +51,5 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,
+            output_buffer=output_buffer,
         )

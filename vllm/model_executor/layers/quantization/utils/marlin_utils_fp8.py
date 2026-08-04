@@ -410,6 +410,7 @@ def apply_mxfp8_marlin_linear(
     size_k: int,
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+    output_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
@@ -425,9 +426,35 @@ def apply_mxfp8_marlin_linear(
         dtype=input.dtype,
     )
 
+    marlin_output = None
+    if output_buffer is not None:
+        if padded_n != size_n:
+            raise ValueError(
+                "A caller-provided MXFP8 Marlin output buffer requires an "
+                f"unpadded output dimension, got {size_n=} and {padded_n=}."
+            )
+        if output_buffer.shape != out_shape:
+            raise ValueError(
+                "MXFP8 Marlin output buffer has the wrong shape: "
+                f"{output_buffer.shape=} != {out_shape=}"
+            )
+        if output_buffer.dtype != input.dtype:
+            raise ValueError(
+                "MXFP8 Marlin output buffer has the wrong dtype: "
+                f"{output_buffer.dtype=} != {input.dtype=}"
+            )
+        if output_buffer.device != input.device:
+            raise ValueError(
+                "MXFP8 Marlin output buffer is on the wrong device: "
+                f"{output_buffer.device=} != {input.device=}"
+            )
+        marlin_output = output_buffer.reshape(-1, size_n)
+        if not marlin_output.is_contiguous():
+            raise ValueError("MXFP8 Marlin output buffer must be contiguous")
+
     output = ops.marlin_gemm(
         a=reshaped_x,
-        c=None,
+        c=marlin_output,
         b_q_weight=weight,
         b_bias=bias,
         b_scales=weight_scale,

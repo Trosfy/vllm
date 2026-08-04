@@ -7,7 +7,10 @@ from unittest.mock import Mock
 import torch
 
 import vllm.model_executor.layers.fused_moe.runner.shared_experts as shared_module
-from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+    SharedExpertsOrder,
+)
 
 
 def test_aux_stream_output_lifetime_extends_to_consumer(monkeypatch) -> None:
@@ -33,3 +36,17 @@ def test_aux_stream_output_lifetime_extends_to_consumer(monkeypatch) -> None:
     shared_experts._layer.assert_called_once_with(shared_experts_input)
     consumer_stream.wait_stream.assert_called_once_with(aux_stream)
     output.record_stream.assert_called_once_with(consumer_stream)
+
+
+def test_only_synchronous_shared_experts_can_donate_input() -> None:
+    shared_experts = object.__new__(SharedExperts)
+    shared_experts_input = torch.empty(4, 8)
+    shared_experts._determine_shared_experts_order = Mock(  # type: ignore[method-assign]
+        return_value=SharedExpertsOrder.NO_OVERLAP
+    )
+    assert shared_experts.can_donate_input(shared_experts_input)
+
+    shared_experts._determine_shared_experts_order.return_value = (  # type: ignore[union-attr]
+        SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+    assert not shared_experts.can_donate_input(shared_experts_input)

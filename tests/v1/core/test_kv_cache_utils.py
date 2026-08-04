@@ -2738,7 +2738,7 @@ def test_group_and_unify_kv_cache_specs_uniform_page_size_returns_none():
     assert group_and_unify_kv_cache_specs(specs) is None
 
 
-def test_k3_dspark_window_group_preserves_target_and_kda_layers():
+def test_k3_dspark_window_group_preserves_target_and_kda_layers(monkeypatch):
     """K3 + bounded DSpark uses the compact generic hybrid-cache layout."""
     target = MLAAttentionSpec(
         block_size=16,
@@ -2860,6 +2860,91 @@ def test_k3_dspark_window_group_preserves_target_and_kda_layers():
     capacity, concurrency = get_kv_cache_capacity(config, cache_config)
     assert capacity == 1_048_576
     assert concurrency == pytest.approx(1.0)
+
+    monkeypatch.setenv("VLLM_K3_KV_GROUP_SIZE", "6")
+    optimized_groups = get_kv_cache_groups(config, specs)
+    assert len(optimized_groups) == 17
+    assert max(len(group.layer_names) for group in optimized_groups) == 6
+    assert {group.kv_cache_spec.page_size_bytes for group in optimized_groups} == {
+        page_size
+    }
+
+    # Group size six has no target padding, three padded KDA states, and one
+    # padded draft layer. At a 64K draft tail this saves 27,869,184 bytes/rank
+    # while also creating three fewer block tables than the default layout.
+    optimized_required_blocks = 6 * (
+        4 * kv_cache_utils.cdiv(kv_cache_utils.cdiv(1_048_576, 8), 768)
+        + 12 * 8
+        + kv_cache_utils.cdiv(
+            draft_group_spec.max_memory_usage_bytes(config), page_size
+        )
+    )
+    optimized_required_bytes = page_size * optimized_required_blocks
+    assert optimized_required_bytes == 2_314_469_376
+    assert required_bytes - optimized_required_bytes == 27_869_184
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, optimized_groups)
+        == optimized_required_bytes
+    )
+    optimized_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, optimized_groups, available_memory=optimized_required_bytes
+    )
+    optimized_capacity, optimized_concurrency = get_kv_cache_capacity(
+        config, optimized_cache_config
+    )
+    assert optimized_capacity == 1_048_576
+    assert optimized_concurrency == pytest.approx(1.0)
+
+    # The production 1M profile uses a 32K draft tail. Keep its launcher
+    # lower bound pinned here so changing scheduler lookahead or grouping
+    # cannot silently turn the next full-model start into an OOM.
+    draft_32k = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=32768,
+        dcp_replicated=True,
+        non_causal_multi_token_decode=True,
+    )
+    specs_32k = {
+        name: draft_32k if name.startswith("draft.mla") else spec
+        for name, spec in specs.items()
+    }
+    optimized_groups_32k = get_kv_cache_groups(config, specs_32k)
+    required_bytes_32k = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        config, optimized_groups_32k
+    )
+    assert required_bytes_32k == 2_200_338_432
+    cache_config_32k = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, optimized_groups_32k, available_memory=required_bytes_32k
+    )
+    capacity_32k, concurrency_32k = get_kv_cache_capacity(
+        config, cache_config_32k
+    )
+    assert capacity_32k == 1_048_576
+    assert concurrency_32k == pytest.approx(1.0)
+
+    # DCP16 halves each target MLA shard. Recurrent KDA state and the bounded
+    # replicated DSpark tail are unchanged, so the exact 1M lower bound drops
+    # by 860.625 MiB/rank relative to DCP8.
+    config.parallel_config.decode_context_parallel_size = 16
+    optimized_groups_dcp16 = get_kv_cache_groups(config, specs_32k)
+    required_bytes_dcp16 = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        config, optimized_groups_dcp16
+    )
+    assert required_bytes_dcp16 == 1_297_907_712
+    assert required_bytes_32k - required_bytes_dcp16 == 902_430_720
+    cache_config_dcp16 = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        optimized_groups_dcp16,
+        available_memory=required_bytes_dcp16,
+    )
+    capacity_dcp16, concurrency_dcp16 = get_kv_cache_capacity(
+        config, cache_config_dcp16
+    )
+    assert capacity_dcp16 == 1_048_576
+    assert concurrency_dcp16 == pytest.approx(1.0)
 
 
 def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():

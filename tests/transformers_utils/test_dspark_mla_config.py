@@ -4,13 +4,18 @@
 import json
 
 import pytest
+import torch
 
 from vllm.config import LoadConfig, ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekScalingRotaryEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import get_quant_config
+from vllm.models.kimi_k3.nvidia.dspark_mla import _fill_compact_rope_cache
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -80,6 +85,42 @@ def test_dspark_mla_config_loads_from_local_json(tmp_path):
     }
     assert config.n_routed_experts == 0
     assert config.draft_vocab_size == config.vocab_size
+
+
+def test_dspark_compact_rope_matches_full_fp32_table(default_vllm_config):
+    rotary = DeepseekScalingRotaryEmbedding(
+        head_size=64,
+        rotary_dim=64,
+        max_position_embeddings=32,
+        base=50000.0,
+        is_neox_style=False,
+        scaling_factor=2.0,
+        dtype=torch.float32,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1.0,
+        mscale_all_dim=1.0,
+    )
+    positions = torch.tensor([0, 1, 17, 31, 63], dtype=torch.int64)
+    inv_freq = rotary._compute_inv_freq(rotary.scaling_factor)
+    freqs = torch.empty((positions.numel(), inv_freq.numel()), dtype=torch.float32)
+    cache = torch.empty((positions.numel(), 2 * inv_freq.numel()), dtype=torch.float32)
+
+    compact = _fill_compact_rope_cache(
+        positions,
+        inv_freq,
+        freqs,
+        cache,
+        mscale=rotary.mscale,
+    )
+
+    torch.testing.assert_close(
+        compact,
+        rotary.cos_sin_cache.index_select(0, positions),
+        rtol=0,
+        atol=0,
+    )
+    assert compact.data_ptr() == cache.data_ptr()
 
 
 @pytest.mark.parametrize(

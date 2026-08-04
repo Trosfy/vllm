@@ -178,6 +178,7 @@ def attn_res(
     block_write_idx: int,
     eps: float,
     output_norm_eps: float,
+    output_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = prefix.shape
     assert prefix.stride(-1) == 1
@@ -186,6 +187,21 @@ def attn_res(
     assert norm_weight.stride(-1) == 1
     assert qk_weight.stride(-1) == 1
     assert output_norm_weight is None or output_norm_weight.stride(-1) == 1
+    if output_buffer is not None:
+        if output_buffer.shape != prefix.shape:
+            raise ValueError(
+                "AttnRes output buffer has the wrong shape: "
+                f"expected {tuple(prefix.shape)}, got {tuple(output_buffer.shape)}"
+            )
+        if output_buffer.dtype != prefix.dtype:
+            raise ValueError(
+                "AttnRes output buffer has the wrong dtype: "
+                f"expected {prefix.dtype}, got {output_buffer.dtype}"
+            )
+        if output_buffer.device != prefix.device:
+            raise ValueError("AttnRes output buffer must be on the prefix device")
+        if output_buffer.stride(-1) != 1:
+            raise ValueError("AttnRes output buffer must be contiguous in hidden size")
     # The in-tree NVIDIA kernel covers the common fused-add + output-norm path;
     # Triton handles block boundaries and final pre-norm output.
     if (
@@ -206,8 +222,9 @@ def attn_res(
             num_blocks,
             eps,
             output_norm_eps,
+            output_buffer,
         )
-    output = prefix.new_empty(prefix.shape)
+    output = prefix.new_empty(prefix.shape) if output_buffer is None else output_buffer
     # Tuned on GB300: source tiling helps decode, while one-source tiles scale
     # better for prefill.
     # Keep get_attn_res_triton_warmup_profiles in sync with these fallbacks.

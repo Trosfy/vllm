@@ -52,6 +52,7 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        self._donate_input = False
         self._layer = layer
         self._moe_config = moe_config
 
@@ -157,6 +158,16 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    def set_donate_input(self, enabled: bool) -> None:
+        self._donate_input = enabled
+
+    def can_donate_input(self, shared_experts_input: torch.Tensor) -> bool:
+        """Donation is valid only on the synchronous shared-expert path."""
+        return (
+            self._determine_shared_experts_order(shared_experts_input)
+            == SharedExpertsOrder.NO_OVERLAP
+        )
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,
@@ -172,6 +183,18 @@ class SharedExperts(torch.nn.Module):
         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             self._output[self._output_idx] = self._run_in_aux_stream(
                 shared_experts_input
+            )
+        elif self._donate_input:
+            forward_with_output_buffer = getattr(
+                self._layer, "forward_with_output_buffer", None
+            )
+            if forward_with_output_buffer is None:
+                raise NotImplementedError(
+                    f"{type(self._layer).__name__} cannot donate its input"
+                )
+            self._output[self._output_idx] = forward_with_output_buffer(
+                shared_experts_input,
+                shared_experts_input,
             )
         else:
             self._output[self._output_idx] = self._layer(shared_experts_input)
