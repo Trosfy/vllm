@@ -21,6 +21,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dcp-size", type=int, choices=(1, 8, 16), required=True)
     parser.add_argument("--global-context", type=int, default=1_048_576)
     parser.add_argument(
+        "--live-context",
+        type=int,
+        default=None,
+        help=(
+            "Actual global sequence length used by the timed run. The plan "
+            "still covers --global-context, which exposes capture-static "
+            "short-context overhead without allocating a full live cache."
+        ),
+    )
+    parser.add_argument(
         "--local-cache-tokens",
         type=int,
         default=None,
@@ -38,6 +48,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=9)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument(
+        "--max-splits",
+        type=int,
+        default=None,
+        help="Clamp the dense-MLA capture-static split count for an A/B sweep.",
+    )
+    parser.add_argument(
+        "--adaptive-splits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Launch only the nonempty prefix of the maximum-context split plan.",
+    )
     return parser.parse_args()
 
 
@@ -59,9 +81,20 @@ def main() -> None:
     )
     if local_cache_tokens <= 0:
         raise ValueError("local cache tokens must be positive")
+    live_global_context = (
+        args.global_context if args.live_context is None else args.live_context
+    )
+    if live_global_context <= 0:
+        raise ValueError("live context must be positive")
+    live_local_cache_tokens = (
+        live_global_context + args.dcp_size - 1
+    ) // args.dcp_size
+    if live_local_cache_tokens > local_cache_tokens:
+        raise ValueError("live context exceeds the planned cache capacity")
     if effective_heads <= 0:
         raise ValueError("effective heads must be positive")
-    pages = (local_cache_tokens + args.page_size - 1) // args.page_size
+    capacity_pages = (local_cache_tokens + args.page_size - 1) // args.page_size
+    live_pages = (live_local_cache_tokens + args.page_size - 1) // args.page_size
     device = torch.device("cuda")
     dtype = torch.float8_e4m3fn
 
@@ -76,9 +109,14 @@ def main() -> None:
             max_total_q=args.max_query_rows,
             max_batch=args.max_query_rows,
             max_cache_tokens=local_cache_tokens,
-            max_page_table_width=pages,
-            num_cache_pages=pages,
+            max_page_table_width=capacity_pages,
+            num_cache_pages=live_pages,
             use_cuda_graph=True,
+            budget=(
+                None
+                if args.max_splits is None
+                else dense_mla.Budget(max_splits=args.max_splits)
+            ),
         )
     )
     (scratch_spec,) = plan.scratch_specs()
@@ -94,7 +132,7 @@ def main() -> None:
         device=device,
     )
     cache_float = torch.randn(
-        pages,
+        live_pages,
         args.page_size,
         576,
         device=device,
@@ -104,13 +142,13 @@ def main() -> None:
     q = (q_float / q_scale).to(dtype)
     cache = (cache_float / kv_scale).to(dtype)
     page_table = torch.arange(
-        pages,
+        live_pages,
         dtype=torch.int32,
         device=device,
     ).repeat(args.query_rows, 1)
     cache_seqlens = torch.full(
         (args.query_rows,),
-        local_cache_tokens,
+        live_local_cache_tokens,
         dtype=torch.int32,
         device=device,
     )
@@ -126,6 +164,14 @@ def main() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    active_splits = plan.num_splits
+    if args.adaptive_splits:
+        valid_chunks = (live_local_cache_tokens + 63) // 64
+        active_splits = min(
+            plan.num_splits,
+            (valid_chunks + plan.chunks_per_split - 1)
+            // plan.chunks_per_split,
+        )
     binding = dense_mla.bind(
         plan,
         scratch=scratch,
@@ -137,6 +183,7 @@ def main() -> None:
         cu_seqlens_q=cu_seqlens_q,
         q_scale=q_scale,
         kv_scale=kv_scale,
+        active_splits=active_splits,
     )
     dense_mla.compile(binding=binding)
     dense_mla.run(binding=binding)
@@ -167,12 +214,17 @@ def main() -> None:
             {
                 "dcp_size": args.dcp_size,
                 "global_context": args.global_context,
+                "live_global_context": live_global_context,
                 "local_cache_tokens": local_cache_tokens,
+                "live_local_cache_tokens": live_local_cache_tokens,
                 "effective_heads": effective_heads,
                 "query_rows": args.query_rows,
                 "max_query_rows": args.max_query_rows,
                 "page_size": args.page_size,
                 "num_splits": plan.num_splits,
+                "active_splits": active_splits,
+                "adaptive_splits": args.adaptive_splits,
+                "requested_max_splits": args.max_splits,
                 "scratch_mib": scratch.nbytes / 1024**2,
                 "median_ms": statistics.median(samples_ms),
                 "min_ms": min(samples_ms),

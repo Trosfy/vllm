@@ -45,6 +45,15 @@ def _parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--dcp-size", type=int, default=8)
+    parser.add_argument(
+        "--local-heads",
+        type=int,
+        default=6,
+        help=(
+            "Rank-local Kimi query heads. Production TP16 Kimi-K3 has six; "
+            "the effective gathered head count is local_heads*dcp_size."
+        ),
+    )
     parser.add_argument("--b12x-cap", type=int, default=8)
     parser.add_argument("--fallback-batch", type=int, default=16)
     parser.add_argument(
@@ -98,15 +107,15 @@ def _capture_target_graph(
     *,
     device: torch.device,
     batch: int,
+    local_heads: int,
     query_dtype: torch.dtype,
     vllm_groups: bool,
 ) -> tuple[torch.cuda.CUDAGraph, tuple[torch.Tensor, ...]]:
     from vllm.v1.attention.ops import dcp_alltoall
 
-    total_heads = 96
+    total_heads = local_heads * cp_group.world_size
     head_dim = 512
     query_head_dim = 576
-    local_heads = total_heads // cp_group.world_size
     query = torch.randn(
         batch,
         local_heads,
@@ -292,14 +301,17 @@ def _run_fallback(
     *,
     device: torch.device,
     batch: int,
+    total_heads: int,
     b12x_cap: int,
     backend: str,
     iterations: int,
 ) -> tuple[torch.Tensor, float | None]:
     if iterations < 1:
         raise ValueError("iterations must be positive")
-    output = torch.randn(batch, 96, 512, device=device, dtype=torch.bfloat16)
-    lse = torch.randn(batch, 96, device=device, dtype=torch.float32)
+    output = torch.randn(
+        batch, total_heads, 512, device=device, dtype=torch.bfloat16
+    )
+    lse = torch.randn(batch, total_heads, device=device, dtype=torch.float32)
 
     def combine() -> torch.Tensor:
         return _combine_fallback(
@@ -367,6 +379,9 @@ def _time_graph(
 
 def main() -> None:
     args = _parse_args()
+    if args.local_heads < 1:
+        raise ValueError("--local-heads must be positive")
+    total_heads = args.local_heads * args.dcp_size
     os.environ.setdefault("VLLM_USE_B12X_DCP_A2A", "1")
     os.environ["VLLM_DCP_A2A_MAX_TOKENS"] = str(args.b12x_cap)
     if args.vllm_groups:
@@ -421,7 +436,7 @@ def main() -> None:
             device=device,
             dtype=torch.bfloat16,
             max_batch_size=args.b12x_cap,
-            total_heads=96,
+            total_heads=total_heads,
             head_dim=512,
             query_head_dim=576,
         )
@@ -430,6 +445,7 @@ def main() -> None:
             cp_group,
             device=device,
             batch=args.b12x_cap,
+            local_heads=args.local_heads,
             query_dtype=query_dtype,
             vllm_groups=args.vllm_groups,
         )
@@ -477,6 +493,7 @@ def main() -> None:
             cp_group,
             device=device,
             batch=args.fallback_batch,
+            total_heads=total_heads,
             b12x_cap=args.b12x_cap,
             backend=args.fallback_backend,
             iterations=args.fallback_iters,
@@ -496,6 +513,8 @@ def main() -> None:
                         "mode": args.mode,
                         "world_size": dist.get_world_size(),
                         "dcp_size": args.dcp_size,
+                        "local_heads": args.local_heads,
+                        "total_heads": total_heads,
                         "b12x_cap": args.b12x_cap,
                         "fallback_batch": args.fallback_batch,
                         "fallback_backend": args.fallback_backend,
