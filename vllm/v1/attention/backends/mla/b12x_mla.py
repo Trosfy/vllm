@@ -331,20 +331,22 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             dtype=scratch_dtype,
             device=device,
         )
-        self._dense_mla_padded_q: torch.Tensor | None = None
-        self._dense_mla_padded_output: torch.Tensor | None = None
-        if self._kernel_heads != self._effective_heads:
-            max_rows = self._max_dense_mla_rows
-            self._dense_mla_padded_q = torch.empty(
-                (max_rows, self._kernel_heads, _K3_ABSORBED_HEAD_DIM),
-                dtype=_planned_kv_dtype(vllm_config),
-                device=device,
-            )
-            self._dense_mla_padded_output = torch.empty(
-                (max_rows, self._kernel_heads, _K3_KV_LORA_RANK),
-                dtype=torch.bfloat16,
-                device=device,
-            )
+        # Keep query-gather and output addresses stable across piecewise eager
+        # attention replays. Besides making graph ownership explicit, this lets
+        # every layer reuse its validated SparkInfer binding rather than
+        # rebuilding Python views after each DCP gather. All represented layers
+        # execute serially on the model stream, so one pair is sufficient.
+        max_rows = self._max_dense_mla_rows
+        self._dense_mla_padded_q = torch.empty(
+            (max_rows, self._kernel_heads, _K3_ABSORBED_HEAD_DIM),
+            dtype=_planned_kv_dtype(vllm_config),
+            device=device,
+        )
+        self._dense_mla_padded_output = torch.empty(
+            (max_rows, self._kernel_heads, _K3_KV_LORA_RANK),
+            dtype=torch.bfloat16,
+            device=device,
+        )
         self._dense_mla_flat_block_table: torch.Tensor | None = None
         self._dense_mla_flat_seq_lens: torch.Tensor | None = None
         self._dense_mla_flat_query_start_loc: torch.Tensor | None = None
@@ -711,6 +713,8 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         self._dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
         self._dcp_max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
         self._compiled_bindings: set[tuple[object, ...]] = set()
+        self._last_binding_key: tuple[object, ...] | None = None
+        self._last_binding: Any | None = None
         self._scratch_by_plan: dict[int, torch.Tensor] = {}
         self._padded_io_by_plan: dict[
             tuple[int, torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]
@@ -764,6 +768,77 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             self._padded_io_by_plan[key] = buffers
         return buffers[0][:batch], buffers[1][:batch]
 
+    @staticmethod
+    def _tensor_binding_key(tensor: torch.Tensor | None) -> tuple[object, ...] | None:
+        """Describe a tensor view without depending on its Python wrapper.
+
+        Dense MLA bindings retain detached views, but their addresses and
+        layouts are capture-static during piecewise replay.  Tensor contents
+        (sequence lengths, page tables, queries, and scales) intentionally do
+        not participate in this key and may change in place between tokens.
+        """
+        if tensor is None:
+            return None
+        return (
+            int(tensor.data_ptr()),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            int(tensor.storage_offset()),
+            tensor.dtype,
+            tensor.device,
+        )
+
+    def _bind_dense_mla(
+        self,
+        plan: Any,
+        *,
+        scratch: torch.Tensor,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        kv_scale: torch.Tensor | None,
+        active_splits: int,
+    ) -> Any:
+        """Reuse a validated binding while all capture-static views match."""
+        key = (
+            id(plan),
+            self._tensor_binding_key(scratch),
+            self._tensor_binding_key(q),
+            self._tensor_binding_key(kv_cache),
+            self._tensor_binding_key(output),
+            self._tensor_binding_key(page_table),
+            self._tensor_binding_key(cache_seqlens),
+            self._tensor_binding_key(cu_seqlens_q),
+            self._tensor_binding_key(q_scale),
+            self._tensor_binding_key(kv_scale),
+            self.scale,
+            active_splits,
+        )
+        if key == self._last_binding_key:
+            assert self._last_binding is not None
+            return self._last_binding
+        binding = self._dense_mla.bind(
+            plan,
+            scratch=scratch,
+            q=q,
+            kv_cache=kv_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            sm_scale=self.scale,
+            active_splits=active_splits,
+        )
+        self._last_binding_key = key
+        self._last_binding = binding
+        return binding
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -812,11 +887,20 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         dcp_group = None
         if self.dcp_world_size > 1:
             dcp_group = get_dcp_group()
+            gathered_q = getattr(attn_metadata, "dense_mla_padded_q", None)
+            if gathered_q is not None:
+                if int(gathered_q.shape[0]) < batch:
+                    raise ValueError(
+                        "B12X_MLA shared query buffer is too small: "
+                        f"capacity={gathered_q.shape[0]}, batch={batch}."
+                    )
+                gathered_q = gathered_q[:batch, : self._effective_heads]
             q = dcp_b12x_all_gather_heads(
                 q,
                 dcp_group,
                 max_batch_size=self._dcp_max_batch_size,
                 output_head_dim=self.kv_lora_rank,
+                out=gathered_q,
             )
 
         effective_heads = int(q.shape[1])
@@ -825,9 +909,9 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 "B12X_MLA gathered an unexpected query-head count: "
                 f"expected {self._effective_heads}, got {effective_heads}."
             )
+        padded_q = getattr(attn_metadata, "dense_mla_padded_q", None)
+        padded_output = getattr(attn_metadata, "dense_mla_padded_output", None)
         if self._kernel_heads != effective_heads:
-            padded_q = getattr(attn_metadata, "dense_mla_padded_q", None)
-            padded_output = getattr(attn_metadata, "dense_mla_padded_output", None)
             if padded_q is None or padded_output is None:
                 padded_q, padded_output = self._borrow_padded_io(plan, q, batch)
             else:
@@ -848,11 +932,14 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             q = padded_q
             output = padded_output
         else:
-            output = torch.empty(
-                (batch, effective_heads, self.kv_lora_rank),
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
+            if padded_output is None:
+                _, padded_output = self._borrow_padded_io(plan, q, batch)
+            elif int(padded_output.shape[0]) < batch:
+                raise ValueError(
+                    "B12X_MLA shared output buffer is too small: "
+                    f"capacity={padded_output.shape[0]}, batch={batch}."
+                )
+            output = padded_output[:batch]
         scratch = getattr(attn_metadata, "dense_mla_scratch", None)
         if scratch is None:
             # Compatibility fallback for direct backend users and old custom
@@ -872,7 +959,8 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 plan,
                 getattr(attn_metadata, "max_seq_len", None),
             )
-        binding = self._dense_mla.bind(
+        cu_seqlens_q = query_start_loc[: batch + 1]
+        binding = self._bind_dense_mla(
             plan,
             scratch=scratch,
             q=q,
@@ -880,10 +968,9 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             output=output,
             page_table=block_table,
             cache_seqlens=seq_lens,
-            cu_seqlens_q=query_start_loc[: batch + 1],
+            cu_seqlens_q=cu_seqlens_q,
             q_scale=layer._q_scale if quantized else None,
             kv_scale=layer._k_scale if quantized else None,
-            sm_scale=self.scale,
             active_splits=active_splits,
         )
 

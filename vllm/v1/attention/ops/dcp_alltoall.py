@@ -331,6 +331,7 @@ def _try_b12x_dcp_all_gather_heads(
     *,
     max_batch_size: int | None,
     output_head_dim: int | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Gather rank-local query heads with the B12X PCIe channel."""
     world_size = cp_group.world_size
@@ -373,8 +374,14 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
+    if out is None:
+        return pool.all_gather_heads(
+            local_input,
+            channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        )
     return pool.all_gather_heads(
         local_input,
+        out=out,
         channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
     )
 
@@ -385,19 +392,33 @@ def dcp_b12x_all_gather_heads(
     *,
     max_batch_size: int | None = None,
     output_head_dim: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather query heads with B12X, falling back to the group backend."""
     local_input = local_input.contiguous()
     if envs.VLLM_USE_B12X_DCP_A2A:
-        result = _try_b12x_dcp_all_gather_heads(
-            local_input,
-            cp_group,
-            max_batch_size=max_batch_size,
-            output_head_dim=output_head_dim,
-        )
+        if out is None:
+            result = _try_b12x_dcp_all_gather_heads(
+                local_input,
+                cp_group,
+                max_batch_size=max_batch_size,
+                output_head_dim=output_head_dim,
+            )
+        else:
+            result = _try_b12x_dcp_all_gather_heads(
+                local_input,
+                cp_group,
+                max_batch_size=max_batch_size,
+                output_head_dim=output_head_dim,
+                out=out,
+            )
         if result is not None:
             return result
-    return cp_group.all_gather(local_input, dim=1)
+    result = cp_group.all_gather(local_input, dim=1)
+    if out is None:
+        return result
+    out.copy_(result)
+    return out
 
 
 def _try_b12x_dcp_all_gather_pair(

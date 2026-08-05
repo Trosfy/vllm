@@ -69,6 +69,8 @@ def _fake_impl(monkeypatch) -> tuple[B12xMLAImpl, _FakeDenseMLA]:
     impl._dcp_comm_backend = "a2a"
     impl._dcp_max_batch_size = 64
     impl._compiled_bindings = set()
+    impl._last_binding_key = None
+    impl._last_binding = None
     impl._scratch_by_plan = {}
     impl._padded_io_by_plan = {}
     dense_mla = _FakeDenseMLA()
@@ -198,6 +200,67 @@ def test_b12x_mla_adapter_passes_fp8_scales(monkeypatch) -> None:
     binding = dense_mla.bindings[0]
     assert binding.q_scale is layer._q_scale
     assert binding.kv_scale is layer._k_scale
+
+
+def test_b12x_mla_adapter_reuses_capture_static_binding(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch)
+    q = torch.randn(1, 8, 576, dtype=torch.bfloat16)
+    cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
+    output = torch.empty(1, 8, 512, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        dense_mla_padded_output=output,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(0.25),
+        _k_scale=torch.tensor(0.5),
+    )
+
+    first, _ = impl.forward_mqa(q, cache, metadata, layer)
+    metadata.decode.seq_lens.fill_(18)
+    second, _ = impl.forward_mqa(q, cache, metadata, layer)
+
+    assert first.data_ptr() == output.data_ptr()
+    assert second.data_ptr() == output.data_ptr()
+    assert len(dense_mla.bindings) == 1
+    assert dense_mla.compile_count == 1
+    assert dense_mla.run_count == 2
+
+
+def test_b12x_mla_adapter_rebinds_when_active_splits_change(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch)
+    plan = SimpleNamespace(
+        num_splits=4,
+        chunks_per_split=1,
+        shapes_and_dtypes=lambda: (((256,), torch.uint8),),
+    )
+    q = torch.randn(1, 8, 576, dtype=torch.bfloat16)
+    cache = torch.randn(8, 16, 576, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        dense_mla_plan=plan,
+        dense_mla_padded_output=torch.empty(1, 8, 512, dtype=torch.bfloat16),
+        max_seq_len=64,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    layer = SimpleNamespace(
+        _q_scale=torch.tensor(0.25),
+        _k_scale=torch.tensor(0.5),
+    )
+
+    impl.forward_mqa(q, cache, metadata, layer)
+    metadata.max_seq_len = 65
+    impl.forward_mqa(q, cache, metadata, layer)
+
+    assert [binding.active_splits for binding in dense_mla.bindings] == [1, 2]
 
 
 def test_b12x_mla_adapter_pads_tp16_k3_heads_and_slices_result(
@@ -594,7 +657,12 @@ def test_b12x_mla_adapter_gathers_and_reduces_dcp_heads(monkeypatch) -> None:
 
     def fake_gather(q, actual_group, **kwargs):
         gather_calls.append((q.shape, actual_group, kwargs))
-        return torch.cat([q] * 8, dim=1)
+        gathered = torch.cat([q] * 8, dim=1)
+        out = kwargs.get("out")
+        if out is not None:
+            out.copy_(gathered)
+            return out
+        return gathered
 
     reduce_calls = []
 
@@ -609,6 +677,8 @@ def test_b12x_mla_adapter_gathers_and_reduces_dcp_heads(monkeypatch) -> None:
     cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
+        dense_mla_padded_q=torch.empty(1, 48, 576, dtype=torch.bfloat16),
+        dense_mla_padded_output=torch.empty(1, 48, 512, dtype=torch.bfloat16),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         decode=SimpleNamespace(
             block_table=torch.tensor([[0, 1]], dtype=torch.int32),
@@ -627,6 +697,7 @@ def test_b12x_mla_adapter_gathers_and_reduces_dcp_heads(monkeypatch) -> None:
     assert dense_mla.bindings[0].q.shape == (1, 48, 576)
     assert gather_calls[0][0] == (1, 6, 576)
     assert gather_calls[0][2]["output_head_dim"] == 512
+    assert gather_calls[0][2]["out"].shape == (1, 48, 576)
     assert reduce_calls[0][0] == (1, 48, 512)
     assert reduce_calls[0][1] == (1, 48)
     assert reduce_calls[0][3]["use_b12x"] is True
