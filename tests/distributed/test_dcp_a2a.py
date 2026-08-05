@@ -690,6 +690,7 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
     class _FakeGroup:
         def __init__(self, *, world_size, communicator=None):
             self.world_size = world_size
+            self.device_group = object()
             self.device_communicator = type(
                 "DeviceCommunicator", (), {"ca_comm": communicator}
             )()
@@ -704,7 +705,9 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
     monkeypatch.setattr(
         dcp_alltoall,
         "checkpoint_b12x_dcp_a2a_channels",
-        lambda group: events.append("checkpoint-dcp") or "dcp-checkpoint",
+        lambda group: (
+            events.append(("checkpoint-b12x", group)) or ("b12x-checkpoint", group)
+        ),
     )
     monkeypatch.setattr(
         dcp_alltoall,
@@ -717,8 +720,10 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
 
     assert events == [
         "checkpoint-tp",
-        "checkpoint-dcp",
-        ("rollback-dcp", "dcp-checkpoint"),
+        ("checkpoint-b12x", dcp_group),
+        ("checkpoint-b12x", tp_group),
+        ("rollback-dcp", ("b12x-checkpoint", tp_group)),
+        ("rollback-dcp", ("b12x-checkpoint", dcp_group)),
         ("rollback-tp", "tp-checkpoint"),
     ]
 
@@ -731,6 +736,9 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
 
     class _FakeGroup:
         world_size = 2
+
+        def __init__(self):
+            self.device_group = object()
 
         @contextmanager
         def graph_capture(self, context):
@@ -748,6 +756,7 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
         yield
 
     monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(parallel_state, "_TP", tp_group)
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
@@ -756,7 +765,7 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
     with parallel_state.graph_capture(torch.device("cpu"), context) as actual:
         assert actual is context
 
-    assert events == [(dcp_group, stream)]
+    assert events == [(dcp_group, stream), (tp_group, stream)]
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")

@@ -7,6 +7,7 @@ import vllm.envs as envs
 from vllm.distributed import (
     get_dcp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
@@ -21,10 +22,32 @@ _KIMI_OUTPUT_BUFFER_REUSE_MIN_TOKENS = 1024
 _KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS = 8
 
 
+def _get_kimi_projection_group():
+    """Return a full-TP group for lossless projection collectives.
+
+    DCP16 and TP16 historically shared the DCP coordinator here.  With a
+    smaller DCP group (for example TP16/DCP8), projections are still sharded
+    over all TP ranks and must not be gathered over only one DCP replica.
+    Retain the established DCP16 coordinator when it already spans TP, and
+    otherwise use the independent TP coordinator.
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    dcp_group = get_dcp_group()
+    if dcp_group.world_size == tp_size:
+        return dcp_group
+    tp_group = get_tp_group()
+    if tp_group.world_size != tp_size:
+        raise RuntimeError(
+            "Kimi projection group does not span tensor parallel ranks: "
+            f"group={tp_group.world_size}, TP={tp_size}"
+        )
+    return tp_group
+
+
 def _try_b12x_kimi_projection_gather(
     output_parallel: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Gather one decode token over Kimi's TP16=DCP16 PCIe channel.
+    """Gather one decode token over Kimi's full-TP PCIe channel.
 
     The SparkInfer operation is a copy collective. Naturally aligned BF16/FP16
     projections use their native lanes; an unaligned half projection gets a
@@ -42,9 +65,9 @@ def _try_b12x_kimi_projection_gather(
         return None
 
     tp_size = get_tensor_model_parallel_world_size()
-    dcp_group = get_dcp_group()
-    if tp_size <= 1 or dcp_group.world_size != tp_size:
+    if tp_size <= 1:
         return None
+    projection_group = _get_kimi_projection_group()
 
     local_width = output_parallel.shape[1]
     restore_dtype: torch.dtype | None = None
@@ -76,7 +99,7 @@ def _try_b12x_kimi_projection_gather(
 
     gathered = dcp_b12x_all_gather_heads(
         transport,
-        dcp_group,
+        projection_group,
         max_batch_size=1,
     )
     if strip_local_width is not None:
@@ -105,7 +128,7 @@ def gather_kimi_sharded_projection_pair(
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size <= 1:
         return local_first, local_second
-    dcp_group = get_dcp_group()
+    projection_group = _get_kimi_projection_group()
     if (
         envs.VLLM_KIMI_USE_B12X_PROJECTION_GATHER
         and envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
@@ -116,12 +139,12 @@ def gather_kimi_sharded_projection_pair(
         and local_second.is_cuda
         and local_first.is_contiguous()
         and local_second.is_contiguous()
-        and dcp_group.world_size == tp_size
+        and projection_group.world_size == tp_size
     ):
         return dcp_b12x_all_gather_pair(
             local_first,
             local_second,
-            dcp_group,
+            projection_group,
             max_batch_size=_KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS,
         )
     return (
@@ -144,14 +167,12 @@ def try_gather_kimi_sharded_projection_pair_topk(
         or tp_size != 16
     ):
         return None
-    dcp_group = get_dcp_group()
-    if dcp_group.world_size != tp_size:
-        return None
+    projection_group = _get_kimi_projection_group()
     return try_dcp_b12x_all_gather_pair_kimi_topk(
         local_down,
         local_router,
         correction_bias,
-        dcp_group,
+        projection_group,
         max_batch_size=1,
     )
 

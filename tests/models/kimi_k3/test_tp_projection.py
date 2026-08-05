@@ -63,6 +63,9 @@ def _enable_fake_b12x_projection_gather(monkeypatch, gather) -> None:
     monkeypatch.setattr(
         tp_projection, "get_dcp_group", lambda: SimpleNamespace(world_size=4)
     )
+    monkeypatch.setattr(
+        tp_projection, "get_tp_group", lambda: SimpleNamespace(world_size=4)
+    )
     monkeypatch.setattr(tp_projection, "dcp_b12x_all_gather_heads", gather)
 
 
@@ -179,6 +182,9 @@ def test_b12x_projection_pair_topk_returns_explicit_compact_payload(
     monkeypatch.setattr(
         tp_projection, "get_dcp_group", lambda: SimpleNamespace(world_size=16)
     )
+    monkeypatch.setattr(
+        tp_projection, "get_tp_group", lambda: SimpleNamespace(world_size=16)
+    )
 
     def fake_fused(down, router, bias, _group, *, max_batch_size):
         assert down is local_down
@@ -198,6 +204,34 @@ def test_b12x_projection_pair_topk_returns_explicit_compact_payload(
     assert actual is not None
     assert actual[0] is expected_down
     assert actual[1] is expected_payload
+
+
+def test_b12x_projection_gather_uses_tp_group_when_dcp_is_smaller(
+    monkeypatch,
+) -> None:
+    local = torch.arange(8, dtype=torch.bfloat16).view(1, 8)
+    dcp_group = SimpleNamespace(world_size=8)
+    tp_group = SimpleNamespace(world_size=16)
+    monkeypatch.setattr(
+        tp_projection.envs, "VLLM_KIMI_USE_B12X_PROJECTION_GATHER", True
+    )
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: 16
+    )
+    monkeypatch.setattr(tp_projection, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(tp_projection, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _self: True))
+
+    def fake_gather(value, group, *, max_batch_size):
+        assert group is tp_group
+        assert max_batch_size == 1
+        return torch.cat(tuple(value + rank for rank in range(16)), dim=1)
+
+    monkeypatch.setattr(tp_projection, "dcp_b12x_all_gather_heads", fake_gather)
+
+    actual = gather_kimi_sharded_projection(local)
+    expected = torch.cat(tuple(local + rank for rank in range(16)), dim=-1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_kimi_precomputed_router_decodes_payload_without_reselection() -> None:
