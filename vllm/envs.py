@@ -202,6 +202,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_PROFILE_SPS_ONLY: bool = False
     VLLM_DSPARK_SPS_DEBUG: int = 0
     VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: int = 0
+    VLLM_DSPARK_MAX_VERIFICATION_TOKENS: int = 0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -348,6 +349,9 @@ if TYPE_CHECKING:
     VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ: bool = False
     VLLM_KIMI_SHARD_ROUTED_UP_PROJ: bool = False
     VLLM_KIMI_SHARD_ROUTER: bool = False
+    VLLM_KIMI_USE_B12X_PROJECTION_GATHER: bool = False
+    VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER: bool = False
+    VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK: bool = False
     VLLM_KIMI_LOG_CONSTRUCTION_MEMORY: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
@@ -1143,9 +1147,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
     ),
-    "VLLM_K3_KV_GROUP_SIZE": lambda: int(
-        os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")
-    ),
+    "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
@@ -1615,14 +1617,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_PROFILE_SPS_ONLY": lambda: bool(
         int(os.getenv("VLLM_DSPARK_PROFILE_SPS_ONLY", "0"))
     ),
-    "VLLM_DSPARK_SPS_DEBUG": lambda: int(
-        os.getenv("VLLM_DSPARK_SPS_DEBUG", "0")
-    ),
+    "VLLM_DSPARK_SPS_DEBUG": lambda: int(os.getenv("VLLM_DSPARK_SPS_DEBUG", "0")),
     # Capture low-load DSpark draft graphs without confidence/capacity kernels.
     # 0 keeps capacity active at every batch size; a positive value must match
     # the profiled saturation knee used by the verification manager.
     "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE": lambda: int(
         os.getenv("VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE", "0")
+    ),
+    # Cap the number of DSpark proposals sent through the target verifier while
+    # preserving the checkpoint's native draft-block width. Zero disables the
+    # cap. This is useful for recurrent targets, where every possible verified
+    # token otherwise reserves another per-request recurrent-state page.
+    "VLLM_DSPARK_MAX_VERIFICATION_TOKENS": lambda: int(
+        os.getenv("VLLM_DSPARK_MAX_VERIFICATION_TOKENS", "0")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
@@ -2319,6 +2326,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_KIMI_SHARD_ROUTER": lambda: bool(
         int(os.getenv("VLLM_KIMI_SHARD_ROUTER", "0"))
+    ),
+    # Transport Kimi-K3's decode-sized TP projection shards over the existing
+    # low-latency B12X DCP channel. The path is byte-exact and falls back to
+    # the normal TP all-gather unless TP and DCP cover the same ranks.
+    "VLLM_KIMI_USE_B12X_PROJECTION_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "0"))
+    ),
+    # Fuse Kimi-K3's routed-down BF16 and router FP32 decode gathers behind one
+    # byte-exact SparkInfer IPC barrier. Requires the projection gather path.
+    "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "0"))
+    ),
+    # Kimi-K3 TP16 decode specialization: gather the routed-down BF16 row and
+    # compute its one-group sigmoid+bias top-16 directly from IPC router shards.
+    # The ordinary paired gather remains the exact fallback.
+    "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "0"))
     ),
     # Log per-layer CUDA allocation while constructing Kimi-K3. This is a
     # model-free diagnostic: it runs before any checkpoint weight is read.

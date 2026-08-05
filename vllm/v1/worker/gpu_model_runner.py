@@ -1369,6 +1369,7 @@ class GPUModelRunner(
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            overwrite_block_ids = req_id in req_data.block_ids_to_overwrite
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -1451,16 +1452,17 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
+            if not resumed_from_preemption and not overwrite_block_ids:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
             else:
-                assert req_index is None
+                if resumed_from_preemption:
+                    assert req_index is None
                 assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
+                # Resumption and recurrent scratch-tail resizing both carry a
+                # complete replacement row.
                 req_state.block_ids = new_block_ids
 
             if req_index is None:
@@ -1483,7 +1485,10 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+                if overwrite_block_ids:
+                    self.input_batch.block_table.add_row(new_block_ids, req_index)
+                else:
+                    self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.

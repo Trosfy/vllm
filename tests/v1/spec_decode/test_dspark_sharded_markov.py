@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
@@ -129,3 +130,26 @@ def test_sharded_markov_finishes_after_backbone_graph_replay():
         args.kwargs["precomputed_base_logits"].untyped_storage().data_ptr()
         == speculator._captured_base_logits.untyped_storage().data_ptr()
     )
+
+
+def test_zero_depth_keeps_draft_cache_current_without_returning_a_draft(monkeypatch):
+    speculator = object.__new__(DSparkSpeculator)
+    speculator.dynamic_physical_depth = True
+    speculator.num_speculative_steps = 7
+    speculator.use_draft_token_capacity = False
+    speculator.use_confidence_capacity = False
+    input_batch = SimpleNamespace(num_reqs=8)
+
+    base_propose = Mock(return_value=torch.arange(8).reshape(8, 1))
+    monkeypatch.setattr(DFlashSpeculator, "propose", base_propose)
+
+    draft_tokens = DSparkSpeculator.propose(
+        speculator,
+        input_batch,
+        num_speculative_tokens=0,
+    )
+
+    assert draft_tokens.shape == (8, 0)
+    assert speculator._last_num_speculative_steps == 1
+    assert speculator._last_proposal_confidence_valid is False
+    assert base_propose.call_args.kwargs["num_speculative_tokens"] == 1

@@ -1392,6 +1392,66 @@ def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
     manager.free(req0)
 
 
+def test_mamba_none_releases_dynamic_speculative_scratch_tail():
+    """Runtime K shrinks physical recurrent scratch, then grows it again."""
+    block_size = 64
+    kv_cache_config = KVCacheConfig(
+        num_blocks=30,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1,),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="none",
+                    num_speculative_blocks=7,
+                ),
+            )
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=block_size,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    req = make_request("dynamic-k", [1] * 8, block_size, sha256)
+
+    # Prefill needs only the running-state page.
+    blocks = manager.allocate_slots(req, 8, num_speculative_tokens=0)
+    assert blocks is not None
+    assert len(manager.get_blocks(req.request_id).blocks[0]) == 1
+    free_after_prefill = manager.block_pool.get_num_free_blocks()
+
+    # One target token plus seven drafts: state + seven scratch pages.
+    req.num_computed_tokens = 8
+    req.append_output_token_ids([2])
+    blocks = manager.allocate_slots(req, 8, num_speculative_tokens=7)
+    assert blocks is not None and not blocks.overwrite
+    assert len(manager.get_blocks(req.request_id).blocks[0]) == 8
+    assert manager.block_pool.get_num_free_blocks() == free_after_prefill - 7
+
+    # At a larger runtime batch K=3 frees four pages and carries a complete
+    # replacement row so workers cannot retain the returned block IDs.
+    req.num_computed_tokens = 9
+    req.append_output_token_ids([3])
+    blocks = manager.allocate_slots(req, 4, num_speculative_tokens=3)
+    assert blocks is not None and blocks.overwrite
+    assert len(blocks.blocks[0]) == 4
+    assert len(manager.get_blocks(req.request_id).blocks[0]) == 4
+    assert manager.block_pool.get_num_free_blocks() == free_after_prefill - 3
+
+    # Dropping back to low load restores full K with append-only growth.
+    blocks = manager.allocate_slots(req, 8, num_speculative_tokens=7)
+    assert blocks is not None and not blocks.overwrite
+    assert len(manager.get_blocks(req.request_id).blocks[0]) == 8
+    assert manager.block_pool.get_num_free_blocks() == free_after_prefill - 7
+
+    manager.free(req)
+
+
 def test_prefill_plp():
     """Test prefill with APC and some prompt logprobs (plp) requests.
 

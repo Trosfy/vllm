@@ -3,19 +3,20 @@
 
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 
 import torch
 from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
-    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -48,6 +49,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAMetadata,
 )
 from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
     reduce_kimi_full_width_output,
     should_reuse_kimi_full_width_output,
 )
@@ -55,6 +57,7 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 logger = init_logger(__name__)
 
@@ -308,6 +311,13 @@ def _make_decode_norm_weight_loader(
 
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        # ``self.num_spec`` is the target verifier width. It can intentionally
+        # be smaller than DSpark's checkpoint-native proposal block.
+        return replace(spec, num_speculative_blocks=self.num_spec)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
 
@@ -338,6 +348,29 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+
+        max_verification_tokens = envs.VLLM_DSPARK_MAX_VERIFICATION_TOKENS
+        if max_verification_tokens:
+            speculative_config = vllm_config.speculative_config
+            if speculative_config is None or speculative_config.method != "dspark":
+                raise ValueError(
+                    "VLLM_DSPARK_MAX_VERIFICATION_TOKENS requires DSpark "
+                    "speculative decoding."
+                )
+            if not 1 <= max_verification_tokens <= self.num_spec:
+                raise ValueError(
+                    "VLLM_DSPARK_MAX_VERIFICATION_TOKENS must be between 1 and "
+                    f"the configured DSpark width ({self.num_spec}), got "
+                    f"{max_verification_tokens}."
+                )
+            if max_verification_tokens < self.num_spec:
+                logger.info_once(
+                    "Kimi-K3 KDA reserves %d target verification state slots "
+                    "instead of DSpark's native %d-token proposal width.",
+                    max_verification_tokens,
+                    self.num_spec,
+                )
+                self.num_spec = max_verification_tokens
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
@@ -543,7 +576,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         mixed_qkv, g_proj_states, f_a, beta = projected[:4]
 
         if self.shard_f_a:
-            f_a = tensor_model_parallel_all_gather(f_a, dim=-1)
+            f_a = gather_kimi_sharded_projection(f_a)
         g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)

@@ -586,6 +586,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.max_num_tokens,
                     self.req_states,
                     self.device,
+                    cudagraphs_enabled=(
+                        self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                    ),
                 )
             )
         self.block_tables = BlockTables(
@@ -1258,7 +1261,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
-                    req_index, req_new_block_ids, overwrite=False
+                    req_index,
+                    req_new_block_ids,
+                    overwrite=req_id in reqs.block_ids_to_overwrite,
                 )
 
         # Update CPU num_computed_prefill_tokens.

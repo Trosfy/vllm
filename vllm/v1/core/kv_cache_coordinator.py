@@ -144,6 +144,7 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        num_speculative_tokens: int | None = None,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -184,6 +185,7 @@ class KVCacheCoordinator(ABC):
                         0,
                         num_encoder_tokens,
                         apply_admission_cap=apply_admission_cap,
+                        num_speculative_tokens=None,
                     )
                 )
             else:
@@ -196,6 +198,7 @@ class KVCacheCoordinator(ABC):
                         num_local_computed_tokens,
                         num_tokens_main_model,
                         apply_admission_cap=apply_admission_cap,
+                        num_speculative_tokens=num_speculative_tokens,
                     )
                 )
         if self.lockstep_mla_allocations:
@@ -291,6 +294,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        num_speculative_tokens: int | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -317,6 +321,7 @@ class KVCacheCoordinator(ABC):
                     if isinstance(manager, CrossAttentionManager)
                     else num_tokens,
                     num_tokens_main_model,
+                    num_speculative_tokens=num_speculative_tokens,
                 )
                 for manager in self.single_type_managers
             )
@@ -336,6 +341,7 @@ class KVCacheCoordinator(ABC):
             request_id,
             num_tokens,
             num_tokens_main_model,
+            num_speculative_tokens=num_speculative_tokens,
         )
         blocks_to_append = new_blocks
         cow_block = None
@@ -360,6 +366,12 @@ class KVCacheCoordinator(ABC):
             for manager in managers[1:]
         )
         return tuple(list(new_blocks) for _ in managers)
+
+    def take_block_table_overwrite(self, request_id: str) -> bool:
+        overwrite = False
+        for manager in self.single_type_managers:
+            overwrite |= manager.take_block_table_overwrite(request_id)
+        return overwrite
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

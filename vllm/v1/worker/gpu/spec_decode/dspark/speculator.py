@@ -112,6 +112,23 @@ class DSparkSpeculator(DFlashSpeculator):
                 "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE must be >= 0, got "
                 f"{self.capacity_activation_batch_size}."
             )
+        self.max_verification_tokens = envs.VLLM_DSPARK_MAX_VERIFICATION_TOKENS
+        if not 0 <= self.max_verification_tokens <= self.num_speculative_steps:
+            raise ValueError(
+                "VLLM_DSPARK_MAX_VERIFICATION_TOKENS must be between 0 and "
+                f"the DSpark block width ({self.num_speculative_steps}), got "
+                f"{self.max_verification_tokens}."
+            )
+        if self.max_verification_tokens == 0:
+            self.max_verification_tokens = self.num_speculative_steps
+        elif self.max_verification_tokens < self.num_speculative_steps:
+            logger.info_once(
+                "DSpark keeps its native %d-token draft block but limits target "
+                "verification to %d proposals per request.",
+                self.num_speculative_steps,
+                self.max_verification_tokens,
+            )
+            self.draft_token_capacity.fill_(self.max_verification_tokens)
         self._runtime_num_reqs_for_capacity = torch.zeros(
             (1,),
             dtype=torch.int32,
@@ -159,13 +176,17 @@ class DSparkSpeculator(DFlashSpeculator):
                     max_batch_tokens,
                     device,
                 )
-        self.use_draft_token_capacity = (
+        self.use_confidence_capacity = (
             self.min_survival_probability > 0.0
             or self.capacity_budget_frac < 1.0
             or self.sps_table is not None
         )
+        self.use_draft_token_capacity = (
+            self.use_confidence_capacity
+            or self.max_verification_tokens < self.num_speculative_steps
+        )
         self.online_sts: DSparkOnlineSTS | None = None
-        if self.use_draft_token_capacity and self.speculative_config.dspark_online_sts:
+        if self.use_confidence_capacity and self.speculative_config.dspark_online_sts:
             self.online_sts = DSparkOnlineSTS(
                 self.max_num_reqs, self.num_speculative_steps, device
             )
@@ -184,7 +205,7 @@ class DSparkSpeculator(DFlashSpeculator):
         confidence_head = getattr(
             getattr(model, "model", None), "confidence_head", None
         )
-        if self.use_draft_token_capacity and (
+        if self.use_confidence_capacity and (
             getattr(model, "compute_confidence", None) is None
             or confidence_head is None
         ):
@@ -284,7 +305,7 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
         confidence_logits = self.draft_token_confidence_logits[:num_reqs, :n_spec]
         min_survival_probability = self.min_survival_probability
-        use_confidence_capacity = self.use_draft_token_capacity and use_capacity
+        use_confidence_capacity = self.use_confidence_capacity and use_capacity
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # laid out as one row per request in the draft query block.
@@ -378,6 +399,7 @@ class DSparkSpeculator(DFlashSpeculator):
             valid_lengths,
             out=self.draft_token_capacity[:num_reqs],
         )
+        self.draft_token_capacity[:num_reqs].clamp_max_(self.max_verification_tokens)
 
     def set_sps_curve(self, sps_curve: list[tuple[int, float]]) -> None:
         """Refresh the SPS lookup table in place (its address is baked into
@@ -407,7 +429,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
     def warmup_capacity_kernels(self) -> None:
         self._warmup_prepare_inputs_kernel()
-        if not self.use_draft_token_capacity:
+        if not self.use_confidence_capacity:
             return
 
         self.draft_token_confidence_logits.zero_()
@@ -430,6 +452,9 @@ class DSparkSpeculator(DFlashSpeculator):
                 sps_table=self.sps_table,
                 confidence_temperature=self.confidence_temperature,
             )
+            self.draft_token_capacity[:num_reqs].clamp_max_(
+                self.max_verification_tokens
+            )
 
     def propose(
         self,
@@ -438,10 +463,21 @@ class DSparkSpeculator(DFlashSpeculator):
         num_speculative_tokens: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        requested_depth = (
+            num_speculative_tokens
+            if self.dynamic_physical_depth and num_speculative_tokens is not None
+            else self.num_speculative_steps
+        )
+        # K=0 disables verification for the next target step, but the draft
+        # cache still has to consume the current target anchor. Run the
+        # one-query K=1 path to keep that cache coherent, then hide its draft
+        # from the scheduler. This also lets a surviving request safely resume
+        # drafting when runtime batch size falls back into a K>0 range.
+        physical_depth = max(requested_depth, 1)
         if self.use_draft_token_capacity:
             self._runtime_num_reqs_for_capacity.fill_(input_batch.num_reqs)
         self._last_proposal_confidence_valid = bool(
-            self.use_draft_token_capacity
+            self.use_confidence_capacity
             and not kwargs.get("is_profile", False)
             and not kwargs.get("dummy_run", False)
             and not self._has_unaligned_cached_prefix(input_batch)
@@ -450,17 +486,17 @@ class DSparkSpeculator(DFlashSpeculator):
                 or input_batch.num_reqs >= self.capacity_activation_batch_size
             )
         )
-        self._last_num_speculative_steps = (
-            num_speculative_tokens
-            if self.dynamic_physical_depth and num_speculative_tokens is not None
-            else self.num_speculative_steps
-        )
-        return super().propose(
+        self._last_num_speculative_steps = physical_depth
+        draft_tokens = super().propose(
             input_batch,
             *args,
-            num_speculative_tokens=num_speculative_tokens,
+            num_speculative_tokens=physical_depth,
             **kwargs,
         )
+        if requested_depth == 0:
+            self._last_proposal_confidence_valid = False
+            return draft_tokens[:, :0]
+        return draft_tokens
 
     def _generate_draft(
         self,

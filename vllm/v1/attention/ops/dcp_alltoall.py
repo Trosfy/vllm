@@ -344,7 +344,8 @@ def _try_b12x_dcp_all_gather_heads(
         return None
 
     batch, local_heads, head_dim = local_input.shape
-    if local_heads <= 0 or head_dim % 8 != 0:
+    gather_alignment = 16 if local_input.dtype == torch.float8_e4m3fn else 8
+    if local_heads <= 0 or head_dim % gather_alignment != 0:
         return None
     if max_batch_size is None:
         max_batch_size = batch
@@ -397,6 +398,163 @@ def dcp_b12x_all_gather_heads(
         if result is not None:
             return result
     return cp_group.all_gather(local_input, dim=1)
+
+
+def _try_b12x_dcp_all_gather_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Gather two decode projections behind one SparkInfer IPC barrier."""
+    world_size = cp_group.world_size
+    supported_dtypes = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+    )
+    if (
+        world_size not in _B12X_DCP_WORLD_SIZES
+        or local_first.dtype not in supported_dtypes
+        or local_second.dtype not in supported_dtypes
+        or not local_first.is_cuda
+        or not local_second.is_cuda
+        or local_first.device != local_second.device
+        or local_first.ndim != 2
+        or local_second.ndim != 2
+        or local_first.shape[0] != local_second.shape[0]
+        or not local_first.is_contiguous()
+        or not local_second.is_contiguous()
+    ):
+        return None
+    batch = int(local_first.shape[0])
+    first_row_bytes = int(local_first.shape[1]) * local_first.element_size()
+    second_row_bytes = int(local_second.shape[1]) * local_second.element_size()
+    if batch < 1 or first_row_bytes % 16 != 0 or second_row_bytes % 16 != 0:
+        return None
+    if max_batch_size is None:
+        max_batch_size = batch
+    max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
+    if max_batch_size < batch:
+        return None
+
+    combined_row_bytes = first_row_bytes + second_row_bytes
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_first.device,
+        total_heads=world_size,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=max_batch_size,
+    )
+    if pool is None or not hasattr(pool, "all_gather_pair"):
+        return None
+    return pool.all_gather_pair(
+        local_first,
+        local_second,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+    )
+
+
+def dcp_b12x_all_gather_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather two rank-local rows together, with exact separate fallbacks."""
+    if envs.VLLM_USE_B12X_DCP_A2A:
+        result = _try_b12x_dcp_all_gather_pair(
+            local_first,
+            local_second,
+            cp_group,
+            max_batch_size=max_batch_size,
+        )
+        if result is not None:
+            return result
+    return (
+        cp_group.all_gather(local_first, dim=-1),
+        cp_group.all_gather(local_second, dim=-1),
+    )
+
+
+def try_dcp_b12x_all_gather_pair_kimi_topk(
+    local_down: torch.Tensor,
+    local_router: torch.Tensor,
+    correction_bias: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return Kimi's gathered latent and compact routing payload on TP16.
+
+    The payload is FP32 ``[weights(16), int32 IDs viewed as FP32(16)]``. This
+    function deliberately has no semantic NCCL fallback; its caller retains
+    the ordinary paired gather plus router implementation when the exact K3
+    contract is unavailable.
+    """
+    if (
+        not envs.VLLM_USE_B12X_DCP_A2A
+        or cp_group.world_size != 16
+        or local_down.shape != (1, 224)
+        or local_down.dtype != torch.bfloat16
+        or local_router.shape != (1, 56)
+        or local_router.dtype != torch.float32
+        or correction_bias.shape != (896,)
+        or correction_bias.dtype != torch.float32
+        or not local_down.is_cuda
+        or not local_router.is_cuda
+        or not correction_bias.is_cuda
+        or local_down.device != local_router.device
+        or local_down.device != correction_bias.device
+        or not local_down.is_contiguous()
+        or not local_router.is_contiguous()
+        or not correction_bias.is_contiguous()
+    ):
+        return None
+    if max_batch_size is None:
+        max_batch_size = 1
+    if int(max_batch_size) < 1:
+        return None
+
+    combined_row_bytes = 224 * 2 + 56 * 4
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_down.device,
+        total_heads=16,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=1,
+    )
+    if pool is None or not hasattr(pool, "all_gather_pair_kimi_topk"):
+        return None
+
+    routed_hidden_states = torch.empty(
+        (1, 3584), device=local_down.device, dtype=torch.bfloat16
+    )
+    routing_payload = torch.empty(
+        (1, 32), device=local_down.device, dtype=torch.float32
+    )
+    topk_weights = routing_payload[:, :16]
+    topk_ids = routing_payload[:, 16:].view(torch.int32)
+    pool.all_gather_pair_kimi_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        routed_hidden_states,
+        topk_weights,
+        topk_ids,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+    )
+    return routed_hidden_states, routing_payload
 
 
 def warmup_b12x_dcp_a2a(

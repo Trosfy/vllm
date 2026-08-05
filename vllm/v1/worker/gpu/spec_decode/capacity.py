@@ -235,6 +235,20 @@ class CapacityBasedVerificationManager:
         self.max_num_tokens = max_num_tokens
         self.device = device
         self.req_states = req_states
+        configured_max_verification_tokens = envs.VLLM_DSPARK_MAX_VERIFICATION_TOKENS
+        if not (
+            0 <= configured_max_verification_tokens <= req_states.num_speculative_steps
+        ):
+            raise ValueError(
+                "VLLM_DSPARK_MAX_VERIFICATION_TOKENS must be between 0 and "
+                f"the DSpark block width ({req_states.num_speculative_steps}), got "
+                f"{configured_max_verification_tokens}."
+            )
+        self.max_verification_tokens = (
+            configured_max_verification_tokens
+            if configured_max_verification_tokens > 0
+            else req_states.num_speculative_steps
+        )
         # Debug (VLLM_DSPARK_TP_CHECK={1,2}): cross-check capacity-derived
         # batch shapes (=2 also GPU-side capacity/STS state) across TP ranks
         # each step via check_dspark_tp_consistency; divergence otherwise
@@ -242,7 +256,7 @@ class CapacityBasedVerificationManager:
         self.tp_check_level = int(os.environ.get("VLLM_DSPARK_TP_CHECK", "0") or "0")
         self.draft_token_capacity_np = np.full(
             req_states.max_num_reqs,
-            req_states.num_speculative_steps,
+            self.max_verification_tokens,
             dtype=np.int32,
         )
         self.copy_stream = torch.cuda.Stream(device)
@@ -283,13 +297,13 @@ class CapacityBasedVerificationManager:
         self.capacity_bypassed = False
 
     def add_request(self, req_idx: int) -> None:
-        self.draft_token_capacity_np[req_idx] = self.req_states.num_speculative_steps
+        self.draft_token_capacity_np[req_idx] = self.max_verification_tokens
 
     def _stage_draft_token_capacity_copy(
         self,
         draft_token_capacity: torch.Tensor,
     ) -> None:
-        self.num_draft_tokens = self.req_states.num_speculative_steps
+        self.num_draft_tokens = self.max_verification_tokens
         self.copied_draft_token_capacity_np = None
         self.copied_req_ids = self.req_ids
         assert self.idx_mapping_np is not None
@@ -432,7 +446,7 @@ class CapacityBasedVerificationManager:
             # Drain a copy staged by the previous high-load step once. Low-load
             # steps then stay entirely GPU/graph driven with no host readback.
             self._flush_draft_token_capacity_copy()
-            self.draft_token_capacity_np.fill(self.req_states.num_speculative_steps)
+            self.draft_token_capacity_np.fill(self.max_verification_tokens)
         self.capacity_bypassed = bypass
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             logger.info(
@@ -458,14 +472,14 @@ class CapacityBasedVerificationManager:
             return
         histogram = np.bincount(
             capacities,
-            minlength=self.req_states.num_speculative_steps + 1,
+            minlength=self.max_verification_tokens + 1,
         )
         logger.info(
             "DSpark capacity dispatch: reqs=%d kept=%d/%d mean=%.3f hist=%s "
             "tokens=%d padded=%s cg=%s max_req=%s",
             capacities.size,
             int(capacities.sum()),
-            capacities.size * self.req_states.num_speculative_steps,
+            capacities.size * self.max_verification_tokens,
             float(capacities.mean()),
             histogram.tolist(),
             num_tokens,
@@ -560,7 +574,7 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
         )
 
     def warmup(self, input_buffers: "InputBuffers") -> None:
-        max_query_len = self.req_states.num_speculative_steps + 1
+        max_query_len = self.max_verification_tokens + 1
         num_reqs = max(
             1,
             min(
@@ -955,8 +969,14 @@ def make_capacity_based_verification_manager(
     max_num_tokens: int,
     req_states: "RequestState",
     device: torch.device,
+    *,
+    cudagraphs_enabled: bool = True,
 ) -> CapacityBasedVerificationManager:
-    if mode == "varlen" and attn_cg_support.min_cg_support != AttentionCGSupport.ALWAYS:
+    if (
+        mode == "varlen"
+        and cudagraphs_enabled
+        and attn_cg_support.min_cg_support != AttentionCGSupport.ALWAYS
+    ):
         logger.info_once(
             "Falling back to masked DSpark capacity verification because "
             "%s reports CUDA graph support %s.",
