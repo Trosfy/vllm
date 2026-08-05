@@ -578,6 +578,57 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     return routed_hidden_states, routing_payload
 
 
+def warmup_b12x_kimi_projection_gathers(
+    projection_group: GroupCoordinator,
+    *,
+    device: torch.device,
+) -> int:
+    """Create Kimi's paired TP channels before CUDA graph capture.
+
+    The M=8 paired projection is first reached by DSpark verification, while
+    the M=1 gather+top-k channel is first reached by ordinary decode. Neither
+    geometry is guaranteed to run during the large-token memory-profile
+    forward. Creating either pool from inside ``graph_capture()`` is too late:
+    it misses the graph-specific channel binding established on context entry
+    and leaves captured nodes sharing the eager channel.
+    """
+    if (
+        not envs.VLLM_USE_B12X_DCP_A2A
+        or not envs.VLLM_KIMI_USE_B12X_PROJECTION_GATHER
+        or not envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
+        or projection_group.world_size != 16
+    ):
+        return 0
+
+    local_down = torch.zeros((8, 224), device=device, dtype=torch.bfloat16)
+    local_router = torch.zeros((8, 56), device=device, dtype=torch.float32)
+    paired = _try_b12x_dcp_all_gather_pair(
+        local_down,
+        local_router,
+        projection_group,
+        max_batch_size=8,
+    )
+    if paired is None:
+        raise RuntimeError("B12X Kimi M=8 paired projection gather is unavailable")
+    warmed = 1
+
+    if envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK:
+        correction_bias = torch.zeros((896,), device=device, dtype=torch.float32)
+        fused = try_dcp_b12x_all_gather_pair_kimi_topk(
+            local_down[:1],
+            local_router[:1],
+            correction_bias,
+            projection_group,
+            max_batch_size=1,
+        )
+        if fused is None:
+            raise RuntimeError(
+                "B12X Kimi M=1 paired projection gather+top-k is unavailable"
+            )
+        warmed += 1
+    return warmed
+
+
 def warmup_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
     *,

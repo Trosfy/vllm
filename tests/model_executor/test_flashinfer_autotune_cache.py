@@ -234,6 +234,46 @@ def test_b12x_dcp_warmup_uses_each_module_dcp_geometry(
     assert calls == expected_calls
 
 
+@pytest.mark.parametrize("dcp_size", [8, 16])
+def test_kimi_projection_warmup_uses_runtime_projection_group(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_size: int,
+) -> None:
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
+    model = torch.nn.Module()
+    model.register_parameter("probe", torch.nn.Parameter(torch.empty(1)))
+    dcp_group = SimpleNamespace(world_size=dcp_size)
+    tp_group = SimpleNamespace(world_size=16)
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    warmed_groups: list[object] = []
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "warmup_b12x_kimi_projection_gathers",
+        lambda group, **kwargs: warmed_groups.append(group) or 1,
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        model_runner=SimpleNamespace(speculator=None),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=dcp_size,
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        ),
+    )
+
+    assert kernel_warmup._warmup_b12x_dcp_a2a(worker) == 1
+    assert warmed_groups == [dcp_group if dcp_size == 16 else tp_group]
+
+
 def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     calls = []
     model = torch.nn.Linear(2, 2)

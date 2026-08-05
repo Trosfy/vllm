@@ -1025,6 +1025,67 @@ def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "1")
+    pair_calls: list[tuple] = []
+    topk_calls: list[tuple] = []
+
+    def fake_pair(local_down, local_router, group, *, max_batch_size):
+        pair_calls.append((local_down.shape, local_router.shape, group, max_batch_size))
+        return local_down, local_router
+
+    def fake_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        group,
+        *,
+        max_batch_size,
+    ):
+        topk_calls.append(
+            (
+                local_down.shape,
+                local_router.shape,
+                correction_bias.shape,
+                group,
+                max_batch_size,
+            )
+        )
+        return local_down, local_router
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_all_gather_pair", fake_pair)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        fake_topk,
+    )
+    group = _FakeCPGroup(16, None)  # type: ignore[arg-type]
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 2
+    assert pair_calls == [(torch.Size([8, 224]), torch.Size([8, 56]), group, 8)]
+    assert topk_calls == [
+        (
+            torch.Size([1, 224]),
+            torch.Size([1, 56]),
+            torch.Size([896]),
+            group,
+            1,
+        )
+    ]
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."
