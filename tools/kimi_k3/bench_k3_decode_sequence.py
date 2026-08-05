@@ -28,7 +28,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-
 FULL_ATTN_LAYERS = frozenset((*range(3, 92, 4), 92))
 NUM_LAYERS = 93
 
@@ -64,6 +63,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument(
+        "--skew-rank",
+        type=int,
+        default=-1,
+        help="Global rank to delay before each full-attention DCP exchange.",
+    )
+    parser.add_argument(
+        "--skew-cycles",
+        type=int,
+        default=0,
+        help="CUDA clock cycles added on skew-rank before each DCP exchange.",
+    )
     return parser.parse_args()
 
 
@@ -212,6 +223,8 @@ def main() -> None:
         raise ValueError("context, page size, iterations, and samples must be positive")
     if args.warmup < 0:
         raise ValueError("warmup must be nonnegative")
+    if args.skew_cycles < 0:
+        raise ValueError("skew cycles must be nonnegative")
     live_context = (
         args.global_context if args.live_context is None else args.live_context
     )
@@ -407,6 +420,8 @@ def main() -> None:
                         )
                     )
                 if layer in FULL_ATTN_LAYERS and do_dcp:
+                    if rank == args.skew_rank and args.skew_cycles:
+                        torch.cuda._sleep(args.skew_cycles)
                     outputs.append(
                         attention_pool.all_gather_heads(
                             local_query,
@@ -446,7 +461,9 @@ def main() -> None:
         eager_outputs: list[torch.Tensor] = []
         run_sequence(eager_outputs)
         torch.cuda.synchronize(device)
-        if not all(bool(torch.isfinite(value.float()).all()) for value in eager_outputs):
+        if not all(
+            bool(torch.isfinite(value.float()).all()) for value in eager_outputs
+        ):
             raise RuntimeError("sequence produced a non-finite output")
         del eager_outputs
         dist.barrier(device_ids=[device.index])
@@ -489,6 +506,8 @@ def main() -> None:
                         "full_attention_layers": len(FULL_ATTN_LAYERS),
                         "moe_layers": NUM_LAYERS - 1,
                         "tp_allreduces": 3 * NUM_LAYERS if do_ar else 0,
+                        "skew_rank": args.skew_rank,
+                        "skew_cycles_per_full_attention_layer": args.skew_cycles,
                         "dense_mla_splits": (
                             dense_state.plan.num_splits
                             if dense_state is not None
