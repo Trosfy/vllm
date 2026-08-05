@@ -504,6 +504,31 @@ def test_b12x_mla_tp16_head_padding_contract() -> None:
     assert b12x_mla._kernel_query_heads(local_heads=6, dcp_size=8) == 48
 
 
+@pytest.mark.parametrize(
+    ("max_seq_len", "expected"),
+    [
+        (0, 1),
+        (1, 1),
+        (1_408, 1),
+        (1_409, 2),
+        (65_536, 47),
+        (131_072, 94),
+        (1_048_576, 94),
+    ],
+)
+def test_b12x_mla_uses_only_nonempty_capture_static_splits(
+    max_seq_len: int,
+    expected: int,
+) -> None:
+    plan = SimpleNamespace(num_splits=94, chunks_per_split=22)
+    assert b12x_mla._active_dense_mla_splits(plan, max_seq_len) == expected
+
+
+def test_b12x_mla_active_split_helper_preserves_legacy_plan_capacity() -> None:
+    plan = SimpleNamespace(num_splits=94, chunks_per_split=22)
+    assert b12x_mla._active_dense_mla_splits(plan, None) == 94
+
+
 def test_b12x_mla_adapter_uses_metadata_shared_scratch(monkeypatch) -> None:
     impl, dense_mla = _fake_impl(monkeypatch)
     shared_scratch = torch.empty(256, dtype=torch.uint8)

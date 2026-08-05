@@ -132,6 +132,30 @@ def _kernel_query_heads(local_heads: int, dcp_size: int) -> int:
     )
 
 
+def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
+    """Return the useful prefix of a capture-static dense-MLA split plan.
+
+    The plan's split boundaries and scratch layout remain fixed at their
+    maximum-context values.  Short decode steps only omit tail splits whose
+    first 64-token chunk is beyond every live sequence, so this does not alter
+    the reduction order of any contributing partial.
+    """
+    num_splits = int(getattr(plan, "num_splits", 1))
+    chunks_per_split = int(getattr(plan, "chunks_per_split", 1))
+    if num_splits <= 0 or chunks_per_split <= 0:
+        raise ValueError(
+            "B12X_MLA received an invalid dense MLA split plan: "
+            f"num_splits={num_splits}, chunks_per_split={chunks_per_split}."
+        )
+    if max_seq_len is None:
+        return num_splits
+    valid_chunks = max(1, (max(0, int(max_seq_len)) + 63) // 64)
+    return min(
+        num_splits,
+        (valid_chunks + chunks_per_split - 1) // chunks_per_split,
+    )
+
+
 def _dcp_local_seq_lens_from_global(
     output: torch.Tensor,
     remainder_scratch: torch.Tensor,
@@ -836,6 +860,18 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             # capture-stable arena allocated above.
             scratch = self._borrow_scratch(plan, q.device)
         quantized = q.dtype == torch.float8_e4m3fn
+        # A conventional CUDA graph fixes kernel grid dimensions and scalar
+        # launch arguments at capture time.  Breakable PIECEWISE execution
+        # calls attention outside the captured segments, so it reaches the
+        # adaptive branch below on every replay.  If another graph mode ever
+        # captures this backend directly, retain the full plan for correctness.
+        if q.is_cuda and torch.cuda.is_current_stream_capturing():
+            active_splits = int(plan.num_splits)
+        else:
+            active_splits = _active_dense_mla_splits(
+                plan,
+                getattr(attn_metadata, "max_seq_len", None),
+            )
         binding = self._dense_mla.bind(
             plan,
             scratch=scratch,
@@ -848,6 +884,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             q_scale=layer._q_scale if quantized else None,
             kv_scale=layer._k_scale if quantized else None,
             sm_scale=self.scale,
+            active_splits=active_splits,
         )
 
         compile_key = (
