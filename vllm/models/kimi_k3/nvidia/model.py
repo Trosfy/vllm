@@ -940,10 +940,15 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[1],
                 self._down_proj_stream,
             )
-            fused_pair_topk = try_gather_kimi_sharded_projection_pair_topk(
-                down_local,
-                router_local,
-                self.gate.e_score_correction_bias.data,
+            fused_pair_topk = (
+                try_gather_kimi_sharded_projection_pair_topk(
+                    down_local,
+                    router_local,
+                    self.gate.e_score_correction_bias.data,
+                )
+                if num_tokens == 1
+                or envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
+                else None
             )
             if fused_pair_topk is not None:
                 routed_hidden_states, routing_payload = fused_pair_topk

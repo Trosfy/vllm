@@ -1025,8 +1025,10 @@ def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+@pytest.mark.parametrize("batched_topk", [False, True])
 def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
     monkeypatch: pytest.MonkeyPatch,
+    batched_topk: bool,
 ):
     from vllm.v1.attention.ops import dcp_alltoall
 
@@ -1034,6 +1036,10 @@ def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
     monkeypatch.setenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
     monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
     monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "1")
+    monkeypatch.setenv(
+        "VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK",
+        str(int(batched_topk)),
+    )
     pair_calls: list[tuple] = []
     topk_calls: list[tuple] = []
 
@@ -1074,15 +1080,14 @@ def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
     )
 
     assert warmed == 2
-    assert pair_calls == []
-    assert topk_calls == [
-        (
-            torch.Size([8, 224]),
-            torch.Size([8, 56]),
-            torch.Size([896]),
-            group,
-            8,
-        ),
+    expected_m8 = (
+        torch.Size([8, 224]),
+        torch.Size([8, 56]),
+        group,
+        8,
+    )
+    assert pair_calls == ([] if batched_topk else [expected_m8])
+    expected_topk = [
         (
             torch.Size([1, 224]),
             torch.Size([1, 56]),
@@ -1091,6 +1096,18 @@ def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
             1,
         )
     ]
+    if batched_topk:
+        expected_topk.insert(
+            0,
+            (
+                torch.Size([8, 224]),
+                torch.Size([8, 56]),
+                torch.Size([896]),
+                group,
+                8,
+            ),
+        )
+    assert topk_calls == expected_topk
 
 
 def test_warmup_kimi_projection_gathers_honors_target_only_token_cap(

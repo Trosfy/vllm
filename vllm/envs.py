@@ -356,6 +356,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_USE_B12X_PROJECTION_GATHER: bool = False
     VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER: bool = False
     VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK: bool = False
+    VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK: bool = False
     VLLM_KIMI_LOG_CONSTRUCTION_MEMORY: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
@@ -2369,6 +2370,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The ordinary paired gather remains the exact fallback.
     "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK": lambda: bool(
         int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "0"))
+    ),
+    # Keep the exact M=2..8 specialization opt-in. It wins in isolation but
+    # can reduce target-model overlap during speculative verification.
+    "VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK", "0"))
     ),
     # Log per-layer CUDA allocation while constructing Kimi-K3. This is a
     # model-free diagnostic: it runs before any checkpoint weight is read.

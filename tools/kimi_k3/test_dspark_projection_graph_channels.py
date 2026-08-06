@@ -35,6 +35,7 @@ def main() -> None:
     os.environ.setdefault("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
     os.environ.setdefault("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
     os.environ.setdefault("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "1")
+    os.environ.setdefault("VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK", "1")
     os.environ.setdefault("VLLM_DCP_A2A_MAX_TOKENS", str(args.batch))
 
     local_rank = int(os.environ["LOCAL_RANK"])

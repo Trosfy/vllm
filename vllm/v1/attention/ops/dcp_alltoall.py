@@ -613,7 +613,10 @@ def warmup_b12x_kimi_projection_gathers(
     if token_cap <= 0 or token_cap >= 8:
         local_down = torch.zeros((8, 224), device=device, dtype=torch.bfloat16)
         local_router = torch.zeros((8, 56), device=device, dtype=torch.float32)
-        if envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK:
+        if (
+            envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK
+            and envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
+        ):
             correction_bias = torch.zeros(
                 (896,), device=device, dtype=torch.float32
             )
