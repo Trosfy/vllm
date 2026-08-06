@@ -132,6 +132,7 @@ def test_dspark_markov_head_is_replicated(
         lambda: SimpleNamespace(model_config=None),
     )
     monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0")
+    monkeypatch.setenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0")
 
     head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
     assert head.markov_w2.tp_size == 1
@@ -162,6 +163,7 @@ def test_dspark_markov_head_can_be_tp_sharded(
     from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
 
     monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
+    monkeypatch.setenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0")
     monkeypatch.setattr(
         vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 3
     )
@@ -193,6 +195,48 @@ def test_dspark_markov_head_can_be_tp_sharded(
     markov_embed = torch.randn(2, 8)
     local_bias = head.local_bias(markov_embed, logits_processor)
     assert local_bias.shape == (2, 16)
+
+
+@pytest.mark.cpu_test
+def test_dspark_markov_head_can_replicate_only_w1(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+
+    monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
+    monkeypatch.setenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "1")
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 3
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(
+        logits_processor,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=None),
+    )
+
+    head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+
+    assert head.shard_across_tp
+    assert head.replicate_w1
+    assert isinstance(head.markov_w1, DSparkMarkovEmbedding)
+    assert head.markov_w1.weight.shape == (128, 8)
+    assert head.markov_w2.tp_size == 8
+    assert head.markov_w2.weight.shape == (16, 8)
+
+    def fail_collective(*args, **kwargs):
+        raise AssertionError("replicated Markov W1 must not invoke an all-reduce")
+
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "tensor_model_parallel_all_reduce",
+        fail_collective,
+    )
+    assert head.embed(torch.tensor([1, 2])).shape == (2, 8)
 
 
 @pytest.mark.cpu_test

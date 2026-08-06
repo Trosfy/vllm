@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
+    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
@@ -1146,6 +1147,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
+    ),
+    # Keep the Markov vocabulary projection TP-sharded while replicating its
+    # much cheaper embedding. This removes one tiny all-reduce per draft step
+    # at half the memory cost of replicating the complete Markov head.
+    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
     ),
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.

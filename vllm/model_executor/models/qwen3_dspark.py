@@ -91,17 +91,30 @@ class DSparkMarkovHead(nn.Module):
     ) -> None:
         super().__init__()
         self.shard_across_tp = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
-        if self.shard_across_tp:
-            # This is the original DSpark layout.  It removes almost all of
-            # the 160 MiB replicated BF16 head at TP16.  The sequential path
-            # pays one 256-element all-reduce and one vocab all-gather for
-            # each proposed token, so keep replication as the default for
-            # models that have enough memory.
-            self.markov_w1 = VocabParallelEmbedding(
-                vocab_size,
-                markov_rank,
-                prefix=maybe_prefix(prefix, "markov_w1"),
+        self.replicate_w1 = envs.VLLM_DSPARK_REPLICATE_MARKOV_W1
+        if self.replicate_w1 and not self.shard_across_tp:
+            raise ValueError(
+                "VLLM_DSPARK_REPLICATE_MARKOV_W1 requires "
+                "VLLM_DSPARK_SHARD_MARKOV_HEAD=1."
             )
+        if self.shard_across_tp:
+            # The fully sharded layout removes almost all of the 160 MiB BF16
+            # head at TP16, but pays one 256-element all-reduce and one vocab
+            # all-gather for each proposed token.  Replicating only W1 costs
+            # 75 MiB/rank more at TP16 and removes the tiny all-reduces while
+            # retaining the large W2/vocabulary shard.
+            if self.replicate_w1:
+                self.markov_w1 = DSparkMarkovEmbedding(
+                    vocab_size,
+                    markov_rank,
+                    use_mxfp8=False,
+                )
+            else:
+                self.markov_w1 = VocabParallelEmbedding(
+                    vocab_size,
+                    markov_rank,
+                    prefix=maybe_prefix(prefix, "markov_w1"),
+                )
             self.markov_w2 = ParallelLMHead(
                 draft_vocab_size,
                 markov_rank,
