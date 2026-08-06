@@ -562,6 +562,35 @@ class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden_states.shape[0]
         if (
+            envs.VLLM_KIMI_CX_TOPK16
+            and self.top_k == 16
+            and self.global_num_experts == 896
+            and self.scoring_func == "sigmoid"
+            and self.renormalize
+            and indices_type in (None, torch.int32)
+            and input_ids is None
+            and self.e_score_correction_bias is not None
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens, 896)
+            and router_logits.dtype == torch.float32
+            and router_logits.is_cuda
+            and router_logits.is_contiguous()
+        ):
+            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (  # noqa: E501
+                _get_padding_mask,
+            )
+            from vllm.models.kimi_k3.nvidia.ops.topk16_cx import (
+                kimi_topk16_sigmoid,
+            )
+
+            return kimi_topk16_sigmoid(
+                router_logits,
+                self.e_score_correction_bias.data,
+                _get_padding_mask(num_tokens),
+                renormalize=self.renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        if (
             self.top_k == 16
             and self.global_num_experts == 896
             and router_logits.ndim == 2

@@ -353,6 +353,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ: bool = False
     VLLM_KIMI_SHARD_ROUTED_UP_PROJ: bool = False
     VLLM_KIMI_SHARD_ROUTER: bool = False
+    VLLM_KIMI_CX_TOPK16: bool = False
     VLLM_KIMI_USE_B12X_PROJECTION_GATHER: bool = False
     VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER: bool = False
     VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK: bool = False
@@ -2358,6 +2359,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Transport Kimi-K3's decode-sized TP projection shards over the existing
     # low-latency B12X DCP channel. The path is byte-exact and falls back to
     # the normal TP all-gather unless TP and DCP cover the same ranks.
+    # Use the fused sigmoid+top-16 routing kernel for Kimi-K3 (bit-exact
+    # replacement for the moeSigmoid+moeTopK pair; 896 experts, top-16).
+    "VLLM_KIMI_CX_TOPK16": lambda: bool(
+        int(os.getenv("VLLM_KIMI_CX_TOPK16", "0"))
+    ),
     "VLLM_KIMI_USE_B12X_PROJECTION_GATHER": lambda: bool(
         int(os.getenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "0"))
     ),
