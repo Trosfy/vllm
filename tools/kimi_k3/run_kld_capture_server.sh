@@ -12,7 +12,7 @@
 # reference at KL~0.003).
 #
 # usage: run_kld_capture_server.sh RUN_LABEL CAPTURE_DIR
-# env: KIMI_SHARD_F_A (default 0), VLLM_ROOT, SPARKINFER_ROOT
+# env: KIMI_SHARD_F_A (default 0), VLLM_ROOT, B12X_ROOT
 set -euo pipefail
 
 if (( $# != 2 )); then
@@ -23,7 +23,7 @@ RUN_LABEL="$1"
 CAPTURE_DIR="$2"
 
 VLLM_ROOT="${VLLM_ROOT:-/mnt/luke/vllm-k3-hh-unified}"
-SPARKINFER_ROOT="${SPARKINFER_ROOT:-/mnt/luke/b12x-k3-hh-unified}"
+B12X_ROOT="${B12X_ROOT:-/mnt/luke/b12x-k3-hh-unified}"
 IMAGE="${IMAGE:-voipmonitor/vllm:kimi-k3-hh-runtime-pr238-pr118-r5-20260805}"
 ENV_FILE="${ENV_FILE:-/mnt/luke/kimi-k3-runs/dspark-dcp16-unified-v90-restored-20260806-a/container-env-after-control.txt}"
 KIMI_SHARD_F_A="${KIMI_SHARD_F_A:-0}"
@@ -45,11 +45,11 @@ docker run -d \
   --name "${CONTAINER}" \
   --hostname aiserver --gpus all --network host --ipc host \
   --env-file "${ENV_FILE}" \
-  -e PYTHONPATH="/source-overlay:${VLLM_ROOT}:${SPARKINFER_ROOT}" \
+  -e PYTHONPATH="/source-overlay:${VLLM_ROOT}:${B12X_ROOT}" \
   -e VLLM_SOURCE_OVERLAY_ROOT="${VLLM_ROOT}" \
   -e VLLM_SOURCE_DIR="${VLLM_ROOT}" \
   -e VLLM_BINARY_PACKAGE_DIR=/opt/kimi-k3-hh/vllm/vllm \
-  -e SPARKINFER_DIR="${SPARKINFER_ROOT}" \
+  -e SPARKINFER_DIR="${B12X_ROOT}" \
   -e TORCH_EXTENSIONS_DIR=/cache/torch-ext-cx \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e NCCL_P2P_DISABLE=0 -e KIMI_NCCL_P2P_DISABLE=0 \

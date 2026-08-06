@@ -29,8 +29,8 @@ export VLLM_DSPARK_COMPACT_ROPE="${VLLM_DSPARK_COMPACT_ROPE:-1}"
 export VLLM_K3_KV_GROUP_SIZE="${VLLM_K3_KV_GROUP_SIZE:-6}"
 # Exact 16-GPU/two-DCP8-group sweep: 512 threads and eight CTAs reduce the
 # production FP8-query gather + BF16 LSE-reduce graph from 74.19 to 69.74 us.
-export SPARKINFER_PCIE_DCP_THREADS="${SPARKINFER_PCIE_DCP_THREADS:-512}"
-export SPARKINFER_PCIE_DCP_BLOCK_LIMIT="${SPARKINFER_PCIE_DCP_BLOCK_LIMIT:-8}"
+export B12X_PCIE_DCP_THREADS="${B12X_PCIE_DCP_THREADS:-512}"
+export B12X_PCIE_DCP_BLOCK_LIMIT="${B12X_PCIE_DCP_BLOCK_LIMIT:-8}"
 # FlashKDA's SM120 prefill cubin materializes several GiB/rank on first use.
 # Keep the 1M profile on the bounded-memory Triton prefill path; this does not
 # affect KDA decode, DSpark acceptance, or target verification throughput.

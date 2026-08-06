@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full stock Kimi K3 MXFP4 on HH, TP16/DCP8, native SparkInfer dense MLA,
+# Full stock Kimi K3 MXFP4 on HH, TP16/DCP8, native B12X dense MLA,
 # and a physical 1M-token FP8 KV cache.
 set -euo pipefail
 
@@ -20,7 +20,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-256}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-1860000000}"
 
 DCP_COMM_BACKEND="${DCP_COMM_BACKEND:-a2a}"
-# This profile serves one sequence at a time.  Sizing SparkInfer's two
+# This profile serves one sequence at a time.  Sizing B12X's two
 # graph/eager PCIe staging channels for 64 rows wastes about 13 MiB/rank at
 # the tight 1M-cache fit without accelerating a size-1 decode.
 DCP_A2A_MAX_TOKENS="${DCP_A2A_MAX_TOKENS:-1}"
@@ -66,13 +66,13 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
-# Fail before loading 1.4 TiB of weights when the requested Luke/SparkInfer
+# Fail before loading 1.4 TiB of weights when the requested Luke/B12X
 # dense MLA package is missing from PYTHONPATH.
 export KDA_PREFILL_BACKEND
 "${PYTHON_BIN}" - <<'PY'
 import os
 
-from sparkinfer.attention import dense_mla
+from b12x.attention import dense_mla
 from vllm.model_executor.layers.activation import ensure_kimi_k3_activation_ops
 from vllm.models.kimi_k3.nvidia.kda import ensure_fused_kda_decode_op
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
@@ -82,8 +82,8 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
 required = ("Caps", "plan", "bind", "compile", "run")
 missing = [name for name in required if not hasattr(dense_mla, name)]
 if missing:
-    raise RuntimeError(f"incomplete sparkinfer.attention.dense_mla: {missing}")
-print(f"SparkInfer dense MLA preflight: {dense_mla.__file__}", flush=True)
+    raise RuntimeError(f"incomplete b12x.attention.dense_mla: {missing}")
+print(f"B12X dense MLA preflight: {dense_mla.__file__}", flush=True)
 ensure_kimi_k3_cache_ops()
 print("HH Kimi-K3 fused cache-op preflight: OK", flush=True)
 if not ensure_fused_kda_decode_op():
@@ -102,7 +102,7 @@ PY
 
 # Native dense MLA gathers the six local TP16 query heads over DCP8, executes
 # 48 effective heads against the local 1/8 KV shard, and LSE-reduces the eight
-# partial outputs. Decode/small batches use SparkInfer's PCIe A2A path.
+# partial outputs. Decode/small batches use B12X's PCIe A2A path.
 export VLLM_USE_B12X_DCP_A2A="${VLLM_USE_B12X_DCP_A2A:-1}"
 export VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM="${VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM:-1}"
 export VLLM_DCP_A2A_MAX_TOKENS="${VLLM_DCP_A2A_MAX_TOKENS:-${DCP_A2A_MAX_TOKENS}}"

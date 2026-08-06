@@ -53,7 +53,7 @@ _MAX_I32 = torch.iinfo(torch.int32).max
 
 
 def _load_dense_mla() -> Any:
-    from sparkinfer.attention import dense_mla
+    from b12x.attention import dense_mla
 
     return dense_mla
 
@@ -103,7 +103,7 @@ def _planned_kv_dtype(vllm_config: VllmConfig) -> torch.dtype:
 def _kernel_query_heads(local_heads: int, dcp_size: int) -> int:
     """Return the head count presented to the tiled dense-MLA kernel.
 
-    SparkInfer computes each query head independently but launches them in
+    B12X computes each query head independently but launches them in
     tiles of eight.  K3 has 96 heads, so TP16 without DCP produces six local
     heads.  Padding that DCP1 query to eight is mathematically inert and lets
     the native kernel cover this otherwise valid tensor-parallel layout.
@@ -260,7 +260,7 @@ class B12xMLAMetadata(MLACommonMetadata):
 
 class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
     # The target verifies the accepted token plus the seven DSpark proposals in
-    # one causal block.  SparkInfer exposes a single-query decode primitive, so
+    # one causal block.  B12X exposes a single-query decode primitive, so
     # both that block and the draft's non-causal block are flattened below.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
@@ -334,7 +334,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         # Keep query-gather and output addresses stable across piecewise eager
         # attention replays. This makes graph ownership explicit and avoids
         # allocating per-layer destinations; each layer still builds a fresh
-        # caller-scratch-owned SparkInfer binding. All represented layers
+        # caller-scratch-owned B12X binding. All represented layers
         # execute serially on the model stream, so one pair is sufficient.
         max_rows = self._max_dense_mla_rows
         self._dense_mla_padded_q = torch.empty(
@@ -510,7 +510,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
 
 
 class B12xMLABackend(MLACommonBackend):
-    """Opt-in dense Kimi K3 MLA backend backed by sparkinfer."""
+    """Opt-in dense Kimi K3 MLA backend backed by b12x."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -700,7 +700,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         # through MLAAttention.forward(), where the common MLA path normally
         # replaces the sentinel value (-1) with the initialized DCP group size.
         # Keep the configured value here so TP16/DCP8 gathers 6 local heads to
-        # the 48-head shape used by the SparkInfer plan.
+        # the 48-head shape used by the B12X plan.
         self.dcp_world_size = dcp_world_size
         self._effective_heads = num_heads * dcp_world_size
         self._kernel_heads = _kernel_query_heads(num_heads, dcp_world_size)

@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    from sparkinfer.attention import dense_mla
+    from b12x.attention import dense_mla
 
     if args.local_cache_tokens is None and args.global_context % args.dcp_size:
         raise ValueError("global context must divide evenly by DCP size")

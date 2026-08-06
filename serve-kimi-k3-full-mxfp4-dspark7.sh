@@ -13,14 +13,14 @@ if [[ ! -x "${DEFAULT_PYTHON_BIN}" && -x /opt/venv/bin/python ]]; then
   DEFAULT_PYTHON_BIN=/opt/venv/bin/python
 fi
 PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
-SPARKINFER_DIR="${SPARKINFER_DIR:-/mnt/luke/sparkinfer-k3-hh-dense-mla-dcp8-latest}"
+SPARKINFER_DIR="${SPARKINFER_DIR:-/mnt/luke/b12x-k3-hh-dense-mla-dcp8-latest}"
 export PYTHON_BIN
 
 if [[ -e "${SCRIPT_DIR}/vllm/_C_stable_libtorch.abi3.so" ]]; then
   export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
-if [[ ! -f "${SPARKINFER_DIR}/sparkinfer/attention/dense_mla/__init__.py" ]]; then
-  echo "SparkInfer dense_mla source is missing: ${SPARKINFER_DIR}" >&2
+if [[ ! -f "${SPARKINFER_DIR}/b12x/attention/dense_mla/__init__.py" ]]; then
+  echo "B12X dense_mla source is missing: ${SPARKINFER_DIR}" >&2
   exit 1
 fi
 export PYTHONPATH="${SCRIPT_DIR}:${SPARKINFER_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -242,7 +242,7 @@ if (( DCP_SIZE > 1 )); then
   # trained seven-token block. Larger prefill batches fall back to NCCL and
   # do not reserve oversized eager/graph PCIe staging slabs.
   export VLLM_DCP_A2A_MAX_TOKENS="${VLLM_DCP_A2A_MAX_TOKENS:-8}"
-  # Keep SparkInfer's low-latency A2A for decode, but avoid the large hidden
+  # Keep B12X's low-latency A2A for decode, but avoid the large hidden
   # ProcessGroupNCCL allocation when a prefill chunk exceeds the B12X cap.
   export VLLM_DCP_A2A_LARGE_BACKEND="${VLLM_DCP_A2A_LARGE_BACKEND:-ag_rs}"
 else
@@ -270,7 +270,7 @@ export VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK="${VLLM_KIMI_USE_B12X_BATCHED_
 export VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS="${VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS:-0}"
 # One 384-thread CTA per verification row is the measured TP16 optimum for
 # the exact fused paired projection gather plus K3 sigmoid top-k path.
-export SPARKINFER_PCIE_KIMI_TOPK_THREADS="${SPARKINFER_PCIE_KIMI_TOPK_THREADS:-384}"
+export B12X_PCIE_KIMI_TOPK_THREADS="${B12X_PCIE_KIMI_TOPK_THREADS:-384}"
 if [[ "${VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS}" == 1 ]]; then
   # The fixed DSpark verification batch is [8, 7168] BF16 = 112 KiB. Reserve
   # that B12X capacity only for the explicit composed-collective experiment.
@@ -334,7 +334,7 @@ import json
 import os
 from pathlib import Path
 
-from sparkinfer.attention import dense_mla
+from b12x.attention import dense_mla
 from vllm.config import LoadConfig, ModelConfig, replace
 from vllm.config.quantization import QuantizationConfigArgs, resolve_quantization_config
 from vllm.model_executor.layers.quantization.online.base import (
@@ -375,15 +375,15 @@ print(f"K3 DSpark preflight: {draft} ({type(config).__name__})", flush=True)
 required = ("Caps", "plan", "bind", "compile", "run")
 missing = [name for name in required if not hasattr(dense_mla, name)]
 if missing:
-    raise RuntimeError(f"incomplete sparkinfer.attention.dense_mla: {missing}")
-print(f"SparkInfer dense MLA preflight: {dense_mla.__file__}", flush=True)
+    raise RuntimeError(f"incomplete b12x.attention.dense_mla: {missing}")
+print(f"B12X dense MLA preflight: {dense_mla.__file__}", flush=True)
 assert B12xMLABackend.supports_compute_capability(DeviceCapability(12, 0))
 assert B12xMLABackend.supports_block_size(944)
 assert B12xMLABackend.supports_non_causal()
 assert B12xMLAMetadataBuilder.supports_non_causal_multi_token_decode
 assert _kernel_query_heads(6, 1) == 8  # full-K3 target at TP16
 assert _kernel_query_heads(4, 1) == 8  # Inferact draft at TP16
-print("SparkInfer target/draft TP16 MLA contract: OK", flush=True)
+print("B12X target/draft TP16 MLA contract: OK", flush=True)
 ensure_kimi_k3_cache_ops()
 if not ensure_fused_kda_decode_op():
     raise RuntimeError("HH Kimi-K3 fused KDA decode op is unavailable")

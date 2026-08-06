@@ -814,7 +814,7 @@ class K3DSparkForCausalLM(nn.Module):
         if runtime is not None:
             return runtime
 
-        from sparkinfer.comm.pcie import VocabParallelArgmax
+        from b12x.comm.pcie import VocabParallelArgmax
 
         tp_group = get_tp_group()
         runtime = VocabParallelArgmax.from_exchange_group(

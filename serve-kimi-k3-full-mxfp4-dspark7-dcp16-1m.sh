@@ -36,9 +36,18 @@ export VLLM_DSPARK_COMPACT_ROPE="${VLLM_DSPARK_COMPACT_ROPE:-1}"
 export VLLM_K3_KV_GROUP_SIZE="${VLLM_K3_KV_GROUP_SIZE:-6}"
 # The production world-16 sweep selected 512 threads / eight CTAs. The exact
 # vLLM graph pair falls from 117.88 to 98.30 us/layer; both the eight- and
-# sixteen-rank settings pass SparkInfer's eager and CUDA-graph oracle.
-export SPARKINFER_PCIE_DCP_THREADS="${SPARKINFER_PCIE_DCP_THREADS:-512}"
-export SPARKINFER_PCIE_DCP_BLOCK_LIMIT="${SPARKINFER_PCIE_DCP_BLOCK_LIMIT:-8}"
+# sixteen-rank settings pass B12X's eager and CUDA-graph oracle.
+# Validated hierarchical all-reduce runtime (handover S8: previously supplied
+# only by the operator's container environment; the self-contained image must
+# carry it so vanilla composition reproduces production behavior).
+export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-1}"
+export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
+export B12X_PCIE_HIERARCHICAL_THREADS="${B12X_PCIE_HIERARCHICAL_THREADS:-256}"
+export B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES="${B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES:-24}"
+export B12X_PCIE_HIERARCHICAL_BF16X2="${B12X_PCIE_HIERARCHICAL_BF16X2:-1}"
+export B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS="${B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS:-7168}"
+export B12X_PCIE_DCP_THREADS="${B12X_PCIE_DCP_THREADS:-512}"
+export B12X_PCIE_DCP_BLOCK_LIMIT="${B12X_PCIE_DCP_BLOCK_LIMIT:-8}"
 export KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-triton}"
 export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE:-2048}"
 if [[ -z "${COMPILATION_CONFIG:-}" ]]; then

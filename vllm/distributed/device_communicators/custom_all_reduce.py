@@ -107,7 +107,7 @@ def _b12x_pcie_dma_min_bytes() -> int | None:
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_allreduce() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import AllReduce as PCIeAllReduce
+        from b12x.comm.pcie import AllReduce as PCIeAllReduce
     except Exception:
         return None
     return PCIeAllReduce
@@ -116,7 +116,7 @@ def _load_b12x_pcie_allreduce() -> Any | None:
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_dma() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import DmaAllReduce as PCIeDmaAllReduce
+        from b12x.comm.pcie import DmaAllReduce as PCIeDmaAllReduce
     except Exception:
         return None
     return PCIeDmaAllReduce
@@ -474,7 +474,7 @@ class CustomAllreduce:
             if allreduce_cls is None:
                 logger.warning(
                     "PCIe custom allreduce was requested, but "
-                    "sparkinfer.comm.pcie.AllReduce is unavailable."
+                    "b12x.comm.pcie.AllReduce is unavailable."
                 )
                 return
             # DMA must accommodate the largest scheduled prefill tensor. The
@@ -580,7 +580,7 @@ class CustomAllreduce:
             elif dma_cls is None:
                 logger.warning(
                     "b12x PCIe DMA allreduce unavailable "
-                    "(sparkinfer.comm.pcie.DmaAllReduce not importable); "
+                    "(b12x.comm.pcie.DmaAllReduce not importable); "
                     "large allreduces stay on PyNCCL."
                 )
             else:
@@ -799,7 +799,7 @@ class CustomAllreduce:
     def capture(self, stream: torch.cuda.Stream | None = None):
         """Bind communicator resources to the enclosing CUDA graph capture.
 
-        Legacy custom all-reduce registers graph buffers on exit. SparkInfer
+        Legacy custom all-reduce registers graph buffers on exit. B12X
         PCIe channels are instead created on the graph's owning stream and
         remain valid for the graph lifetime.
         """
@@ -819,7 +819,7 @@ class CustomAllreduce:
                 self.register_graph_buffers()
 
     def checkpoint_pcie_channels(self) -> Any | None:
-        """Snapshot SparkInfer PCIe channels before a disposable capture.
+        """Snapshot B12X PCIe channels before a disposable capture.
 
         Returns:
             An opaque runtime checkpoint, or ``None`` when PCIe all-reduce is
@@ -832,18 +832,18 @@ class CustomAllreduce:
         return checkpoint()
 
     def rollback_pcie_channels(self, checkpoint: Any) -> None:
-        """Release SparkInfer PCIe channels created after ``checkpoint``.
+        """Release B12X PCIe channels created after ``checkpoint``.
 
         Args:
             checkpoint: Opaque state returned by ``checkpoint_pcie_channels``.
 
         Raises:
-            RuntimeError: If the SparkInfer PCIe runtime is unavailable.
+            RuntimeError: If the B12X PCIe runtime is unavailable.
         """
         runtime = self._pcie_runtime
         rollback = getattr(runtime, "rollback_channels", None)
         if rollback is None:
-            raise RuntimeError("SparkInfer PCIe all-reduce runtime is unavailable")
+            raise RuntimeError("B12X PCIe all-reduce runtime is unavailable")
         rollback(checkpoint)
 
     def _pcie_runtime_stream(self) -> torch.cuda.Stream | None:

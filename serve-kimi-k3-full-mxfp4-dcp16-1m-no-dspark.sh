@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/opt/venv/bin/python}"
 VLLM_SOURCE_DIR="${VLLM_SOURCE_DIR:-/opt/kimi-k3-hh/vllm}"
-SPARKINFER_DIR="${SPARKINFER_DIR:-/opt/kimi-k3-hh/sparkinfer}"
+SPARKINFER_DIR="${SPARKINFER_DIR:-/opt/kimi-k3-hh/b12x}"
 
 MODEL="${MODEL:-/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/2496450e92e425c886db095102a52a6682ca3970}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-HH-DCP16-1M-NoDSpark}"
@@ -34,8 +34,8 @@ if [[ ! -f "${MODEL}/model.safetensors.index.json" ]]; then
   echo "Kimi K3 target checkpoint is incomplete: ${MODEL}" >&2
   exit 1
 fi
-if [[ ! -f "${SPARKINFER_DIR}/sparkinfer/attention/dense_mla/__init__.py" ]]; then
-  echo "SparkInfer dense MLA source is missing: ${SPARKINFER_DIR}" >&2
+if [[ ! -f "${SPARKINFER_DIR}/b12x/attention/dense_mla/__init__.py" ]]; then
+  echo "B12X dense MLA source is missing: ${SPARKINFER_DIR}" >&2
   exit 1
 fi
 if (( TP_SIZE != 16 || DCP_SIZE != 16 )); then
@@ -97,34 +97,34 @@ export VLLM_PCIE_ALLREDUCE_BACKEND="${KIMI_NO_DSPARK_PCIE_ALLREDUCE_BACKEND:-b12
 export VLLM_PCIE_ONESHOT_SINGLE_CHANNEL="${VLLM_PCIE_ONESHOT_SINGLE_CHANNEL:-1}"
 # The optional two-generation staging path is exact but was 1.2% slower in
 # full-model decode, so retain the single-generation serving default.
-export SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
+export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
 # The mixed 32/16/32-grid TP16 harness is bit-exact through 48,000 collectives
 # and cuts the measured all-reduce sequence latency by 6.87%.  Keep the switch
 # independently overridable so serving A/B tests can select the legacy path.
-export SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-1}"
+export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-1}"
 # K3's 7168/32 and 3584/16 grids both contain exactly 224 BF16 values per
 # block.  The vectorized path processes 112 BF16 pairs with four warps,
 # preserves the scalar FP32 accumulation order, and is bit-exact in the TP16
 # mixed-grid and odd-tail stress harnesses.  A long model-free A/B/A measured
 # 338.21 us/graph versus 356.21 us for the original deferred configuration.
-export SPARKINFER_PCIE_HIERARCHICAL_THREADS="${SPARKINFER_PCIE_HIERARCHICAL_THREADS:-224}"
-export SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES="${SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES:-24}"
-export SPARKINFER_PCIE_HIERARCHICAL_BF16X2="${SPARKINFER_PCIE_HIERARCHICAL_BF16X2:-1}"
+export B12X_PCIE_HIERARCHICAL_THREADS="${B12X_PCIE_HIERARCHICAL_THREADS:-224}"
+export B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES="${B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES:-24}"
+export B12X_PCIE_HIERARCHICAL_BF16X2="${B12X_PCIE_HIERARCHICAL_BF16X2:-1}"
 export VLLM_DISABLE_SHARED_EXPERTS_STREAM="${VLLM_DISABLE_SHARED_EXPERTS_STREAM:-0}"
 export VLLM_USE_B12X_DCP_A2A=1
 export VLLM_DCP_A2A_MAX_TOKENS="${VLLM_DCP_A2A_MAX_TOKENS:-1}"
 export VLLM_DCP_A2A_LARGE_BACKEND="${VLLM_DCP_A2A_LARGE_BACKEND:-ag_rs}"
-export SPARKINFER_PCIE_DCP_THREADS="${SPARKINFER_PCIE_DCP_THREADS:-512}"
+export B12X_PCIE_DCP_THREADS="${B12X_PCIE_DCP_THREADS:-512}"
 # The same exact fused projection/router kernel serves M=1 and M=8; 384
 # threads is faster than its former 512-thread launch at both shapes.
-export SPARKINFER_PCIE_KIMI_TOPK_THREADS="${SPARKINFER_PCIE_KIMI_TOPK_THREADS:-384}"
+export B12X_PCIE_KIMI_TOPK_THREADS="${B12X_PCIE_KIMI_TOPK_THREADS:-384}"
 # Size-1 K3 DCP16 query gather measured best at four CTAs; LSE reduction and
 # projection gathers already select fewer CTAs from their row counts.
-export SPARKINFER_PCIE_DCP_BLOCK_LIMIT="${SPARKINFER_PCIE_DCP_BLOCK_LIMIT:-4}"
+export B12X_PCIE_DCP_BLOCK_LIMIT="${B12X_PCIE_DCP_BLOCK_LIMIT:-4}"
 # The small-M MoE grid barrier resets its counter and advances its epoch before
 # releasing the grid, so the next completed launch can reuse both scalars.
 # This removes two 1x-int32 fill kernels per sparse layer (184 launches/token).
-export SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET="${SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET:-0}"
+export B12X_W4A16_SMALL_M_HOST_BARRIER_RESET="${B12X_W4A16_SMALL_M_HOST_BARRIER_RESET:-0}"
 
 # K3 has dense MLA and no GLM sparse indexer/selected-CKV decode path.
 export VLLM_DCP_INDEXER_SHARDS=0
@@ -142,7 +142,7 @@ if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
 fi
 
 "${PYTHON_BIN}" - <<'PY'
-from sparkinfer.attention import dense_mla
+from b12x.attention import dense_mla
 from vllm.model_executor.layers.activation import ensure_kimi_k3_activation_ops
 from vllm.models.kimi_k3.nvidia.kda import ensure_fused_kda_decode_op
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
@@ -152,13 +152,13 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
 required = ("Caps", "plan", "bind", "compile", "run")
 missing = [name for name in required if not hasattr(dense_mla, name)]
 if missing:
-    raise RuntimeError(f"incomplete SparkInfer dense MLA API: {missing}")
+    raise RuntimeError(f"incomplete B12X dense MLA API: {missing}")
 ensure_kimi_k3_cache_ops()
 if not ensure_fused_kda_decode_op():
     raise RuntimeError("Kimi K3 fused KDA decode op is unavailable")
 if not ensure_kimi_k3_activation_ops():
     raise RuntimeError("Kimi K3 fused SiTU activation op is unavailable")
-print(f"SparkInfer dense MLA preflight: {dense_mla.__file__}", flush=True)
+print(f"B12X dense MLA preflight: {dense_mla.__file__}", flush=True)
 print("Kimi K3 no-DSpark target preflight: OK", flush=True)
 PY
 

@@ -66,7 +66,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
 @lru_cache(maxsize=1)
 def _load_b12x_dcp_a2a_pool() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
+        from b12x.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
     except Exception:
         return None
     return PCIeDCPA2APool
@@ -132,7 +132,7 @@ def _get_b12x_dcp_a2a_pool(
             query_head_dim=query_head_dim,
             single_channel=False,
         )
-        # SparkInfer identifies independently replayable channels by a stable
+        # B12X identifies independently replayable channels by a stable
         # semantic name. Stream handles are process-local and can be recycled,
         # so they are not a valid distributed identity.
         pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
@@ -177,7 +177,7 @@ def capture_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
     stream: torch.cuda.Stream | None = None,
 ):
-    """Bind registered SparkInfer DCP pools to the graph's owning stream.
+    """Bind registered B12X DCP pools to the graph's owning stream.
 
     Each graph capture receives independent channels; reusing channels across
     target and draft graphs would make one graph depend on another's lifetime.
@@ -207,7 +207,7 @@ def capture_b12x_dcp_a2a(
 def checkpoint_b12x_dcp_a2a_channels(
     cp_group: GroupCoordinator,
 ) -> tuple[int, dict[Any, tuple[Any, Any]]]:
-    """Snapshot SparkInfer DCP pools before a disposable graph capture."""
+    """Snapshot B12X DCP pools before a disposable graph capture."""
     group_id = id(cp_group.device_group)
     checkpoints = {
         key: (pool, pool.checkpoint_channels())
@@ -428,7 +428,7 @@ def _try_b12x_dcp_all_gather_pair(
     *,
     max_batch_size: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Gather two decode projections behind one SparkInfer IPC barrier."""
+    """Gather two decode projections behind one B12X IPC barrier."""
     world_size = cp_group.world_size
     supported_dtypes = (
         torch.float16,

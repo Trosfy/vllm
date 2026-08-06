@@ -188,7 +188,7 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    from sparkinfer.attention import dense_mla
+    from b12x.attention import dense_mla
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.config.parallel import ParallelConfig

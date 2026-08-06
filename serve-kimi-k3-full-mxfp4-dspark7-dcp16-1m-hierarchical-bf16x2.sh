@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 export PYTHON_BIN="${PYTHON_BIN:-/opt/venv/bin/python}"
-export SPARKINFER_DIR="${SPARKINFER_DIR:-/opt/kimi-k3-hh/sparkinfer}"
+export SPARKINFER_DIR="${SPARKINFER_DIR:-/opt/kimi-k3-hh/b12x}"
 
 export DCP_SIZE=16
 export MAX_MODEL_LEN=1048576
@@ -39,20 +39,20 @@ export VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK=1
 # model-free A/B/A and the full no-DSpark E2E control.
 export KIMI_DSPARK_PCIE_ALLREDUCE_BACKEND=b12x
 export KIMI_DSPARK_PCIE_ONESHOT_SINGLE_CHANNEL=1
-export SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION=1
-export SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER=0
-export SPARKINFER_PCIE_HIERARCHICAL_THREADS=256
-export SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES=24
-export SPARKINFER_PCIE_HIERARCHICAL_BF16X2=1
+export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION=1
+export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER=0
+export B12X_PCIE_HIERARCHICAL_THREADS=256
+export B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES=24
+export B12X_PCIE_HIERARCHICAL_BF16X2=1
 # Preserve the M=1 vector path and select the measured scalar-256 path for
 # DSpark's eight-row target verifier collectives.
-export SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS=7168
-export SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET=0
+export B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS=7168
+export B12X_W4A16_SMALL_M_HOST_BARRIER_RESET=0
 
 # DSpark verifies one current token plus seven draft tokens. DCP16 attention
 # was validated at 512 threads and an eight-CTA cap for this shape.
-export SPARKINFER_PCIE_DCP_THREADS=512
-export SPARKINFER_PCIE_DCP_BLOCK_LIMIT=8
+export B12X_PCIE_DCP_THREADS=512
+export B12X_PCIE_DCP_BLOCK_LIMIT=8
 export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[8],"pass_config":{"fuse_allreduce_rms":true}}'
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-HH-DSpark7-BF16-DCP16-1M-AdaptiveAR-PairB8}"
 

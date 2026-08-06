@@ -6,7 +6,7 @@ The harness reproduces one ordinary (non-speculative) Kimi-K3 decode step:
 * 93 attention output TP all-reduces;
 * 92 latent-MoE TP gather+top-k operations and two further TP all-reduces;
 * 24 full-attention layers with the TP-sharded QKV-A gather, DCP query gather,
-  optional production-shaped SparkInfer dense MLA, and DCP LSE reduction.
+  optional production-shaped B12X dense MLA, and DCP LSE reduction.
 
 It intentionally allocates no model weights.  ``--component`` permits exact
 subtraction tests while retaining the same TP16/DCP process groups and IPC
@@ -101,7 +101,7 @@ def _build_dense_mla(
     gathered_query: torch.Tensor,
     adaptive_splits: bool,
 ) -> DenseMLAState:
-    from sparkinfer.attention import dense_mla
+    from b12x.attention import dense_mla
 
     if global_context % dcp_size:
         raise ValueError("global context must divide evenly by DCP size")
@@ -408,7 +408,7 @@ def main() -> None:
         do_dcp = args.component in ("full", "dcp")
 
         def run_sequence(outputs: list[torch.Tensor]) -> None:
-            from sparkinfer.attention import dense_mla
+            from b12x.attention import dense_mla
 
             for layer in range(NUM_LAYERS):
                 if layer in FULL_ATTN_LAYERS and do_projection:
@@ -536,7 +536,7 @@ def main() -> None:
                 pool.close()
         dcp_alltoall._B12X_DCP_A2A_POOLS.clear()
         # GroupCoordinator.destroy() removes the ProcessGroup before dropping
-        # CustomAllreduce.  SparkInfer's bounded-degree runtime deliberately
+        # CustomAllreduce.  B12X's bounded-degree runtime deliberately
         # performs coordinated barriers during close, so close it while the TP
         # group is still valid and prevent the later destructor from retrying.
         device_communicator = tp_group.device_communicator
