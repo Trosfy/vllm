@@ -60,13 +60,14 @@ def _stream_request(
     model: str,
     prompt: list[int],
     max_tokens: int,
+    temperature: float,
 ) -> tuple[dict[str, int], list[float], str, float, float]:
     payload = json.dumps(
         {
             "model": model,
             "prompt": prompt,
             "max_tokens": max_tokens,
-            "temperature": 0,
+            "temperature": temperature,
             "seed": 1,
             "ignore_eos": True,
             "stream": True,
@@ -107,6 +108,7 @@ def _run(
     model: str,
     prompt: list[int],
     max_tokens: int,
+    temperature: float,
     output_dir: Path,
 ) -> dict[str, object]:
     before = _metrics(url, model)
@@ -115,6 +117,7 @@ def _run(
         model=model,
         prompt=prompt,
         max_tokens=max_tokens,
+        temperature=temperature,
     )
     after = _metrics(url, model)
     if len(event_times) < 2:
@@ -147,6 +150,7 @@ def _run(
         "output_file": str(output_path),
         "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
         "prompt_tokens": int(usage.get("prompt_tokens", len(prompt))),
+        "temperature": temperature,
         "run": name,
         "speculative_counter_delta": {
             "accepted_per_position": position_deltas,
@@ -177,6 +181,7 @@ def main() -> None:
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--prompt-tokens", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--runs", type=int, default=4)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -197,6 +202,7 @@ def main() -> None:
             model=args.model,
             prompt=prompt,
             max_tokens=min(args.max_tokens, 128),
+            temperature=args.temperature,
             output_dir=args.output_dir,
         )
 
@@ -207,6 +213,7 @@ def main() -> None:
             model=args.model,
             prompt=prompt,
             max_tokens=args.max_tokens,
+            temperature=args.temperature,
             output_dir=args.output_dir,
         )
         for index in range(args.runs)
@@ -220,16 +227,15 @@ def main() -> None:
         ),
         "max_tokens": args.max_tokens,
         "mean_emitted_tokens_per_target_cycle_median": statistics.median(
-            float(result["mean_emitted_tokens_per_target_cycle"])
-            for result in results
+            float(result["mean_emitted_tokens_per_target_cycle"]) for result in results
         ),
         "model": args.model,
         "output_sha256s": [result["output_sha256"] for result in results],
         "prompt_tokens": args.prompt_tokens,
         "runs": args.runs,
+        "temperature": args.temperature,
         "target_cycles_per_second_median": statistics.median(
-            float(result["target_cycles_per_second_normalized"])
-            for result in results
+            float(result["target_cycles_per_second_normalized"]) for result in results
         ),
     }
     (args.output_dir / "summary.json").write_text(

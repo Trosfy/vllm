@@ -20,7 +20,10 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -225,6 +228,18 @@ class K3DSparkModel(nn.Module):
             prefix=maybe_prefix(prefix, "markov_head"),
             quant_config=self.quant_config,
         )
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if getattr(self.config, "enable_confidence_head", False):
+            include_markov = getattr(self.config, "confidence_head_with_markov", True)
+            confidence_input_dim = self.config.hidden_size
+            if include_markov:
+                confidence_input_dim += self.config.markov_rank
+            self.confidence_head = DSparkConfidenceHead(
+                confidence_input_dim,
+                prefix=maybe_prefix(prefix, "confidence_head"),
+                bias=True,
+                include_markov=include_markov,
+            )
         self._context_kv_fusion_available: bool | None = None
         self._max_num_context_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -658,7 +673,7 @@ class K3DSparkForCausalLM(nn.Module):
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
-    checkpoint_skip_substrs = ("confidence_head", "embed_tokens", "lm_head")
+    checkpoint_skip_substrs = ("embed_tokens", "lm_head")
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"": "model."},
@@ -780,6 +795,17 @@ class K3DSparkForCausalLM(nn.Module):
     def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
 
+    def gather_local_draft_logits(
+        self,
+        base_logits: torch.Tensor,
+        markov_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """Materialize the full draft distribution from TP-sharded logits."""
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
+        logits = base_logits + markov_bias
+        logits = tensor_model_parallel_all_gather(logits, dim=-1)
+        return logits[..., : self.logits_processor.org_vocab_size]
+
     def _get_b12x_dspark_argmax(
         self,
         base_logits: torch.Tensor,
@@ -837,9 +863,7 @@ class K3DSparkForCausalLM(nn.Module):
         # topology (0.55 vs 0.79 ms for all seven Markov steps). Base and
         # Markov logits are added locally first, so this remains one collective
         # per step and no collective is captured in the draft CUDA graph.
-        logits = base_logits + markov_bias
-        logits = tensor_model_parallel_all_gather(logits, dim=-1)
-        logits = logits[..., : self.logits_processor.org_vocab_size]
+        logits = self.gather_local_draft_logits(base_logits, markov_bias)
         return logits.argmax(dim=-1)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
@@ -851,9 +875,18 @@ class K3DSparkForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def compute_confidence(
+        self,
+        head_hidden: torch.Tensor,
+        markov_embed: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.model.confidence_head is None:
+            return None
+        return self.model.confidence_head(head_hidden, markov_embed)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # confidence_head is training-only. The frozen target embedding and LM
-        # head are shared after this draft-specific checkpoint is loaded.
+        # The frozen target embedding and LM head are shared after this
+        # draft-specific checkpoint is loaded.
         loader = AutoWeightsLoader(
             self,
             skip_substrs=list(self.checkpoint_skip_substrs),

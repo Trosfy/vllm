@@ -244,12 +244,12 @@ class DSparkSpeculator(DFlashSpeculator):
                     "A TP-sharded DSpark Markov head requires model support "
                     "for local draft argmax."
                 )
-            if self.draft_logits is not None:
-                raise ValueError(
-                    "TP-sharded DSpark Markov sampling currently supports "
-                    "deterministic draft sampling only."
-                )
             self._use_local_draft_argmax = True
+            if self.draft_logits is not None:
+                logger.info_once(
+                    "DSpark probabilistic sampling gathers each TP-sharded "
+                    "base-plus-Markov distribution before sampling."
+                )
         if self._capture_sharded_markov:
             if not getattr(model, "_b12x_dspark_argmax_enabled", False):
                 raise RuntimeError(
@@ -376,12 +376,12 @@ class DSparkSpeculator(DFlashSpeculator):
                 bias = self.model.compute_local_markov_bias(markov_embed)
             else:
                 bias = self.model.markov_bias(markov_embed)
-            if self._use_local_draft_argmax:
-                draft_sampled_i = self.model.sample_local_draft_logits(
-                    base_logits[:, i], bias
+            if self.draft_logits is not None:
+                logits_i = (
+                    self.model.gather_local_draft_logits(base_logits[:, i], bias)
+                    if self._use_local_draft_argmax
+                    else base_logits[:, i] + bias
                 )
-            elif self.draft_logits is not None:
-                logits_i = base_logits[:, i] + bias
                 # Probabilistic: sample in target vocab (a reduced draft vocab is
                 # scattered into its target columns; full vocab is already there).
                 if self._d2t_scatter_index is not None:
@@ -400,6 +400,10 @@ class DSparkSpeculator(DFlashSpeculator):
                     seeds=self.seeds,
                     draft_step=self._step_cols[i],
                     draft_logits=self.draft_logits,
+                )
+            elif self._use_local_draft_argmax:
+                draft_sampled_i = self.model.sample_local_draft_logits(
+                    base_logits[:, i], bias
                 )
             else:
                 logits_i = base_logits[:, i] + bias

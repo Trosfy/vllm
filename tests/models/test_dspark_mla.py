@@ -94,6 +94,11 @@ def test_k3_dspark_full_kv_spec_can_be_explicitly_dcp_sharded(monkeypatch) -> No
             1,
         ),
         ("context_proj.weight", "model.context_proj.weight", None),
+        (
+            "confidence_head.proj.weight",
+            "model.confidence_head.proj.weight",
+            None,
+        ),
     ],
 )
 def test_dspark_mla_checkpoint_weight_mapping(checkpoint_name, runtime_name, shard_id):
@@ -102,14 +107,39 @@ def test_dspark_mla_checkpoint_weight_mapping(checkpoint_name, runtime_name, sha
     ) == (runtime_name, shard_id)
 
 
-def test_dspark_mla_shares_frozen_target_weights_and_skips_training_head():
+def test_dspark_mla_shares_only_frozen_target_embedding_and_lm_head():
     assert not K3DSparkForCausalLM.has_own_embed_tokens
     assert not K3DSparkForCausalLM.has_own_lm_head
     assert set(K3DSparkForCausalLM.checkpoint_skip_substrs) == {
-        "confidence_head",
         "embed_tokens",
         "lm_head",
     }
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_compute_confidence_uses_checkpoint_head() -> None:
+    class ConfidenceHead(nn.Module):
+        def forward(
+            self,
+            hidden: torch.Tensor,
+            markov_embed: torch.Tensor,
+        ) -> torch.Tensor:
+            return hidden.sum(dim=-1) + markov_embed.sum(dim=-1)
+
+    model = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.confidence_head = ConfidenceHead()
+    hidden = torch.randn(3, 8)
+    markov_embed = torch.randn(3, 2)
+
+    confidence = model.compute_confidence(hidden, markov_embed)
+
+    assert confidence is not None
+    torch.testing.assert_close(
+        confidence,
+        hidden.sum(dim=-1) + markov_embed.sum(dim=-1),
+    )
 
 
 @pytest.mark.cpu_test
@@ -278,6 +308,44 @@ def test_k3_dspark_sharded_sampling_gathers_after_local_sum(
     sampled = model.sample_local_draft_logits(base_logits, markov_bias)
 
     assert sampled.tolist() == [2, 1]
+    assert len(calls) == 1
+    assert calls[0][1] == -1
+    torch.testing.assert_close(calls[0][0], base_logits + markov_bias)
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_gathers_full_probabilistic_logits_after_local_sum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers import vocab_parallel_embedding
+
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    model = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.lm_head = ParallelLMHead(8, 4, disable_tp=True)
+    model.logits_processor = SimpleNamespace(org_vocab_size=6)
+
+    base_logits = torch.randn(2, 4)
+    markov_bias = torch.randn(2, 4)
+    gathered_logits = torch.arange(16, dtype=torch.float32).view(2, 8)
+    calls = []
+
+    def fake_all_gather(logits, dim=-1):
+        calls.append((logits, dim))
+        return gathered_logits
+
+    monkeypatch.setattr(dspark_mla, "tensor_model_parallel_all_gather", fake_all_gather)
+
+    logits = model.gather_local_draft_logits(base_logits, markov_bias)
+
+    torch.testing.assert_close(logits, gathered_logits[:, :6])
     assert len(calls) == 1
     assert calls[0][1] == -1
     torch.testing.assert_close(calls[0][0], base_logits + markov_bias)
