@@ -655,6 +655,12 @@ class KimiRoutedOutputTransform(nn.Module):
             _KIMI_CORRECTNESS_TRACE.capture(
                 self.layer_idx, "routed_latent_reduced", hidden_states
             )
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                collect_kquant_routed_latent,
+            )
+
+            collect_kquant_routed_latent(self.layer_idx, hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         if self._trace_enabled:

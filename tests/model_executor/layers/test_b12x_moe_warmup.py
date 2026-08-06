@@ -143,6 +143,43 @@ def test_b12x_moe_custom_op_matches_generic_mutation_contract() -> None:
     assert "Tensor(a0!) hidden_states" in b12x_shared_schema
 
 
+@pytest.mark.parametrize(
+    "source_format",
+    ["exl3_trellis_mcg", "exl3_trellis_mul1_e4m3"],
+)
+def test_trellis_scratch_plan_uses_fixed_tp12_route_blocks(
+    source_format: str,
+) -> None:
+    sparkinfer_fused_moe = pytest.importorskip("sparkinfer.moe.fused_moe")
+    weight_plan = sparkinfer_fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format=source_format,
+        activation="situ",
+        params_dtype=torch.bfloat16,
+        num_experts=896,
+        hidden_size=3584,
+        intermediate_size=256,
+        w13_layout="w13",
+        trellis_bits=3,
+    )
+    experts = SimpleNamespace(
+        plan=weight_plan,
+        source_format=source_format,
+    )
+
+    plan = b12x_moe._plan_b12x_moe_fp4_scratch(
+        tokens=32,
+        topk=16,
+        device=torch.device("cpu"),
+        quant_mode="w4a16",
+        experts=experts,
+        route_num_experts=896,
+    )
+
+    assert plan.caps.w4a16_block_size_m == 8
+    assert plan._core_workspace_plan.route_block_size_m == 8
+
+
 def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
     sparkinfer_fused_moe = pytest.importorskip("sparkinfer.moe.fused_moe")
 

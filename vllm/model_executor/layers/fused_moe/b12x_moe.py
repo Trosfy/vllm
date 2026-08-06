@@ -3,12 +3,12 @@
 """B12X modular fused-MoE backend for FP4 weights."""
 
 import os
-import re
 from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import regex as re
 import torch
 
 import vllm.envs as envs
@@ -407,6 +407,15 @@ def _plan_b12x_moe_fp4_scratch(
     from sparkinfer.moe.fused_moe import Caps as TPMoEScratchCaps
     from sparkinfer.moe.fused_moe import plan as plan_tp_moe_scratch
 
+    # Full-rotation Trellis launch plans must own one immutable route geometry
+    # before CUDA-graph prewarming.  The TP12 Trellis kernels and their closure
+    # suite use M=8 route blocks; ordinary packed FP4 plans retain B12X's
+    # existing shape-dependent selection by leaving this unset.
+    w4a16_block_size_m = (
+        8
+        if experts.source_format in {"exl3_trellis_mcg", "exl3_trellis_mul1_e4m3"}
+        else None
+    )
     return plan_tp_moe_scratch(
         TPMoEScratchCaps(
             max_tokens=max(int(tokens), 1),
@@ -421,6 +430,7 @@ def _plan_b12x_moe_fp4_scratch(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             collect_activation_amax=bool(collect_activation_amax),
+            w4a16_block_size_m=w4a16_block_size_m,
             frozen=True,
         )
     )
@@ -633,11 +643,7 @@ def _set_quant_config_weight_scale(
 def _maybe_release_cuda_cache(device: torch.device) -> None:
     if device.type != "cuda" or _is_current_stream_capturing():
         return
-    accelerator = getattr(torch, "accelerator", None)
-    if accelerator is not None:
-        accelerator.empty_cache()
-    else:
-        torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
 
 def _raise_if_capture_copy_required(tensor: torch.Tensor, description: str) -> None:
@@ -1036,7 +1042,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation=activation,
             params_dtype=params_dtype,
         )
-        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR") and not bool(
+            getattr(layer, "_kquant_capture_parent_managed", False)
+        ):
             from vllm.model_executor.layers.fused_moe.kquant_capture import (
                 register_kquant_capture_layer,
             )
@@ -1537,8 +1545,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 "process_weights_after_loading must run first"
             )
         device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
+            torch.device("cuda", torch.accelerator.current_device_index())
+            if torch.accelerator.is_available()
             else torch.device("cpu")
         )
         workspace_dtype = getattr(self.moe_config, "in_dtype", torch.bfloat16)

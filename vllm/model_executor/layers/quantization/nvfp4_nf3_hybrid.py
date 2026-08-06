@@ -16,20 +16,21 @@ absent from the map (e.g. an MTP head) are treated as uniform NVFP4 and run
 through the same path as an all-kept layer. Non-expert linear layers are
 excluded by the checkpoint config and handled by the regular machinery.
 
-Both tiers execute through the b12x W4A16 CuteDSL fused-MoE kernel as
-preplanned launches sharing one scratch/route buffer set. All compiles
-happen during vLLM's eager profile run (the first forward), so the path is
-CUDA-graph safe. Decode steps (M <= 8) use the kernel's TC-decode launch
-with direct top-k routing over -1-masked local expert ids and a fused
-top-k sum (``zero_fc2_output=False``); larger batches use the packed-route
-launch with an expert map.
+The retained tier executes through its ordinary MXFP4 W4A16 kernel.  A TP12
+E4M3 trellis tier (MUL1 or SQG) can use a direct W4A8 route-major decode for
+the small decode buckets where it wins, and retains the full-rotation W4A16
+path for prefill and larger batches.  Both paths consume the same compact
+P24/P33 payload and global-to-local expert map.  All scratch is allocated and
+all kernels are prewarmed during vLLM's eager profile run, so both choices
+remain CUDA-graph safe.
 """
 
 import dataclasses
 import os
-import re
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
+import regex as re
 import torch
 
 from vllm import envs
@@ -62,6 +63,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_qsrt_repeat_check_reports = 0
+
 # Pinned CTA tiles (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n): the NF3
 # flat-span weight layout is packed for a SPECIFIC tile_n, but the kernel's
 # auto tile selection is m-dependent (fc1_tile_n flips 128<->256 across m).
@@ -71,6 +74,10 @@ logger = init_logger(__name__)
 _B12X_TILES = (64, 256, 64, 256)
 # Batches of at most this many tokens take the preplanned TC-decode launch.
 _B12X_DECODE_M = 8
+# Production-shape microbenchmarks favor the native E4M3 W4A8 path for M=1..4.
+# At M=8 the current route-major FC2 loses its decode advantage, so retain the
+# mature W4A16 path there until same-expert route grouping lands.
+_TRELLIS_W4A8_DECODE_M = 4
 # Global scale the NF3 prepare path expects (scales are stored pre-divided).
 _NF3_GLOBAL_SCALE = 2.0**116
 # Expert-chunk size for NF3 unpack/repack. Kimi K3 TP16 runs with less than
@@ -91,6 +98,65 @@ _K3_HYBRID_TOPK = 16
 _K3_HYBRID_HIDDEN = 3584
 _K3_HYBRID_INTERMEDIATE = 192
 _K3_HYBRID_EXPERTS = 896
+# Fixed X4T/W4A16 TP12 ABI.  QSRT fuses checkpoint-order [w1; w3] rows,
+# which are [gate; up] for SiTU; B12X names that physical order ``w31``.
+_QSRT_X4T_W13_LAYOUT = "w31"
+_QSRT_X4T_W13_EXCEPTION_TASK_ROWS = 128
+_QSRT_X4T_W2_EXCEPTION_TASK_ROWS = 896
+_QSRT_X4T_W13_EXCEPTION_ROW_ROTATION = 0
+
+
+def _qsrt_w4a8_requested() -> bool:
+    """Return the opt-in runtime toggle for native QSRT W4A8.
+
+    The direct route-major port is numerically closed but remains behind the
+    mature W4A16 fused path in CUDA-graph decode benchmarks.  Keep it off by
+    default until the fused-scheduler implementation passes the performance
+    gate; this switch exists for explicit kernel evaluation only.
+    """
+
+    return os.getenv("VLLM_KQUANT_TRELLIS_W4A8", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _stack_exl3_intermediate_rotations(
+    w13_svh: torch.Tensor,
+    w2_suh: torch.Tensor,
+) -> torch.Tensor:
+    """Build B12X's ``[gate_svh, up_svh, down_suh]`` rotation bundle."""
+
+    if w13_svh.ndim != 3 or int(w13_svh.shape[1]) != 2:
+        raise ValueError("EXL3 w13_svh must have shape [experts, 2, intermediate]")
+    if (
+        w2_suh.ndim != 2
+        or int(w2_suh.shape[0]) != int(w13_svh.shape[0])
+        or int(w2_suh.shape[1]) != int(w13_svh.shape[2])
+    ):
+        raise ValueError("EXL3 w2_suh must have shape [experts, intermediate]")
+    return torch.cat(
+        [w13_svh[:, 0], w13_svh[:, 1], w2_suh],
+        dim=1,
+    ).contiguous()
+
+
+def _require_rank_local_kept_kernel(kernel: Any) -> None:
+    """Reject a kept-tier kernel that would bypass the outer TP reduction.
+
+    Mixed K3 weights are already sharded over the intermediate axis. The
+    compact MXFP4 tier is therefore built with a no-parallel MoE config and
+    must return the same kind of rank-local latent partial as the trellis
+    tier. The outer FusedMoE runner owns the reduction after the optional
+    Kimi routed-output transform.
+    """
+
+    if kernel.output_is_reduced():
+        raise RuntimeError(
+            "nvfp4_nf3_hybrid kept kernel must return an unreduced rank-local partial"
+        )
 
 
 def _is_dense_layer_ignored(
@@ -142,7 +208,7 @@ def _combined_tier_local_descriptors(
 ) -> list[int]:
     """Encode an exact two-tier partition for the hybrid one-grid kernel."""
     descriptors = [-1] * num_experts
-    seen_local = (set(), set())
+    seen_local: tuple[set[int], set[int]] = (set(), set())
     for global_id, tier_local in remap.items():
         try:
             global_id_i = int(global_id)
@@ -337,7 +403,7 @@ class _HybridSharedRuntime:
         self.topk: int | None = None
         # (num_experts, weight_layout, scale_format, topk, max_m, H, I)
         #   -> (decode_launch, prefill_launch)
-        self.launches: dict[tuple, tuple[Any, Any]] = {}
+        self.launches: dict[tuple, Any] = {}
         self.buffers: Any = None
         self.out_kept: torch.Tensor | None = None
         self.out_nf3: torch.Tensor | None = None
@@ -350,6 +416,17 @@ class _HybridSharedRuntime:
         self.k3_hybrid_sms: int | None = None
         self.k3_hybrid_max_shared_mem: int | None = None
         self.k3_hybrid_disabled_reason: str | None = None
+        # Capture-only route-major canonical pre-w2 scratch. EXL3 cache2 is
+        # H128(h * down_suh); this stable buffer receives its inverse transform.
+        self.kquant_logical_mid: torch.Tensor | None = None
+        # Native E4M3 W4A8 decode buffers, one allocation per captured M.
+        # They are shared across layers because execution is single-stream.
+        self.trellis_w4a8_scratch: dict[int, Any] = {}
+        self.trellis_scratch: torch.Tensor | None = None
+        # X4T expands only routed scale rows immediately before W4A16. The
+        # output grids are shared across layers on the same CUDA stream.
+        self.x4t_w13_scale_scratch: torch.Tensor | None = None
+        self.x4t_w2_scale_scratch: torch.Tensor | None = None
 
 
 class _HybridLayerState:
@@ -404,6 +481,13 @@ class _HybridLayerState:
         # Keeps kernel-format tensors alive: b12x prepared weights VIEW the
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
+        # This mapped K3 layer owns its experts through one fixed TP12 slab,
+        # rather than ordinary safetensors expert parameters.
+        self.uses_mixed_tp12_slab = False
+        self.trellis_w4a8_ready = False
+        self.trellis_w4a8_prewarmed = False
+        self.trellis_weights: Any = None
+        self.trellis_plan: Any = None
         self.runtime_ready = False
 
 
@@ -435,12 +519,17 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         )
         self.hybrid_bit_map: dict[str, list[int]] = hybrid_bit_map or {}
         self.kept_format = kept_format
+        self.kept_storage: str = "inline-mxfp4"
         self.nf3_levels: list[float] | None = None
         # "nf3_2p1" (default) or "exl3_3": how demoted (bit-3) experts are
         # stored and executed. exl3_3 = native EXL3 trellis tensors run via
         # sparkinfer trellis_moe.
         self.demoted_format: str = "nf3_2p1"
+        self.mixed_exl3_tp12: dict[str, Any] | None = None
+        self.qsrt_tp12: dict[str, Any] | None = None
+        self.trellis_codebook: str = "mcg"
         self.trellis_mcg: int = 0
+        self.trellis_mul1_e4m3: int = 0
         self.trellis_shared_su: bool = False
         # "mxfp8" routes non-ignored dense linears to the serialized loader
         # (offline-baked fp8 weights + e8m0 scales in the checkpoint).
@@ -544,19 +633,157 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         if demoted_format is None and isinstance(quantization, dict):
             demoted_format = quantization.get("demoted_format")
         if demoted_format is not None:
-            if demoted_format not in ("nf3_2p1", "exl3_3"):
+            if demoted_format not in (
+                "nf3_2p1",
+                "exl3_3",
+                "mixed_exl3_tp12",
+                "qsrt_tp12",
+            ):
                 raise ValueError(f"unsupported demoted_format {demoted_format!r}")
             config.demoted_format = demoted_format
+        mixed_exl3_tp12 = original_config.get("mixed_exl3_tp12")
+        if mixed_exl3_tp12 is None and isinstance(quantization, dict):
+            mixed_exl3_tp12 = quantization.get("mixed_exl3_tp12")
+        if demoted_format == "mixed_exl3_tp12":
+            if not isinstance(mixed_exl3_tp12, dict):
+                raise ValueError(
+                    "mixed_exl3_tp12 demotion requires a mixed_exl3_tp12 "
+                    "format descriptor"
+                )
+            if mixed_exl3_tp12.get("schema") != "kquant_mixed_exl3_tp12_proto_v3":
+                raise ValueError("unsupported mixed_exl3_tp12 schema")
+            if mixed_exl3_tp12.get("tp_size") != 12:
+                raise ValueError("mixed_exl3_tp12 format requires tp_size=12")
+            kept_storage = original_config.get("kept_storage")
+            if kept_storage is None and isinstance(quantization, dict):
+                kept_storage = quantization.get("kept_storage")
+            if kept_storage is None:
+                kept_storage = "inline-mxfp4"
+            if kept_storage not in {"inline-mxfp4", "external-x4t"}:
+                raise ValueError(
+                    f"unsupported mixed_exl3_tp12 kept_storage {kept_storage!r}"
+                )
+            if kept_storage == "external-x4t":
+                expected_external = {
+                    "layer_header_version": 5,
+                    "x4t_tp12_rank_file_pattern": (
+                        "x4t-tp12-layer-{layer:05d}-rank-{rank:02d}.safetensors"
+                    ),
+                    "x4t_tp12_version": 1,
+                }
+                for name, expected in expected_external.items():
+                    if mixed_exl3_tp12.get(name) != expected:
+                        raise ValueError(
+                            f"external-X4T mixed_exl3_tp12 {name} must be {expected!r}"
+                        )
+            elif mixed_exl3_tp12.get("layer_header_version") not in (None, 3, 4):
+                raise ValueError(
+                    "inline mixed_exl3_tp12 requires layer header version 3 or 4"
+                )
+            config.kept_storage = kept_storage
+            config.mixed_exl3_tp12 = dict(mixed_exl3_tp12)
+        qsrt_tp12 = original_config.get("qsrt_tp12")
+        if qsrt_tp12 is None and isinstance(quantization, dict):
+            qsrt_tp12 = quantization.get("qsrt_tp12")
+        if demoted_format == "qsrt_tp12":
+            if not isinstance(qsrt_tp12, dict):
+                raise ValueError(
+                    "qsrt_tp12 demotion requires a qsrt_tp12 format descriptor"
+                )
+            expected_qsrt = {
+                "schema": "kquant_kimi_k3_qsrt_tp12_v1",
+                "layer_header_version": 5,
+                "tp_size": 12,
+                "layer_file_pattern": "qsrt-tp12-layer-{layer:05d}.bin",
+                "x4t_tp12_rank_file_pattern": (
+                    "x4t-tp12-layer-{layer:05d}-rank-{rank:02d}.safetensors"
+                ),
+                "x4t_tp12_version": 1,
+            }
+            for name, expected in expected_qsrt.items():
+                if qsrt_tp12.get(name) != expected:
+                    raise ValueError(
+                        f"QSRT TP12 {name} must be {expected!r}, got "
+                        f"{qsrt_tp12.get(name)!r}"
+                    )
+            kept_storage = original_config.get("kept_storage")
+            if kept_storage is None and isinstance(quantization, dict):
+                kept_storage = quantization.get("kept_storage")
+            if kept_storage != "external-x4t":
+                raise ValueError("QSRT TP12 requires kept_storage='external-x4t'")
+            config.kept_storage = kept_storage
+            config.qsrt_tp12 = dict(qsrt_tp12)
         trellis = original_config.get("trellis")
         if trellis is None and isinstance(quantization, dict):
             trellis = quantization.get("trellis")
-        if isinstance(trellis, dict) and "mcg_mult" in trellis:
-            config.trellis_mcg = int(
-                torch.tensor(int(trellis["mcg_mult"]), dtype=torch.uint32).view(
-                    torch.int32
-                )
-            )
         if isinstance(trellis, dict):
+            codebook = str(trellis.get("codebook", "mcg")).lower()
+            if codebook not in {
+                "mcg",
+                "mul1-e4m3",
+                "sqg-normal-e4m3",
+                "sqg-cheb-normal-e4m3",
+                "sqg-cheb-normal-k2-q8h4-w2-e4m3",
+            }:
+                raise ValueError(f"unsupported EXL3 trellis codebook {codebook!r}")
+            config.trellis_codebook = codebook
+            if codebook == "mcg" and "mcg_mult" in trellis:
+                config.trellis_mcg = int(
+                    torch.tensor(int(trellis["mcg_mult"]), dtype=torch.uint32).view(
+                        torch.int32
+                    )
+                )
+            if codebook == "mul1-e4m3":
+                if trellis.get("reconstruction_dtype") != "e4m3":
+                    raise ValueError(
+                        "mul1-e4m3 trellis requires reconstruction_dtype='e4m3'"
+                    )
+                if "mul1_mult" not in trellis:
+                    raise ValueError("mul1-e4m3 trellis requires the mul1_mult marker")
+                config.trellis_mul1_e4m3 = int(
+                    torch.tensor(int(trellis["mul1_mult"]), dtype=torch.uint32).view(
+                        torch.int32
+                    )
+                )
+            if codebook == "sqg-normal-e4m3":
+                expected_sqg = {
+                    "labelling": "sqg-l16-normal-r44-v1",
+                    "reconstruction_dtype": "e4m3",
+                    "rate_dependent_reconstruction": True,
+                    "mode_ids": [0, 1, 2],
+                    "separate_r13_r2": True,
+                }
+                for name, expected in expected_sqg.items():
+                    if trellis.get(name) != expected:
+                        raise ValueError(
+                            f"sqg-normal-e4m3 trellis {name} must be {expected!r}"
+                        )
+            if codebook == "sqg-cheb-normal-e4m3":
+                expected_sqg_cheb = {
+                    "labelling": "sqg-l16-normal-cheb-v1",
+                    "reconstruction_dtype": "e4m3",
+                    "rate_dependent_reconstruction": True,
+                    "mode_ids": [0, 1, 2],
+                    "separate_r13_r2": True,
+                }
+                for name, expected in expected_sqg_cheb.items():
+                    if trellis.get(name) != expected:
+                        raise ValueError(
+                            f"sqg-cheb-normal-e4m3 trellis {name} must be {expected!r}"
+                        )
+            if codebook == "sqg-cheb-normal-k2-q8h4-w2-e4m3":
+                expected_sqg_cheb_q8h4 = {
+                    "labelling": "sqg-l16-normal-cheb-k2-q8h4-w2-v1",
+                    "reconstruction_dtype": "e4m3",
+                    "rate_dependent_reconstruction": True,
+                    "mode_ids": [0, 1, 2],
+                    "separate_r13_r2": True,
+                }
+                for name, expected in expected_sqg_cheb_q8h4.items():
+                    if trellis.get(name) != expected:
+                        raise ValueError(
+                            f"SQG-Cheb Q8H4 trellis {name} must be {expected!r}"
+                        )
             # shared-su artifacts store one H-side rotation row per
             # (layer, matrix); register [1, ...] params and let the kernels
             # broadcast (zero expert stride).
@@ -631,7 +858,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if self.quant_config.nf3_levels is not None:
             _apply_nf3_codebook_override(self.quant_config.nf3_levels)
         bits = self._layer_bits(layer)
-        kept_mx = bits is not None and self.quant_config.kept_format == "mxfp4_e8m0k32"
+        mapped_layer = bits is not None
+        kept_mx = mapped_layer and self.quant_config.kept_format == "mxfp4_e8m0k32"
         if bits is None:
             # MoE layer absent from hybrid_bit_map (e.g. an MTP head): its
             # experts are uniform NVFP4; run it through the hybrid path as
@@ -659,7 +887,36 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             **{e: (1, i) for i, e in enumerate(demoted)},
         }
         state = _HybridLayerState(remap, hidden, inter, num_experts, kept_mx)
+        state.uses_mixed_tp12_slab = bool(
+            mapped_layer
+            and self.quant_config.demoted_format in {"mixed_exl3_tp12", "qsrt_tp12"}
+        )
         layer.hybrid_state = state
+
+        if state.uses_mixed_tp12_slab:
+            if tp_size != 12:
+                raise ValueError(
+                    f"mixed_exl3_tp12 serving requires TP=12, got TP={tp_size}"
+                )
+            if hidden != 3584 or inter != 256 or num_experts != 896:
+                raise ValueError(
+                    "mixed_exl3_tp12 serving requires K3's rank-local "
+                    "H=3584, I=256, E=896 geometry"
+                )
+            if not kept_mx:
+                raise ValueError(
+                    "mixed_exl3_tp12 serving requires kept_format='mxfp4_e8m0k32'"
+                )
+            placeholder = torch.nn.Parameter(
+                torch.empty(
+                    (0,),
+                    dtype=torch.uint8,
+                    device=torch.accelerator.current_device_index(),
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("mixed_exl3_tp12_placeholder", placeholder)
+            return
 
         def hybrid_weight_loader(
             param: torch.nn.Parameter,
@@ -681,6 +938,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             name = name_mapped or weight_name or ""
             if "input_scale" in name:  # W4A16: activation scales are unused
                 return True
+            if expert_id is None:
+                raise ValueError(f"expert tensor {name!r} is missing expert_id")
             tier, local_id = state.remap[int(expert_id)]
             if "exl3_" in name:
                 # Native EXL3 tier tensors. TP sharding slices only the
@@ -761,7 +1020,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
 
         def register(name: str, shape: tuple[int, ...], dtype=torch.uint8) -> None:
             param = torch.nn.Parameter(
-                torch.zeros(shape, dtype=dtype, device=torch.cuda.current_device()),
+                torch.zeros(
+                    shape,
+                    dtype=dtype,
+                    device=torch.accelerator.current_device_index(),
+                ),
                 requires_grad=False,
             )
             set_weight_attrs(param, {"weight_loader": hybrid_weight_loader})
@@ -843,13 +1106,266 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         ):
             scale_param = torch.nn.Parameter(
                 torch.zeros(
-                    shape, dtype=dtype, device=dev or torch.cuda.current_device()
+                    shape,
+                    dtype=dtype,
+                    device=dev or torch.accelerator.current_device_index(),
                 ),
                 requires_grad=False,
             )
             if dev == "cpu":
                 scale_param._vllm_keep_on_cpu = True
             layer.register_parameter(name, scale_param)
+
+    def _load_mixed_exl3_tp12_slab(
+        self,
+        layer: "RoutedExperts",
+        *,
+        device: torch.device,
+    ) -> None:
+        """Load this process's rank section from the fixed K3 TP12 slab."""
+
+        from sparkinfer.moe import fused_moe
+
+        from vllm.config import get_current_vllm_config
+        from vllm.model_executor.layers.quantization.kquant_kimi_k3_qsrt_tp12 import (
+            MCG_MULT,
+            MUL1_MULT,
+            read_tp12_rank_payload,
+        )
+
+        state: _HybridLayerState = layer.hybrid_state
+        match = re.search(r"layers\.(\d+)\b", layer.layer_name)
+        if match is None:
+            raise ValueError(
+                f"cannot resolve a mixed_exl3_tp12 layer from {layer.layer_name!r}"
+            )
+        layer_index = int(match.group(1))
+        bits = self._layer_bits(layer)
+        if bits is None:
+            raise ValueError("mixed_exl3_tp12 layer is absent from hybrid_bit_map")
+        tp_rank = get_tensor_model_parallel_rank()
+        model_root = Path(get_current_vllm_config().model_config.model)
+        if not model_root.is_dir():
+            raise ValueError(
+                "mixed_exl3_tp12 serving requires a local model directory, got "
+                f"{model_root}"
+            )
+        descriptor = (
+            self.quant_config.qsrt_tp12
+            if self.quant_config.demoted_format == "qsrt_tp12"
+            else self.quant_config.mixed_exl3_tp12
+        )
+        assert descriptor is not None
+        slab_pattern = descriptor.get(
+            "layer_file_pattern", "mixed-exl3-tp12-layer-{layer:05d}.bin"
+        )
+        slab_path = model_root / slab_pattern.format(layer=layer_index)
+        x4t_tp12_path = None
+        if self.quant_config.kept_storage == "external-x4t":
+            pattern = descriptor["x4t_tp12_rank_file_pattern"]
+            candidate = model_root / pattern.format(
+                layer=layer_index,
+                rank=tp_rank,
+            )
+            if not candidate.is_file():
+                raise FileNotFoundError(
+                    "external-X4T TP12 serving requires its persistent rank "
+                    f"checkpoint shard: {candidate}"
+                )
+            x4t_tp12_path = candidate
+        payload = read_tp12_rank_payload(
+            slab_path,
+            layer=layer_index,
+            rank=tp_rank,
+            x4t_tp12_path=x4t_tp12_path,
+            expected_bits=bits,
+            expected_codebook=self.quant_config.trellis_codebook,
+        )
+        expected_compressed = tuple(
+            global_id
+            for global_id, (tier, _local_id) in sorted(
+                state.remap.items(), key=lambda item: item[1][1]
+            )
+            if tier == 1
+        )
+        expected_kept = tuple(
+            global_id
+            for global_id, (tier, _local_id) in sorted(
+                state.remap.items(), key=lambda item: item[1][1]
+            )
+            if tier == 0
+        )
+        if tuple(payload.compressed_expert_ids.tolist()) != expected_compressed:
+            raise ValueError(
+                "mixed_exl3_tp12 compressed tier order disagrees with remap"
+            )
+        if tuple(payload.kept_expert_ids.tolist()) != expected_kept:
+            raise ValueError("mixed_exl3_tp12 kept tier order disagrees with remap")
+
+        def on_device(value: torch.Tensor) -> torch.Tensor:
+            return value.to(device=device, non_blocking=False).contiguous()
+
+        if state.num_nf3:
+            w13 = on_device(payload.w13_trellis)
+            w2 = on_device(payload.w2_trellis)
+            codebook = self.quant_config.trellis_codebook
+            source_formats = {
+                "mcg": "exl3_trellis_mcg",
+                "mul1-e4m3": "exl3_trellis_mul1_e4m3",
+                "sqg-normal-e4m3": "exl3_trellis_sqg_e4m3",
+                "sqg-cheb-normal-e4m3": "exl3_trellis_sqg_cheb_e4m3",
+                "sqg-cheb-normal-k2-q8h4-w2-e4m3": (
+                    "exl3_trellis_sqg_cheb_k2_q8h4_w2_e4m3"
+                ),
+            }
+            source_format = source_formats[codebook]
+            weight_plan = fused_moe.plan_weights(
+                quant_modes="w4a16",
+                source_format=source_format,
+                activation=self.moe.activation.value,
+                params_dtype=self.moe.in_dtype,
+                num_experts=state.num_nf3,
+                hidden_size=state.hidden_size,
+                intermediate_size=state.intermediate_size,
+                w13_layout="w13",
+                trellis_bits=3,
+                trellis_tile_config=state.tiles,
+                trellis_pair_format="tp12_p24_p33",
+            )
+            if codebook == "mcg":
+                marker = self.quant_config.trellis_mcg
+                expected_marker = MCG_MULT
+                marker_args = {"trellis_mcg": marker}
+            elif codebook == "mul1-e4m3":
+                marker = self.quant_config.trellis_mul1_e4m3
+                expected_marker = MUL1_MULT
+                marker_args = {"trellis_mul1_e4m3": marker}
+            else:
+                marker = 0
+                expected_marker = 0
+                marker_args = {}
+            if marker & 0xFFFFFFFF != expected_marker:
+                raise ValueError(
+                    f"mixed_exl3_tp12 checkpoint has the wrong {codebook} marker: "
+                    f"{marker & 0xFFFFFFFF:#010x}"
+                )
+            state.trellis_weights = fused_moe.prepare_weights(
+                plan=weight_plan,
+                params_dtype=self.moe.in_dtype,
+                w1_fp4=w13,
+                w2_fp4=w2,
+                gate_suh=on_device(payload.gate_suh),
+                up_suh=on_device(payload.up_suh),
+                intermediate_rotations=on_device(payload.intermediate_rotations),
+                down_svh=on_device(payload.down_svh),
+                trellis_fc1_pair_modes=on_device(payload.fc1_pair_modes),
+                trellis_fc2_pair_modes=on_device(payload.fc2_pair_modes),
+                # The payload was freshly loaded for this layer and has no
+                # other owner.  Swizzle it in bounded expert chunks instead
+                # of allocating a second full FC1 slab during model startup.
+                # This preparation choice is independent of whether serving
+                # later dispatches the W4A8 or W4A16 execution path.
+                trellis_inplace_fc1_pair_swizzle=True,
+                **marker_args,
+            )
+
+        def register_loaded(name: str, value: torch.Tensor) -> None:
+            layer.register_parameter(
+                name,
+                torch.nn.Parameter(on_device(value), requires_grad=False),
+            )
+
+        if state.num_kept and self.quant_config.kept_storage == "external-x4t":
+            from sparkinfer._lib.quant.x4t_scales import make_x4t_scale_batch
+            from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+                prepare_w4a16_x4t_tp12_weights,
+            )
+
+            if (
+                payload.w13_x4t_scale_components is None
+                or payload.w2_x4t_scale_components is None
+            ):
+                raise ValueError(
+                    "external X4T serving payload omitted its stored scale streams"
+                )
+            w13_components = payload.w13_x4t_scale_components
+            w2_components = payload.w2_x4t_scale_components
+            w13_x4t = make_x4t_scale_batch(
+                [component.fixed for component in w13_components],
+                [component.exceptions for component in w13_components],
+                rows=512,
+                columns=112,
+                device=device,
+                exception_task_rows=_QSRT_X4T_W13_EXCEPTION_TASK_ROWS,
+                # The sidecar's fused FC1 rows are already [gate; up]
+                # (B12X ``w31``), so neither the sparse exception ranges nor
+                # the packed W4A16 rows need a half rotation.
+                exception_row_rotation=_QSRT_X4T_W13_EXCEPTION_ROW_ROTATION,
+            )
+            w2_x4t = make_x4t_scale_batch(
+                [component.fixed for component in w2_components],
+                [component.exceptions for component in w2_components],
+                rows=3584,
+                columns=8,
+                device=device,
+                exception_task_rows=_QSRT_X4T_W2_EXCEPTION_TASK_ROWS,
+            )
+            runtime = self.quant_config.shared_runtime
+            if runtime.x4t_w13_scale_scratch is None:
+                runtime.x4t_w13_scale_scratch = torch.empty(
+                    (896, 112, 512), dtype=torch.uint8, device=device
+                )
+                runtime.x4t_w2_scale_scratch = torch.empty(
+                    (896, 8, 3584), dtype=torch.uint8, device=device
+                )
+            assert runtime.x4t_w2_scale_scratch is not None
+            global_scale = torch.ones(
+                state.num_kept, dtype=torch.float32, device=device
+            )
+            state.prep_kept = prepare_w4a16_x4t_tp12_weights(
+                on_device(payload.w13_mxfp4),
+                w13_x4t,
+                global_scale,
+                on_device(payload.w2_mxfp4),
+                w2_x4t,
+                global_scale.clone(),
+                runtime.x4t_w13_scale_scratch,
+                runtime.x4t_w2_scale_scratch,
+                activation=self.moe.activation.value,
+                params_dtype=self.moe.in_dtype,
+                # The QSRT sidecar is fused in checkpoint order [w1; w3],
+                # i.e. [gate; up].  B12X calls that physical order ``w31``;
+                # ``w13`` means [up; gate] and would silently swap SiTU's
+                # two inputs during the W4A16 repack.
+                w13_layout=_QSRT_X4T_W13_LAYOUT,
+            )
+        elif state.num_kept:
+            register_loaded("w13_weight", payload.w13_mxfp4)
+            register_loaded("w13_nv_scale", payload.w13_mxfp4_scale)
+            register_loaded("w2_weight", payload.w2_mxfp4)
+            register_loaded("w2_nv_scale", payload.w2_mxfp4_scale)
+        layer.mixed_exl3_tp12_placeholder.data = (
+            layer.mixed_exl3_tp12_placeholder.data.new_empty((0,))
+        )
+        kept_label = (
+            "external X4T"
+            if self.quant_config.kept_storage == "external-x4t"
+            else "MXFP4"
+        )
+        format_name = (
+            "qsrt_tp12"
+            if self.quant_config.demoted_format == "qsrt_tp12"
+            else "mixed_exl3_tp12"
+        )
+        logger.info(
+            "Loaded %s layer %d rank %d: %d compressed, %d %s via W4A16FusedMoeKernel",
+            format_name,
+            layer_index,
+            tp_rank,
+            state.num_nf3,
+            state.num_kept,
+            kept_label,
+        )
 
     def _build_kept_mxfp4(self, layer: "RoutedExperts") -> None:
         """Build the MXFP4 kept tier as a modular kernel over the kept
@@ -883,10 +1399,15 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         )
         backend, experts_cls = select_mxfp4_moe_backend(kept_moe, activation_key=None)
+        if experts_cls is None:
+            raise RuntimeError("MXFP4 backend did not provide an experts class")
         kept_module = torch.nn.Module()
         kept_module.activation = layer.activation
         kept_module.moe_config = kept_moe
         kept_module.local_num_experts = num_kept
+        # The compact kept tier is registered under its global parent layer;
+        # suppress the ordinary B12X collector's local-expert registration.
+        kept_module._kquant_capture_parent_managed = True
         w13, w2, w13_scale, w2_scale, _bias13, _bias2 = (
             convert_weight_to_mxfp4_moe_kernel_format(
                 backend,
@@ -907,6 +1428,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         quant_config = make_mxfp4_moe_quant_config(
             backend, w13_scale, w2_scale, layer=kept_module
         )
+        if quant_config is None:
+            raise RuntimeError("MXFP4 backend did not provide a quantization config")
         kernel = make_mxfp4_moe_kernel(
             quant_config,
             kept_moe,
@@ -914,8 +1437,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             mxfp4_backend=backend,
             routing_tables=None,
         )
+        _require_rank_local_kept_kernel(kernel)
         kernel.fused_experts.process_weights_after_loading(kept_module)
-        prepared_experts = kernel.fused_experts._lookup_prepared_experts()
+        prepared_experts = cast(Any, kernel.fused_experts)._lookup_prepared_experts()
         if prepared_experts is None:
             raise RuntimeError("MXFP4 modular kernel did not publish prepared weights")
         state.prep_kept_hybrid = prepared_experts.representation_for("w4a16")
@@ -1003,7 +1527,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
 
         state: _HybridLayerState = layer.hybrid_state
         hidden, inter = state.hidden_size, state.intermediate_size
-        device = layer.w13_weight.device
+        device = (
+            torch.device("cuda", torch.accelerator.current_device_index())
+            if state.uses_mixed_tp12_slab
+            else layer.w13_weight.device
+        )
         num_kept, num_nf3 = state.num_kept, state.num_nf3
         emap_kept = torch.full(
             (state.num_experts,), -1, dtype=torch.int32, device=device
@@ -1016,22 +1544,21 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         state.emap_kept, state.emap_nf3 = emap_kept, emap_nf3
         fc1_tile_n, fc2_tile_n = state.tiles[1], state.tiles[3]
 
-        if num_nf3 > 0 and self.quant_config.demoted_format == "exl3_3":
+        if state.uses_mixed_tp12_slab:
+            self._load_mixed_exl3_tp12_slab(layer, device=device)
+        elif num_nf3 > 0 and self.quant_config.demoted_format == "exl3_3":
             from sparkinfer.moe import fused_moe
 
             # Projection-major native stacks; prepare_weights wraps zero-copy.
             w13 = layer.w13_exl3_trellis.data.permute(1, 0, 2, 3, 4).contiguous()
             w2t = layer.w2_exl3_trellis.data.contiguous()
-            # intermediate rotation bundle order pinned by the closure test:
-            # (gate_svh, down_suh, up_svh)
-            inter_rot = torch.cat(
-                [
-                    layer.w13_exl3_svh.data[:, 0],
-                    layer.w2_exl3_suh.data,
-                    layer.w13_exl3_svh.data[:, 1],
-                ],
-                dim=1,
-            ).contiguous()
+            # B12X consumes the two FC1 output scales before the FC2 input
+            # scale.  This order is observable for SiTU because its up branch
+            # is nonlinear; the latter two blocks cannot be commuted.
+            inter_rot = _stack_exl3_intermediate_rotations(
+                layer.w13_exl3_svh.data,
+                layer.w2_exl3_suh.data,
+            )
             wplan = fused_moe.plan_weights(
                 quant_modes="w4a16",
                 source_format="exl3_trellis_mcg",
@@ -1064,7 +1591,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             ):
                 p = getattr(layer, pname)
                 p.data = p.data.new_empty((0,))
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         elif num_nf3 > 0:
 
             def drop_parameter_data(name: str) -> None:
@@ -1155,9 +1682,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 fc2_tile_n=fc2_tile_n,
             )
 
-        if num_kept > 0 and state.kept_mx:
+        if num_kept > 0 and state.kept_mx and state.prep_kept is None:
             self._build_kept_mxfp4(layer)
-        elif num_kept > 0:
+        elif num_kept > 0 and state.prep_kept is None:
             # Kept NVFP4 through the "packed"/e4m3_k16 W4A16 layout. This is
             # byte-identical to the kernel's own prepare entry and lets the
             # TC-decode launches compile; no modular kernel is involved.
@@ -1205,6 +1732,24 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 param = getattr(layer, name)
                 param.data = param.data.new_empty((0,))
 
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                register_kquant_capture_layer,
+            )
+
+            prefix = str(layer.layer_name)
+            register_kquant_capture_layer(
+                prefix=prefix,
+                device=device,
+                hidden_size=hidden,
+                local_intermediate_size=inter,
+                num_experts=state.num_experts,
+                topk=int(self.moe.experts_per_token),
+                quant_mode="hybrid_exl3_3",
+            )
+            if state.kept_kernel is not None:
+                state.kept_kernel.fused_experts._kquant_capture_prefix = prefix
+
     def _get_launch_pair(
         self, prepared: Any, state: _HybridLayerState
     ) -> tuple[Any, Any]:
@@ -1224,14 +1769,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
 
         runtime = self.quant_config.shared_runtime
+        assert runtime.max_m is not None
+        assert runtime.topk is not None
+        max_m = runtime.max_m
+        topk = runtime.topk
         hidden = self.moe.hidden_dim
         inter = self.moe.intermediate_size_per_partition
         key = (
             prepared.num_experts,
             prepared.weight_layout,
             prepared.scale_format,
-            runtime.topk,
-            runtime.max_m,
+            topk,
+            max_m,
             hidden,
             inter,
             layer_activation := self.moe.activation.value,
@@ -1240,12 +1789,14 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         cached = runtime.launches.get(key)
         if cached is not None:
             return cached
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = torch.cuda.get_device_properties(
+            torch.accelerator.current_device_index()
+        )
         common = dict(
             hidden_size=hidden,
             intermediate_size=inter,
             num_experts=prepared.num_experts,
-            top_k=runtime.topk,
+            top_k=topk,
             activation=layer_activation,
             apply_router_weight_on_input=False,
             element_dtype="bf16",
@@ -1258,11 +1809,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             scale_format=prepared.scale_format,
             force_tile_config=state.tiles,
         )
-        cap_slots = max_packed_route_slots(
-            runtime.max_m * runtime.topk, 64, self.moe.num_experts
-        )
+        cap_slots = max_packed_route_slots(max_m * topk, 64, self.moe.num_experts)
         prefill = compile_w4a16_fused_moe(
-            size_m=runtime.max_m,
+            size_m=max_m,
             zero_fc2_output=True,
             moe_block_size=64,
             max_m_blocks=(cap_slots + 63) // 64,
@@ -1280,7 +1829,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 size_m=_B12X_DECODE_M,
                 zero_fc2_output=False,
                 moe_block_size=8,
-                max_m_blocks=_B12X_DECODE_M * runtime.topk,
+                max_m_blocks=_B12X_DECODE_M * topk,
                 direct_topk_routes=True,
                 tc_decode_fused_sum=True,
                 **common,
@@ -1408,7 +1957,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if not prepared_contract:
                 raise RuntimeError("prepared tier layouts do not match Grid188 ABI")
 
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            props = torch.cuda.get_device_properties(
+                torch.accelerator.current_device_index()
+            )
             sms = int(props.multi_processor_count)
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", 101_376)
@@ -1545,7 +2096,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 compile_w4a16_fused_moe_hybrid,
             )
 
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            props = torch.cuda.get_device_properties(
+                torch.accelerator.current_device_index()
+            )
             sms = int(props.multi_processor_count)
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", 101_376)
@@ -1753,6 +2306,68 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
         return state.k3_hybrid_output
 
+    def _can_use_trellis_w4a8(self, state: _HybridLayerState, *, topk: int) -> bool:
+        """Identify the exact TP12 E4M3 trellis contract implemented by B12X."""
+
+        prepared = (
+            state.trellis_weights.representation.value
+            if getattr(state, "trellis_weights", None) is not None
+            else None
+        )
+
+        return bool(
+            _qsrt_w4a8_requested()
+            and not os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+            and state.uses_mixed_tp12_slab
+            and self.quant_config.trellis_codebook
+            in {
+                "mul1-e4m3",
+                "sqg-normal-e4m3",
+                "sqg-cheb-normal-e4m3",
+                "sqg-cheb-normal-k2-q8h4-w2-e4m3",
+            }
+            and get_tensor_model_parallel_world_size() == 12
+            and state.hidden_size == 3584
+            and state.intermediate_size == 256
+            and int(topk) == 16
+            and self.moe.activation.value == "situ"
+            and prepared is not None
+            and int(prepared.gate_suh.shape[0]) == 1
+            and int(prepared.up_suh.shape[0]) == 1
+        )
+
+    def _run_trellis_w4a8(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the compact compressed tier through native E4M3 W4A8 MMA."""
+
+        from sparkinfer.moe._shared.kernels.trellis_w4a8 import (
+            run_trellis_w4a8_moe,
+        )
+
+        state: _HybridLayerState = layer.hybrid_state
+        runtime = self.quant_config.shared_runtime
+        m = int(x.shape[0])
+        scratch = runtime.trellis_w4a8_scratch.get(m)
+        if scratch is None:
+            raise RuntimeError(
+                f"native QSRT W4A8 scratch for m={m} was not preallocated"
+            )
+        prepared = state.trellis_weights.representation.value
+        return run_trellis_w4a8_moe(
+            x if x.is_contiguous() else x.contiguous(),
+            prepared,
+            topk_weights,
+            topk_ids,
+            scratch,
+            expert_map=state.emap_nf3,
+            fast_math=True,
+        )
+
     def _ensure_runtime(self, layer: "RoutedExperts", m: int, topk: int) -> None:
         """First-apply init: per-tier preplanned launches plus ONE shared
         scratch/buffer set. The first apply is vLLM's eager profile run at
@@ -1790,25 +2405,58 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 caps = fused_moe.Caps(
                     max_tokens=runtime.max_m,
                     num_topk=runtime.topk,
-                    device=torch.cuda.current_device(),
+                    device=torch.accelerator.current_device_index(),
                     weight_plan=state.trellis_weights.plan,
                     quant_mode="w4a16",
                     route_num_experts=self.moe.num_experts,
+                    # Full-rotation Trellis owns one immutable route geometry
+                    # for prewarm, eager execution, and CUDA-graph replay.
+                    # This is the TP12 geometry validated by the B12X closure
+                    # and pair-container benchmark paths.
+                    w4a16_block_size_m=8,
                 )
                 plan = fused_moe.plan(caps)
                 runtime.launches[key] = plan
             state.trellis_plan = plan
             spec = plan.scratch_specs()[0]
             need = int(torch.Size(spec.shape).numel())
-            if getattr(runtime, "trellis_scratch", None) is None or (
-                runtime.trellis_scratch.numel() < need
-                or runtime.trellis_scratch.dtype != spec.dtype
+            trellis_scratch = runtime.trellis_scratch
+            if trellis_scratch is None or (
+                trellis_scratch.numel() < need or trellis_scratch.dtype != spec.dtype
             ):
                 runtime.trellis_scratch = torch.empty(
                     spec.shape,
                     dtype=spec.dtype,
-                    device=torch.cuda.current_device(),
+                    device=torch.accelerator.current_device_index(),
                 )
+            if (
+                os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+                and runtime.kquant_logical_mid is None
+            ):
+                runtime.kquant_logical_mid = torch.empty(
+                    (runtime.max_m * runtime.topk, state.intermediate_size),
+                    dtype=torch.float16,
+                    device=torch.accelerator.current_device_index(),
+                )
+            if self._can_use_trellis_w4a8(state, topk=topk):
+                from sparkinfer.moe._shared.kernels.trellis_w4a8 import (
+                    make_trellis_w4a8_moe_scratch,
+                )
+
+                prepared = state.trellis_weights.representation.value
+                device = prepared.w13.device
+                for decode_m in range(1, _TRELLIS_W4A8_DECODE_M + 1):
+                    if decode_m not in runtime.trellis_w4a8_scratch:
+                        runtime.trellis_w4a8_scratch[decode_m] = (
+                            make_trellis_w4a8_moe_scratch(
+                                m=decode_m,
+                                topk=topk,
+                                hidden_size=state.hidden_size,
+                                intermediate_size=state.intermediate_size,
+                                device=device,
+                            )
+                        )
+                state.trellis_w4a8_ready = True
         if state.prep_nf3 is not None:
             state.launch_nf3 = self._get_launch_pair(state.prep_nf3, state)
         if runtime.buffers is None:
@@ -1939,6 +2587,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         runtime = self.quant_config.shared_runtime
         if state.prep_kept is not None:
             m = x.shape[0]
+            assert state.launch_kept is not None
+            assert state.emap_kept is not None
+            assert runtime.out_kept is not None
             return self._run_tier(
                 x,
                 topk_weights,
@@ -1950,7 +2601,12 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 decode,
             )
         result_m = int(x.shape[0])
-        if decode and state.kept_mx and result_m != 1:
+        if (
+            decode
+            and state.kept_mx
+            and result_m != 1
+            and not os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+        ):
             # The native MXFP4 microkernel is valuable for single-sequence
             # decode, where M is exactly one.  Chunked-prefill tails can also
             # land in the nominal decode range (M=2..8); specializing the
@@ -1959,6 +2615,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             # the numerically-safe packed route while NF3 retains its direct
             # launch at the original M.
             packed_m = _B12X_DECODE_M + 1
+            if runtime.max_m is None:
+                raise RuntimeError("hybrid runtime was not initialized")
             if runtime.max_m < packed_m:
                 raise RuntimeError(
                     "nvfp4_nf3_hybrid requires max_num_batched_tokens >= "
@@ -1981,6 +2639,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 dim=0,
             )
         kept_module = state.kept_module
+        if kept_module is None or state.kept_kernel is None:
+            raise RuntimeError("MXFP4 kept tier was not prepared")
         return state.kept_kernel.apply(
             x,
             kept_module.w13_weight,
@@ -1995,7 +2655,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             shared_experts_input=None,
         )[:result_m]
 
-    def apply(
+    def _apply_once(
         self,
         layer: "RoutedExperts",
         x: torch.Tensor,
@@ -2011,6 +2671,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         m = int(x.shape[0])
         if not state.runtime_ready:
             self._ensure_runtime(layer, m, int(topk_ids.shape[1]))
+        if runtime.max_m is None:
+            raise RuntimeError("hybrid runtime was not initialized")
         if m > runtime.max_m:
             raise RuntimeError(
                 f"nvfp4_nf3_hybrid: m={m} exceeds the planned launch "
@@ -2024,7 +2686,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
         if not weights.is_contiguous():
             weights = weights.contiguous()
-        if state.grid188_ready and 1 <= m <= _GRID188_M:
+        if (
+            state.grid188_ready
+            and 1 <= m <= _GRID188_M
+            and not os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+        ):
             # The unified hybrid launch takes dynamic m up to the compiled
             # capacity, so every small decode bucket (not just the exact MTP
             # batch) rides the one-grid path.
@@ -2044,7 +2710,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             ):
                 logger.info_once("nvfp4_nf3_hybrid: executing hybrid one-grid decode")
                 return self._run_grid188(layer, x, weights, grid_ids)
-        if state.k3_hybrid_ready and m == _K3_HYBRID_M:
+        if (
+            state.k3_hybrid_ready
+            and m == _K3_HYBRID_M
+            and not os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+        ):
             hybrid_ids = (
                 topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
@@ -2073,6 +2743,34 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             )
             if not tids.is_contiguous():
                 tids = tids.contiguous()
+            if state.trellis_w4a8_ready:
+                # The first call for every layer happens in vLLM's eager
+                # profile pass.  Exercise M=1 there so no CuTe resolution or
+                # compilation can occur inside a later CUDA-graph capture.
+                if not state.trellis_w4a8_prewarmed:
+                    self._run_trellis_w4a8(
+                        layer,
+                        x[:1],
+                        weights[:1],
+                        tids[:1],
+                    )
+                    state.trellis_w4a8_prewarmed = True
+                if m <= _TRELLIS_W4A8_DECODE_M:
+                    logger.info_once(
+                        "nvfp4_nf3_hybrid: executing TP12 E4M3 trellis W4A8 decode"
+                    )
+                    out_trellis = self._run_trellis_w4a8(
+                        layer,
+                        x,
+                        weights,
+                        tids,
+                    ).to(x.dtype)
+                    if state.num_kept == 0:
+                        return out_trellis
+                    return (
+                        self._run_kept(layer, x, weights, topk_ids, decode)[:m]
+                        + out_trellis
+                    )
             binding = fused_moe.bind(
                 state.trellis_plan,
                 scratch=runtime.trellis_scratch,
@@ -2085,10 +2783,35 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             # The unified full-rotation top-k sum emits fp32; downstream
             # layers expect the model dtype.
             out_trellis = fused_moe.run(binding=binding)[:m].to(x.dtype)
+            if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+                from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                    collect_kquant_exl3_mid,
+                )
+
+                prepared = state.trellis_weights.representation.value
+                intermediate_rotations = prepared.intermediate_rotations
+                logical_scratch = runtime.kquant_logical_mid
+                if intermediate_rotations is None or logical_scratch is None:
+                    raise RuntimeError(
+                        "EXL3 KQuant capture resources were not prepared eagerly"
+                    )
+                collect_kquant_exl3_mid(
+                    prefix=str(layer.layer_name),
+                    binding=binding,
+                    topk_weights=weights,
+                    topk_ids=tids,
+                    expert_map=state.emap_nf3,
+                    intermediate_rotations=intermediate_rotations,
+                    logical_scratch=logical_scratch,
+                )
             if state.num_kept == 0:
                 return out_trellis
             return self._run_kept(layer, x, weights, topk_ids, decode)[:m] + out_trellis
         if state.num_kept == 0:
+            assert state.prep_nf3 is not None
+            assert state.launch_nf3 is not None
+            assert state.emap_nf3 is not None
+            assert runtime.out_nf3 is not None
             return self._run_tier(
                 x,
                 weights,
@@ -2100,6 +2823,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 decode,
             )
         out_kept = self._run_kept(layer, x, weights, topk_ids, decode)
+        assert state.prep_nf3 is not None
+        assert state.launch_nf3 is not None
+        assert state.emap_nf3 is not None
+        assert runtime.out_nf3 is not None
         out_nf3 = self._run_tier(
             x,
             weights,
@@ -2111,6 +2838,98 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             decode,
         )
         return out_kept + out_nf3
+
+    def apply(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the hybrid QSRT/X4T expert path.
+
+        The optional repeat check deliberately wraps the complete hybrid
+        dispatch rather than the ordinary modular-MoE adapter: QSRT invokes
+        the B12X prepared launches directly, so a check in ``B12xExperts``
+        cannot observe this path.  It is post-start and eager-only, and thus
+        has no serving cost unless explicitly enabled for a runtime audit.
+        """
+        global _qsrt_repeat_check_reports
+
+        output = self._apply_once(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
+            shared_experts_input,
+        )
+        repeat_enabled = (
+            os.getenv("B12X_MOE_REPEAT_CHECK", "0") == "1"
+            or os.getenv("VLLM_B12X_MOE_REPEAT_CHECK", "0") == "1"
+        )
+        after_start = (
+            os.getenv("B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START", "0") == "1"
+            or os.getenv("VLLM_B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START", "0") == "1"
+        )
+        engine_started = os.getenv("B12X_VLLM_ENGINE_STARTED", "0") == "1"
+        try:
+            max_reports = int(os.getenv("B12X_MOE_REPEAT_CHECK_MAX_REPORTS", "8"))
+        except ValueError:
+            max_reports = 8
+        is_capturing = bool(
+            torch.accelerator.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        )
+        if (
+            not repeat_enabled
+            or (after_start and not engine_started)
+            or is_capturing
+            or _qsrt_repeat_check_reports >= max_reports
+        ):
+            return output
+
+        # The hybrid implementation reuses shared output buffers.  Preserve
+        # the first result before the second launch overwrites those buffers.
+        original = output.clone()
+        repeated = self._apply_once(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
+            shared_experts_input,
+        )
+        original_f = original.float()
+        repeated_f = repeated.float()
+        diff = (original_f - repeated_f).abs()
+        finite = bool(
+            torch.isfinite(original_f).all().item()
+            and torch.isfinite(repeated_f).all().item()
+        )
+        max_abs = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+        denom = original_f.flatten().norm() * repeated_f.flatten().norm()
+        cosine = (
+            float((original_f.flatten().dot(repeated_f.flatten()) / denom).item())
+            if float(denom.item()) != 0.0
+            else 1.0
+        )
+        _qsrt_repeat_check_reports += 1
+        logger.warning(
+            "B12X MoE repeat check: finite=%s max_abs=%g mean_abs=%g "
+            "cosine=%g shape=%s dtype=%s quant_mode=w4a16 "
+            "implementation=w4a16",
+            finite,
+            max_abs,
+            mean_abs,
+            cosine,
+            tuple(original.shape),
+            original.dtype,
+        )
+        return repeated
 
 
 NvFp4Nf3HybridConfig.FusedMoEMethodCls = NvFp4Nf3HybridMoEMethod

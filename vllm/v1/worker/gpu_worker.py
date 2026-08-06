@@ -958,6 +958,21 @@ class Worker(WorkerBase):
         os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
         os.environ["SPARKINFER_ENGINE_STARTED"] = "1"
 
+        # A post-start B12X repeat check cannot be emitted from ordinary
+        # requests when their model work is served entirely by CUDA-graph
+        # replay: the Python MoE dispatch hook is not re-entered.  Keep this
+        # diagnostic opt-in and run one eager token after setting the engine
+        # marker so the repeat check exercises the actual prepared kernel.
+        if (
+            os.getenv("B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START", "0") == "1"
+            or os.getenv("VLLM_B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START", "0") == "1"
+        ):
+            self.model_runner._dummy_run(
+                num_tokens=1,
+                skip_eplb=True,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+
         activate_jit_monitor(
             mode=self.observability_config.jit_monitor_mode,
             verbose=self.observability_config.jit_monitor_verbose,
