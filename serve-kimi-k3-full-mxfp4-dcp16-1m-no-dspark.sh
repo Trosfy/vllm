@@ -115,6 +115,9 @@ export VLLM_USE_B12X_DCP_A2A=1
 export VLLM_DCP_A2A_MAX_TOKENS="${VLLM_DCP_A2A_MAX_TOKENS:-1}"
 export VLLM_DCP_A2A_LARGE_BACKEND="${VLLM_DCP_A2A_LARGE_BACKEND:-ag_rs}"
 export SPARKINFER_PCIE_DCP_THREADS="${SPARKINFER_PCIE_DCP_THREADS:-512}"
+# The same exact fused projection/router kernel serves M=1 and M=8; 384
+# threads is faster than its former 512-thread launch at both shapes.
+export SPARKINFER_PCIE_KIMI_TOPK_THREADS="${SPARKINFER_PCIE_KIMI_TOPK_THREADS:-384}"
 # Size-1 K3 DCP16 query gather measured best at four CTAs; LSE reduction and
 # projection gathers already select fewer CTAs from their row counts.
 export SPARKINFER_PCIE_DCP_BLOCK_LIMIT="${SPARKINFER_PCIE_DCP_BLOCK_LIMIT:-4}"

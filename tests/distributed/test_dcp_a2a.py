@@ -1074,8 +1074,15 @@ def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
     )
 
     assert warmed == 2
-    assert pair_calls == [(torch.Size([8, 224]), torch.Size([8, 56]), group, 8)]
+    assert pair_calls == []
     assert topk_calls == [
+        (
+            torch.Size([8, 224]),
+            torch.Size([8, 56]),
+            torch.Size([896]),
+            group,
+            8,
+        ),
         (
             torch.Size([1, 224]),
             torch.Size([1, 56]),

@@ -168,12 +168,13 @@ def try_gather_kimi_sharded_projection_pair_topk(
     ):
         return None
     projection_group = _get_kimi_projection_group()
+    batch = int(local_down.shape[0]) if local_down.ndim == 2 else 0
     return try_dcp_b12x_all_gather_pair_kimi_topk(
         local_down,
         local_router,
         correction_bias,
         projection_group,
-        max_batch_size=1,
+        max_batch_size=1 if batch == 1 else 8,
     )
 
 

@@ -517,17 +517,20 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return Kimi's gathered latent and compact routing payload on TP16.
 
-    The payload is FP32 ``[weights(16), int32 IDs viewed as FP32(16)]``. This
-    function deliberately has no semantic NCCL fallback; its caller retains
-    the ordinary paired gather plus router implementation when the exact K3
+    The payload is one FP32 tensor with contiguous ``[M, 16]`` weight and ID
+    planes; the ID plane is viewed as int32 by the K3 router. This function
+    deliberately has no semantic NCCL fallback; its caller retains the
+    ordinary paired gather plus router implementation when the exact K3
     contract is unavailable.
     """
+    batch = int(local_down.shape[0]) if local_down.ndim == 2 else 0
     if (
         not envs.VLLM_USE_B12X_DCP_A2A
         or cp_group.world_size != 16
-        or local_down.shape != (1, 224)
+        or not 1 <= batch <= 8
+        or local_down.shape != (batch, 224)
         or local_down.dtype != torch.bfloat16
-        or local_router.shape != (1, 56)
+        or local_router.shape != (batch, 56)
         or local_router.dtype != torch.float32
         or correction_bias.shape != (896,)
         or correction_bias.dtype != torch.float32
@@ -542,8 +545,8 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     ):
         return None
     if max_batch_size is None:
-        max_batch_size = 1
-    if int(max_batch_size) < 1:
+        max_batch_size = 1 if batch == 1 else 8
+    if int(max_batch_size) < batch:
         return None
 
     combined_row_bytes = 224 * 2 + 56 * 4
@@ -553,19 +556,19 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
         total_heads=16,
         head_dim=combined_row_bytes,
         query_head_dim=combined_row_bytes,
-        max_batch_size=1,
+        max_batch_size=int(max_batch_size),
     )
     if pool is None or not hasattr(pool, "all_gather_pair_kimi_topk"):
         return None
 
     routed_hidden_states = torch.empty(
-        (1, 3584), device=local_down.device, dtype=torch.bfloat16
+        (batch, 3584), device=local_down.device, dtype=torch.bfloat16
     )
     routing_payload = torch.empty(
-        (1, 32), device=local_down.device, dtype=torch.float32
+        (batch * 2, 16), device=local_down.device, dtype=torch.float32
     )
-    topk_weights = routing_payload[:, :16]
-    topk_ids = routing_payload[:, 16:].view(torch.int32)
+    topk_weights = routing_payload[:batch]
+    topk_ids = routing_payload[batch:].view(torch.int32)
     pool.all_gather_pair_kimi_topk(
         local_down,
         local_router,
@@ -610,15 +613,27 @@ def warmup_b12x_kimi_projection_gathers(
     if token_cap <= 0 or token_cap >= 8:
         local_down = torch.zeros((8, 224), device=device, dtype=torch.bfloat16)
         local_router = torch.zeros((8, 56), device=device, dtype=torch.float32)
-        paired = _try_b12x_dcp_all_gather_pair(
-            local_down,
-            local_router,
-            projection_group,
-            max_batch_size=8,
-        )
+        if envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK:
+            correction_bias = torch.zeros(
+                (896,), device=device, dtype=torch.float32
+            )
+            paired = try_dcp_b12x_all_gather_pair_kimi_topk(
+                local_down,
+                local_router,
+                correction_bias,
+                projection_group,
+                max_batch_size=8,
+            )
+        else:
+            paired = _try_b12x_dcp_all_gather_pair(
+                local_down,
+                local_router,
+                projection_group,
+                max_batch_size=8,
+            )
         if paired is None:
             raise RuntimeError(
-                "B12X Kimi M=8 paired projection gather is unavailable"
+                "B12X Kimi M=8 paired projection gather path is unavailable"
             )
         warmed += 1
 

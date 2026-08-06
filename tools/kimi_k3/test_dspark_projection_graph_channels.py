@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise Kimi-K3's repeated paired projection gather without weights.
+"""Exercise Kimi-K3's repeated fused paired gather+router without weights.
 
 Run one process per TP rank. The test pre-creates the M=8 and M=1 projection
-pools, captures a full target's 92 routed-MoE paired gathers, and asserts that
-capture did not lazily create another pool on the wrong semantic channel.
+pools, captures a full target's 92 routed-MoE gathers and exact sigmoid top-k
+operations, and asserts that capture did not lazily create another pool on the
+wrong semantic channel.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
+    import vllm._custom_ops as ops
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.config.parallel import ParallelConfig
     from vllm.distributed.parallel_state import (
@@ -79,9 +81,11 @@ def main() -> None:
     down_locals: list[torch.Tensor] = []
     router_locals: list[torch.Tensor] = []
     down_outputs: list[torch.Tensor] = []
-    router_outputs: list[torch.Tensor] = []
+    routing_payloads: list[torch.Tensor] = []
     down_expected: list[torch.Tensor] = []
-    router_expected: list[torch.Tensor] = []
+    weights_expected: list[torch.Tensor] = []
+    ids_expected: list[torch.Tensor] = []
+    correction_biases: list[torch.Tensor] = []
     down_base = torch.arange(args.batch * 224, dtype=torch.int32, device=device).view(
         args.batch, 224
     )
@@ -104,12 +108,8 @@ def main() -> None:
                 dtype=torch.bfloat16,
             )
         )
-        router_outputs.append(
-            torch.empty(
-                (args.batch, world_size * 56),
-                device=device,
-                dtype=torch.float32,
-            )
+        routing_payloads.append(
+            torch.empty((args.batch * 2, 16), device=device, dtype=torch.float32)
         )
         down_expected.append(
             torch.cat(
@@ -124,15 +124,31 @@ def main() -> None:
                 dim=1,
             )
         )
-        router_expected.append(
-            torch.cat(
-                [
-                    router_base + source_rank * 10_000 + layer * 100
-                    for source_rank in range(world_size)
-                ],
-                dim=1,
-            )
+        gathered_router = torch.cat(
+            [
+                router_base + source_rank * 10_000 + layer * 100
+                for source_rank in range(world_size)
+            ],
+            dim=1,
         )
+        correction_bias = (
+            torch.sin(torch.arange(896, device=device, dtype=torch.float32))
+            * (layer + 1)
+            * 1e-5
+        )
+        correction_biases.append(correction_bias)
+        weights, ids = ops.grouped_topk(
+            gathered_router,
+            1,
+            1,
+            16,
+            True,
+            1.0,
+            correction_bias,
+            1,
+        )
+        weights_expected.append(weights)
+        ids_expected.append(ids)
 
     graph: torch.cuda.CUDAGraph | None = None
     try:
@@ -148,14 +164,18 @@ def main() -> None:
 
         def run_sequence() -> None:
             for layer in range(args.layers):
-                down, router = dcp_alltoall.dcp_b12x_all_gather_pair(
+                fused = dcp_alltoall.try_dcp_b12x_all_gather_pair_kimi_topk(
                     down_locals[layer],
                     router_locals[layer],
+                    correction_biases[layer],
                     projection_group,
                     max_batch_size=args.batch,
                 )
+                if fused is None:
+                    raise AssertionError("fused Kimi projection router declined")
+                down, routing_payload = fused
                 down_outputs[layer].copy_(down)
-                router_outputs[layer].copy_(router)
+                routing_payloads[layer].copy_(routing_payload)
 
         with graph_capture(device) as context:
             run_sequence()
@@ -177,9 +197,12 @@ def main() -> None:
             torch.testing.assert_close(
                 down_outputs[layer], down_expected[layer], rtol=0, atol=0
             )
+            weights = routing_payloads[layer][: args.batch]
+            ids = routing_payloads[layer][args.batch :].view(torch.int32)
             torch.testing.assert_close(
-                router_outputs[layer], router_expected[layer], rtol=0, atol=0
+                weights, weights_expected[layer], rtol=0, atol=0
             )
+            torch.testing.assert_close(ids, ids_expected[layer], rtol=0, atol=0)
         dist.barrier()
         if dist.get_rank() == 0:
             print(

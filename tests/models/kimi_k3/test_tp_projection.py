@@ -161,14 +161,19 @@ def test_b12x_projection_pair_preserves_separate_rank_order(
     torch.testing.assert_close(actual_second, expected_second, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("batch", [1, 8])
 def test_b12x_projection_pair_topk_returns_explicit_compact_payload(
-    monkeypatch,
+    monkeypatch, batch: int
 ) -> None:
-    local_down = torch.arange(224, dtype=torch.bfloat16).view(1, 224)
-    local_router = torch.arange(56, dtype=torch.float32).view(1, 56)
+    local_down = torch.arange(batch * 224, dtype=torch.bfloat16).view(batch, 224)
+    local_router = torch.arange(batch * 56, dtype=torch.float32).view(batch, 56)
     correction_bias = torch.zeros(896, dtype=torch.float32)
-    expected_down = torch.arange(3584, dtype=torch.bfloat16).view(1, 3584)
-    expected_payload = torch.arange(32, dtype=torch.float32).view(1, 32)
+    expected_down = torch.arange(batch * 3584, dtype=torch.bfloat16).view(
+        batch, 3584
+    )
+    expected_payload = torch.arange(batch * 32, dtype=torch.float32).view(
+        batch * 2, 16
+    )
 
     for name in (
         "VLLM_KIMI_USE_B12X_PROJECTION_GATHER",
@@ -190,7 +195,7 @@ def test_b12x_projection_pair_topk_returns_explicit_compact_payload(
         assert down is local_down
         assert router is local_router
         assert bias is correction_bias
-        assert max_batch_size == 1
+        assert max_batch_size == (1 if batch == 1 else 8)
         return expected_down, expected_payload
 
     monkeypatch.setattr(
@@ -251,6 +256,31 @@ def test_kimi_precomputed_router_decodes_payload_without_reselection() -> None:
 
     assert weights.data_ptr() == payload.data_ptr()
     assert torch.equal(weights, payload[:, :16])
+    assert torch.equal(ids, expected_ids)
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+def test_kimi_precomputed_router_decodes_contiguous_planes(batch: int) -> None:
+    bias = torch.nn.Parameter(torch.zeros(896, dtype=torch.float32))
+    router = KimiK3PrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=bias,
+        scoring_func="sigmoid",
+    )
+    payload = torch.empty((batch * 2, 16), dtype=torch.float32)
+    expected_weights = torch.arange(batch * 16, dtype=torch.float32).view(batch, 16)
+    expected_weights.mul_(1e-3)
+    expected_ids = torch.arange(batch * 16, dtype=torch.int32).view(batch, 16)
+    payload[:batch].copy_(expected_weights)
+    payload[batch:].view(torch.int32).copy_(expected_ids)
+
+    weights, ids = router._compute_routing(
+        torch.empty(batch, 3584), payload, None
+    )
+
+    assert weights.data_ptr() == payload.data_ptr()
+    assert torch.equal(weights, expected_weights)
     assert torch.equal(ids, expected_ids)
 
 

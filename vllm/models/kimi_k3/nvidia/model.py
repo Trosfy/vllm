@@ -560,11 +560,23 @@ class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
         if (
             self.top_k == 16
             and self.global_num_experts == 896
             and router_logits.ndim == 2
-            and router_logits.shape == (hidden_states.shape[0], 32)
+            and router_logits.shape == (num_tokens * 2, 16)
+            and router_logits.dtype == torch.float32
+        ):
+            topk_weights = router_logits[:num_tokens]
+            topk_ids = router_logits[num_tokens:].view(torch.int32)
+            return topk_weights, topk_ids
+        # Retain compatibility with the original M=1 row-interleaved payload.
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens, 32)
             and router_logits.dtype == torch.float32
         ):
             topk_weights = router_logits[:, :16]
@@ -928,14 +940,10 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[1],
                 self._down_proj_stream,
             )
-            fused_pair_topk = (
-                try_gather_kimi_sharded_projection_pair_topk(
-                    down_local,
-                    router_local,
-                    self.gate.e_score_correction_bias.data,
-                )
-                if num_tokens == 1
-                else None
+            fused_pair_topk = try_gather_kimi_sharded_projection_pair_topk(
+                down_local,
+                router_local,
+                self.gate.e_score_correction_bias.data,
             )
             if fused_pair_topk is not None:
                 routed_hidden_states, routing_payload = fused_pair_topk
