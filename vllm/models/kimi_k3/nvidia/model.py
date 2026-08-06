@@ -946,8 +946,7 @@ class KimiMoE(nn.Module):
                     router_local,
                     self.gate.e_score_correction_bias.data,
                 )
-                if num_tokens == 1
-                or envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
+                if num_tokens == 1 or envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
                 else None
             )
             if fused_pair_topk is not None:
@@ -980,6 +979,8 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if not self.use_mega_moe and envs.VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS:
+            self.experts.prelaunch_shared_experts(hidden_states)
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.

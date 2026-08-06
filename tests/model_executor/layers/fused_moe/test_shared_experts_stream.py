@@ -50,3 +50,40 @@ def test_only_synchronous_shared_experts_can_donate_input() -> None:
         SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
     )
     assert not shared_experts.can_donate_input(shared_experts_input)
+
+
+def test_prelaunch_defers_consumer_wait_until_normal_join(monkeypatch) -> None:
+    shared_experts = object.__new__(SharedExperts)
+    aux_stream = Mock()
+    consumer_stream = Mock()
+    output = Mock()
+    shared_experts_input = Mock()
+    shared_experts._stream = aux_stream
+    shared_experts._layer = Mock(return_value=output)
+    shared_experts._output = [None, None]
+    shared_experts._prelaunched = [False, False]
+    shared_experts.enable_dbo = False
+    shared_experts._determine_shared_experts_order = Mock(  # type: ignore[method-assign]
+        return_value=SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+
+    @contextmanager
+    def use_stream(stream):
+        assert stream is aux_stream
+        yield
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(shared_module, "current_stream", lambda: consumer_stream)
+
+    assert shared_experts.prelaunch(shared_experts_input)
+    shared_experts_input.record_stream.assert_called_once_with(aux_stream)
+    aux_stream.wait_stream.assert_called_once_with(consumer_stream)
+    consumer_stream.wait_stream.assert_not_called()
+    assert shared_experts._output[0] is output
+
+    shared_experts.forward(
+        shared_experts_input, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+    )
+    consumer_stream.wait_stream.assert_called_once_with(aux_stream)
+    output.record_stream.assert_called_once_with(consumer_stream)
+    assert not shared_experts._prelaunched[0]

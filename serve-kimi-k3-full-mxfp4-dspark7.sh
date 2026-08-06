@@ -264,6 +264,10 @@ export VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS="${VLLM_DSPARK_PREFER_B12X_ALLREDUC
 # full-model A/B reduced verification overlap. Preserve it for profiling while
 # the production default keeps M=8 paired gather plus native routing.
 export VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK="${VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK:-0}"
+# Exact-math overlap experiment: begin the shared-expert branch before K3's
+# independent router and routed-down projection. Keep disabled until linked
+# and full-model E2E measurements both establish a win.
+export VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS="${VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS:-0}"
 # One 384-thread CTA per verification row is the measured TP16 optimum for
 # the exact fused paired projection gather plus K3 sigmoid top-k path.
 export SPARKINFER_PCIE_KIMI_TOPK_THREADS="${SPARKINFER_PCIE_KIMI_TOPK_THREADS:-384}"
