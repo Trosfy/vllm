@@ -795,6 +795,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             kv_scale=kv_scale,
             sm_scale=self.scale,
             active_splits=active_splits,
+            validate=False,
         )
 
     def forward_mqa(
