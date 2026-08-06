@@ -288,6 +288,26 @@ class CUDAGraphWrapper:
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
+                if self.runtime_mode == CUDAGraphMode.FULL:
+                    # Full-graph capture records the model's SparkInfer DCP
+                    # collectives inside the graph. Bind every registered DCP
+                    # pool to a per-graph channel first; otherwise captured
+                    # nodes would share the eager channel's staging slots with
+                    # eager execution and with other graphs.
+                    try:
+                        from vllm.distributed import get_dcp_group
+                        from vllm.v1.attention.ops.dcp_alltoall import (
+                            capture_b12x_dcp_a2a,
+                        )
+
+                        stack.enter_context(
+                            capture_b12x_dcp_a2a(
+                                get_dcp_group(), stream=current_stream()
+                            )
+                        )
+                    except AssertionError:
+                        # No DCP group in this configuration.
+                        pass
                 if self.cudagraph_options.gc_disable:
                     # during every model forward for piecewise cudagraph
                     # mode, we will capture many pieces of cudagraphs
