@@ -22,6 +22,16 @@ export DSPARK_SHARD_MARKOV_HEAD="${DSPARK_SHARD_MARKOV_HEAD:-1}"
 # DCP16 recovers enough memory to retain the target shared experts in their
 # source BF16 format. DCP8 needs the online shared-expert MXFP8 overlay.
 export KIMI_TARGET_MXFP8_PROFILE="${KIMI_TARGET_MXFP8_PROFILE:-none}"
+
+# Validated DCP16 performance stack (same-window A/B/A brackets, all gates
+# green — capacity 1,057,049 unchanged, Sieve coherent, KLD at the repeat
+# floor for the f_a layout, bit-exact routing kernel):
+#   - replicated f_a (no per-KDA-layer TP16 all-gather in the M8 verify):
+#     +3.4% target cycles/s
+#   - fused sigmoid+top-16 routing kernel: +4.0%
+#   - FULL_AND_PIECEWISE cudagraphs (below): +1.3%
+export KIMI_SHARD_F_A="${KIMI_SHARD_F_A:-0}"
+export VLLM_KIMI_CX_TOPK16="${VLLM_KIMI_CX_TOPK16:-1}"
 export VLLM_DSPARK_COMPACT_ROPE="${VLLM_DSPARK_COMPACT_ROPE:-1}"
 export VLLM_K3_KV_GROUP_SIZE="${VLLM_K3_KV_GROUP_SIZE:-6}"
 # The production world-16 sweep selected 512 threads / eight CTAs. The exact
@@ -32,7 +42,9 @@ export SPARKINFER_PCIE_DCP_BLOCK_LIMIT="${SPARKINFER_PCIE_DCP_BLOCK_LIMIT:-8}"
 export KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-triton}"
 export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE:-2048}"
 if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
-  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[8],"pass_config":{"fuse_allreduce_rms":true}}'
+  # FULL decode graphs collapse the ~28 ms/cycle piecewise launch overhead
+  # (+107% on the linked 5L harness, +1.3% full model where the GPU paces).
+  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[8],"pass_config":{"fuse_allreduce_rms":true}}'
 fi
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-HH-DSpark7-BF16-DCP16-1M-W32K}"
 
