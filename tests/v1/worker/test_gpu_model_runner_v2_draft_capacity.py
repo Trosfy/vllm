@@ -593,10 +593,12 @@ def test_capacity_manager_bypasses_readback_below_profiled_knee():
         device=device,
     )
     handler.capacity_activation_batch_size = 2
+    handler.dynamic_draft_depth_controller = SimpleNamespace(depth=1)
     handler.draft_token_capacity_np.fill(0)
 
     assert not handler.should_apply_capacity(1)
     assert handler.capacity_bypassed
+    assert handler.recommended_draft_depth(3) == 3
     assert handler.draft_token_capacity_np.tolist() == [3, 3, 3, 3]
 
     handler.idx_mapping_np = np.array([0], dtype=np.int32)
@@ -605,6 +607,7 @@ def test_capacity_manager_bypasses_readback_below_profiled_knee():
 
     assert handler.should_apply_capacity(2)
     assert not handler.capacity_bypassed
+    assert handler.recommended_draft_depth(3) == 1
 
 
 def test_varlen_capacity_manager_warmup_compacts_inputs_in_place():
@@ -821,6 +824,69 @@ def test_masked_capacity_manager_marks_pruned_tokens_for_forward_and_sampler():
         [10, 11, -1, -1, 14, 15, 16, -1, 18, 19],
     ]
     assert draft_sampled.cpu().tolist() == [0, 1, -1, -1, 4, 5, 6, -1]
+
+
+def test_masked_capacity_manager_bypass_keeps_full_verifier_batch():
+    device = torch.device("cuda")
+    req_states = RequestState(
+        max_num_reqs=2,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        num_speculative_steps=3,
+        vocab_size=32,
+        device=device,
+    )
+    handler = MaskedCapacityBasedVerificationManager(
+        max_num_tokens=8,
+        req_states=req_states,
+        device=device,
+    )
+    handler.capacity_activation_batch_size = 2
+    handler.draft_token_capacity_np[0] = 1
+    assert not handler.should_apply_capacity(1)
+
+    input_ids = torch.arange(8, dtype=torch.int32, device=device)
+    input_batch = InputBatch(
+        req_ids=["req0"],
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        expanded_idx_mapping=torch.zeros(4, dtype=torch.int32, device=device),
+        expanded_local_pos=torch.arange(4, dtype=torch.int32, device=device),
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        max_query_len=4,
+        num_tokens=4,
+        num_tokens_after_padding=8,
+        num_draft_tokens=3,
+        num_draft_tokens_per_req=np.array([3], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 4], dtype=np.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor([4], dtype=torch.int32),
+        max_seq_len_upper_bound=4,
+        dcp_local_seq_lens=None,
+        num_computed_tokens_np=np.array([0], dtype=np.int32),
+        prefill_len_np=np.array([0], dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array([0], dtype=np.int32),
+        is_prefilling_np=np.array([False], dtype=np.bool_),
+        max_seq_len_np=None,
+        input_ids=input_ids,
+        positions=torch.arange(8, dtype=torch.int64, device=device),
+        is_padding=torch.zeros(8, dtype=torch.bool, device=device),
+        logits_indices=torch.arange(4, dtype=torch.int64, device=device),
+        cu_num_logits=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        cu_num_logits_np=np.array([0, 4], dtype=np.int32),
+        has_structured_output_reqs=False,
+        prompt_lens=None,
+    )
+
+    handler.trim_batch(input_batch)
+
+    torch.accelerator.synchronize()
+    assert not handler.has_forward_skip_mask
+    assert not input_batch.is_padding.any()
+    assert input_batch.input_ids.cpu().tolist() == list(range(8))
 
 
 def test_capacity_cudagraph_dispatch_filters_by_max_query_len():

@@ -396,7 +396,9 @@ class CapacityBasedVerificationManager:
 
     def recommended_draft_depth(self, default: int) -> int:
         controller = self.dynamic_draft_depth_controller
-        return default if controller is None else min(default, controller.depth)
+        if controller is None or self.capacity_bypassed:
+            return default
+        return min(default, controller.depth)
 
     def set_dynamic_draft_token_budget(self, draft_token_budget: int) -> None:
         controller = self.dynamic_draft_depth_controller
@@ -860,11 +862,20 @@ class MaskedCapacityBasedVerificationManager(CapacityBasedVerificationManager):
         self,
         input_batch: "InputBatch",
     ) -> "InputBatch":
-        self._flush_draft_token_capacity_copy()
         self._remember_batch(input_batch)
         input_batch.is_padding[: input_batch.num_tokens].fill_(False)
         self.forward_skip_mask_len = 0
         self.has_forward_skip_mask = False
+        if self.capacity_bypassed:
+            attempted = input_batch.valid_num_draft_tokens_per_req
+            if attempted is None:
+                attempted = input_batch.num_draft_tokens_per_req
+            if attempted is not None:
+                self._remember_capacity_log_snapshot(attempted)
+                self._observe_dynamic_draft_depth(input_batch, attempted)
+            return self._set_token_views(input_batch)
+
+        self._flush_draft_token_capacity_copy()
         if (
             input_batch.num_draft_tokens == 0
             or input_batch.num_draft_tokens_per_req is None

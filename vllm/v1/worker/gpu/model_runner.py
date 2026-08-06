@@ -1700,11 +1700,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             skip_compiled = True
 
         apply_verification_capacity = True
-        if (
-            verification_capacity_manager is not None
-            and verification_capacity_manager.varlen_spec_decode
-            and not dummy_run
-        ):
+        if verification_capacity_manager is not None and not dummy_run:
             capacity_was_bypassed = verification_capacity_manager.capacity_bypassed
             apply_verification_capacity = (
                 verification_capacity_manager.should_apply_capacity(

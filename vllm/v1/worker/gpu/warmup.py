@@ -518,9 +518,7 @@ def _profile_sps_curve(
         if sps_debug:
             model_runner._sps_debug_events = []
         uniform_query_len = query_len if query_len != decode_query_len else None
-        uniform_num_speculative_tokens = (
-            query_len - 1 if not apply_curve else None
-        )
+        uniform_num_speculative_tokens = query_len - 1 if not apply_curve else None
         for _ in range(warmup_iters):
             model_runner._dummy_run(
                 num_tokens,
@@ -613,6 +611,13 @@ def _profile_sps_curve(
                 model_runner.num_speculative_steps,
             )
             capacity_manager.set_dynamic_draft_token_budget(draft_token_budget)
+            # Keep proposal-side confidence work aligned with verifier-side
+            # capacity readback.  With an auto-derived activation threshold,
+            # the manager used to bypass low-load readback while the DSpark
+            # graph still computed confidence logits on every proposal.
+            model_runner.speculator.capacity_activation_batch_size = (
+                capacity_manager.capacity_activation_batch_size
+            )
             logger.info(
                 "DSpark auto-profiled dynamic draft-token budget: %d",
                 draft_token_budget,
