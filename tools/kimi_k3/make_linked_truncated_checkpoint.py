@@ -99,15 +99,104 @@ def build(source: Path, destination: Path, layers: int) -> dict:
     }
 
 
+def build_dspark_overlay(
+    source: Path,
+    destination: Path,
+    target_layer_ids: tuple[int, ...],
+    target_num_hidden_layers: int,
+) -> dict:
+    """Create a linked DSpark checkpoint with remapped target taps."""
+    source = source.resolve()
+    if destination.exists():
+        raise FileExistsError(f"destination already exists: {destination}")
+    config_path = source / "config.json"
+    config = json.loads(config_path.read_text())
+    num_target_layers = int(config["num_target_layers"])
+    if len(target_layer_ids) != num_target_layers:
+        raise ValueError(
+            "--draft-target-layer-ids must contain "
+            f"{num_target_layers} entries"
+        )
+    if any(
+        layer_id < 0 or layer_id >= target_num_hidden_layers
+        for layer_id in target_layer_ids
+    ):
+        raise ValueError(
+            "draft target layer ids must address the truncated target"
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.tmp-{os.getpid()}-",
+            dir=destination.parent,
+        )
+    )
+    try:
+        for item in source.iterdir():
+            if item.name == "config.json":
+                continue
+            (staging / item.name).symlink_to(item.resolve())
+        config["target_layer_ids"] = list(target_layer_ids)
+        config["target_num_hidden_layers"] = target_num_hidden_layers
+        (staging / "config.json").write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n"
+        )
+        staging.rename(destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return {
+        "destination": str(destination),
+        "target_layer_ids": list(target_layer_ids),
+        "target_num_hidden_layers": target_num_hidden_layers,
+    }
+
+
+def _parse_layer_ids(value: str) -> tuple[int, ...]:
+    try:
+        result = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from error
+    if not result:
+        raise argparse.ArgumentTypeError("at least one layer id is required")
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--draft-source", type=Path)
+    parser.add_argument("--draft-destination", type=Path)
+    parser.add_argument("--draft-target-layer-ids", type=_parse_layer_ids)
     args = parser.parse_args()
+    draft_options = (
+        args.draft_source,
+        args.draft_destination,
+        args.draft_target_layer_ids,
+    )
+    if any(option is not None for option in draft_options) and not all(
+        option is not None for option in draft_options
+    ):
+        parser.error(
+            "--draft-source, --draft-destination, and "
+            "--draft-target-layer-ids must be used together"
+        )
+    result = build(args.source, args.destination, args.layers)
+    if args.draft_source is not None:
+        assert args.draft_destination is not None
+        assert args.draft_target_layer_ids is not None
+        result["draft"] = build_dspark_overlay(
+            args.draft_source,
+            args.draft_destination,
+            args.draft_target_layer_ids,
+            args.layers,
+        )
     print(
         json.dumps(
-            build(args.source, args.destination, args.layers),
+            result,
             indent=2,
             sort_keys=True,
         )

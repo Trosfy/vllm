@@ -61,6 +61,7 @@ DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW="${DSPARK_ADAPTIVE_SPECULATIVE_TOKENS_
 DSPARK_BATCH_SIZE_SPECULATIVE_SCHEDULE="${DSPARK_BATCH_SIZE_SPECULATIVE_SCHEDULE:-}"
 DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE="${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-0}"
 DSPARK_PROFILE_SPS_ONLY="${DSPARK_PROFILE_SPS_ONLY:-0}"
+DSPARK_EXPECTED_TARGET_LAYER_IDS="${DSPARK_EXPECTED_TARGET_LAYER_IDS:-2,23,47,71,89}"
 if (( DCP_SIZE > 1 )); then
   DCP_COMM_BACKEND="${DCP_COMM_BACKEND:-a2a}"
 else
@@ -320,6 +321,7 @@ fi
 # Fail before loading 1.4 TiB of target weights if either the draft contract or
 # the native K3 runtime is missing.
 export KDA_PREFILL_BACKEND DSPARK_DRAFT_WEIGHT_FORMAT DSPARK_DRAFT_MXFP8_BACKEND
+export DSPARK_EXPECTED_TARGET_LAYER_IDS
 export KIMI_TARGET_MXFP8_PROFILE VLLM_DSPARK_SHARD_MARKOV_HEAD
 export VLLM_DSPARK_REPLICATE_MARKOV_W1
 export VLLM_KIMI_K3_B12X_DSPARK_ARGMAX
@@ -352,10 +354,14 @@ from vllm.platforms.interface import DeviceCapability
 
 draft = Path(os.environ["DRAFT_MODEL"])
 raw = json.loads((draft / "config.json").read_text())
+expected_target_layer_ids = [
+    int(value)
+    for value in os.environ["DSPARK_EXPECTED_TARGET_LAYER_IDS"].split(",")
+]
 assert raw["architectures"] == ["K3DSparkModel"]
 assert raw["model_type"] == "k3_dspark"
 assert raw["num_hidden_layers"] == 5
-assert raw["target_layer_ids"] == [2, 23, 47, 71, 89]
+assert raw["target_layer_ids"] == expected_target_layer_ids
 assert raw["max_position_embeddings"] >= int(os.environ["MAX_MODEL_LEN"])
 config = get_config(str(draft), trust_remote_code=False)
 assert type(config).__name__ == "K3DSparkConfig"
