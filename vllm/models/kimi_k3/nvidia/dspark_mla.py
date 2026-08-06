@@ -96,7 +96,10 @@ class K3DSparkDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = fused_allreduce_rms_norm(
-                hidden_states, residual, self.input_layernorm
+                hidden_states,
+                residual,
+                self.input_layernorm,
+                prefer_b12x=envs.VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS,
             )
 
         hidden_states = self.self_attn(
@@ -105,7 +108,10 @@ class K3DSparkDecoderLayer(nn.Module):
             rope_cos_sin_cache=rope_cos_sin_cache,
         )
         hidden_states, residual = fused_allreduce_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            prefer_b12x=envs.VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS,
         )
         # The MLP output is reduced by the next layer's input_layernorm (or by
         # the model's final_norm).
@@ -640,7 +646,10 @@ class K3DSparkModel(nn.Module):
                 rope_cos_sin_cache=rope_cos_sin_cache,
             )
         hidden_states, _ = fused_allreduce_rms_norm(
-            hidden_states, residual, self.final_norm
+            hidden_states,
+            residual,
+            self.final_norm,
+            prefer_b12x=envs.VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS,
         )
         return hidden_states
 

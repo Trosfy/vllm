@@ -293,6 +293,7 @@ class CustomAllreduce:
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_allreduce_max_size: int | None = None
         self._pcie_fused_add_rms_norm_max_size: int | None = None
+        self._pcie_composed_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._pcie_cpp_backend = False
@@ -502,6 +503,9 @@ class CustomAllreduce:
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
             ) = _b12x_pcie_oneshot_limits()
+            self._pcie_composed_add_rms_norm_max_size = (
+                self._pcie_fused_add_rms_norm_max_size
+            )
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because b12x PCIe oneshot "
@@ -1001,6 +1005,33 @@ class CustomAllreduce:
             )
         )
 
+    def try_all_reduce_for_composed_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Run B12X AR for a caller-provided fused add + RMSNorm.
+
+        This has an independent cutoff from generic all-reduce dispatch. It
+        lets an eager model path select the measured B12X collective without
+        changing the target model's all-reduce crossover.
+        """
+        inp_size = inp.numel() * inp.element_size()
+        runtime = self._pcie_runtime
+        max_size = self._pcie_composed_add_rms_norm_max_size
+        if (
+            self.disabled
+            or runtime is None
+            or max_size is None
+            or max_size <= 0
+            or inp_size > max_size
+        ):
+            return None
+        stream = self._pcie_runtime_stream()
+        channel = runtime.for_stream(stream)
+        if not channel.should_allreduce(inp):
+            return None
+        return runtime.all_reduce(inp, stream=stream)
+
     def try_fused_add_rms_norm(
         self,
         inp: torch.Tensor,
@@ -1244,6 +1275,26 @@ def get_b12x_pcie_allreduce() -> CustomAllreduce | None:
     if (
         isinstance(custom_allreduce, CustomAllreduce)
         and custom_allreduce.supports_fused_add_rms_norm()
+    ):
+        return custom_allreduce
+    return None
+
+
+def get_active_b12x_pcie_allreduce() -> CustomAllreduce | None:
+    """Return the active TP B12X runtime, including hierarchical mode."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        device_communicator = get_tp_group().device_communicator
+    except (AssertionError, RuntimeError):
+        return None
+    if device_communicator is None:
+        return None
+    custom_allreduce = getattr(device_communicator, "ca_comm", None)
+    if (
+        isinstance(custom_allreduce, CustomAllreduce)
+        and not custom_allreduce.disabled
+        and custom_allreduce._pcie_runtime is not None
     ):
         return custom_allreduce
     return None
