@@ -544,6 +544,20 @@ if [[ -n "${TARGET_QUANT_JSON:-}" ]]; then
   TARGET_QUANT_ARGS+=(--quantization-config "${TARGET_QUANT_JSON}")
 fi
 
+# The no-DSpark profile replicates f_a (KIMI_SHARD_F_A=0) and thereby avoids
+# one TP16 all-gather per KDA layer; the DSpark profile historically pinned
+# the sharded layout. Keep 1 as the validated default but allow the
+# replicated-f_a experiment through the same knob the no-DSpark launcher uses.
+KIMI_SHARD_F_A="${KIMI_SHARD_F_A:-1}"
+case "${KIMI_SHARD_F_A}" in
+  0) KIMI_KDA_ADDITIONAL_CONFIG='{"kda_shard_f_a":false}' ;;
+  1) KIMI_KDA_ADDITIONAL_CONFIG='{"kda_shard_f_a":true}' ;;
+  *)
+    echo "KIMI_SHARD_F_A must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
 exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --language-model-only \
   --attention-backend B12X_MLA \
@@ -554,7 +568,7 @@ exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --kv-cache-dtype fp8 \
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" \
   --no-enable-prefix-caching \
-  --additional-config '{"kda_shard_f_a":true}' \
+  --additional-config "${KIMI_KDA_ADDITIONAL_CONFIG}" \
   --speculative-config "${SPECULATIVE_CONFIG}" \
   "${TARGET_QUANT_ARGS[@]}" \
   "$@"
