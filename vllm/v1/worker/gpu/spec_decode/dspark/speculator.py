@@ -70,13 +70,20 @@ class DSparkSpeculator(DFlashSpeculator):
             self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
         )
 
-        # NCCL collectives from a TP-sharded Markov head must not be captured
-        # in the draft's full CUDA graph. Replaying that graph immediately
-        # before target DCP collectives can poison the next communicator with
-        # ``NCCL Error 1: unhandled cuda error``. Keep the five-layer draft
-        # backbone captured, copy its tiny query output to a stable buffer in
-        # the graph, and run only the sequential Markov head eagerly.
-        self._markov_outside_cudagraph = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+        # Historical TP-sharded Markov sampling used NCCL and had to stay out
+        # of the draft graph: replaying it before target DCP collectives could
+        # poison that communicator. Kimi-K3 can opt back into capture after
+        # both sharded collectives have been replaced with graph-safe B12X
+        # operations. The conservative eager tail remains the default.
+        self._capture_sharded_markov = envs.VLLM_DSPARK_CAPTURE_SHARDED_MARKOV
+        if self._capture_sharded_markov and not envs.VLLM_DSPARK_SHARD_MARKOV_HEAD:
+            raise ValueError(
+                "VLLM_DSPARK_CAPTURE_SHARDED_MARKOV requires "
+                "VLLM_DSPARK_SHARD_MARKOV_HEAD=1."
+            )
+        self._markov_outside_cudagraph = (
+            envs.VLLM_DSPARK_SHARD_MARKOV_HEAD and not self._capture_sharded_markov
+        )
         self._use_local_draft_argmax = False
         self._captured_markov_hidden: torch.Tensor | None = None
         self._captured_base_logits: torch.Tensor | None = None
@@ -230,7 +237,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
-        if self._markov_outside_cudagraph:
+        if envs.VLLM_DSPARK_SHARD_MARKOV_HEAD:
             supports_local_argmax = getattr(model, "supports_local_draft_argmax", None)
             if supports_local_argmax is None or not supports_local_argmax():
                 raise RuntimeError(
@@ -243,6 +250,42 @@ class DSparkSpeculator(DFlashSpeculator):
                     "deterministic draft sampling only."
                 )
             self._use_local_draft_argmax = True
+        if self._capture_sharded_markov:
+            if not getattr(model, "_b12x_dspark_argmax_enabled", False):
+                raise RuntimeError(
+                    "Captured TP-sharded Markov sampling requires the B12X "
+                    "vocabulary argmax."
+                )
+            markov_head = model.model.markov_head
+            if not markov_head.replicate_w1:
+                from vllm.distributed.device_communicators.custom_all_reduce import (
+                    get_active_b12x_pcie_allreduce,
+                )
+
+                custom_allreduce = get_active_b12x_pcie_allreduce()
+                if custom_allreduce is None:
+                    raise RuntimeError(
+                        "Captured TP-sharded Markov sampling requires an active "
+                        "B12X TP all-reduce runtime."
+                    )
+                max_rows = self.max_num_reqs
+                markov_rank = self.draft_model_config.hf_config.markov_rank
+                probe = torch.empty(
+                    max_rows,
+                    markov_rank,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                if not custom_allreduce.should_custom_ar(probe):
+                    raise RuntimeError(
+                        "The active B12X TP all-reduce cannot capture the "
+                        f"Markov W1 output shape {tuple(probe.shape)}."
+                    )
+            logger.info_once(
+                "DSpark captures its TP-sharded Markov tail with B12X W1 "
+                "all-reduce and B12X vocabulary argmax."
+            )
+        elif self._markov_outside_cudagraph:
             max_markov_rows = self.max_num_reqs * self.num_speculative_steps
             local_vocab_size = model.lm_head.num_embeddings_per_partition
             logits_dtype = model.logits_processor.head_dtype or self.dtype

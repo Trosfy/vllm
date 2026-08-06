@@ -45,6 +45,7 @@ DSPARK_DRAFT_MXFP8_BACKEND="${DSPARK_DRAFT_MXFP8_BACKEND:-marlin}"
 DSPARK_SHARD_MARKOV_HEAD="${DSPARK_SHARD_MARKOV_HEAD:-0}"
 DSPARK_REPLICATE_MARKOV_W1="${DSPARK_REPLICATE_MARKOV_W1:-0}"
 DSPARK_B12X_ARGMAX="${DSPARK_B12X_ARGMAX:-1}"
+DSPARK_CAPTURE_SHARDED_MARKOV="${DSPARK_CAPTURE_SHARDED_MARKOV:-0}"
 # Model-free TP16 measurements show a small launch-level win for the composed
 # B12X AR + vLLM RMSNorm path.  Keep it opt-in: the full v74 model run lost
 # 0.59% target cycles/s because it removed useful NCCL/FlashInfer overlap.
@@ -162,6 +163,13 @@ case "${DSPARK_B12X_ARGMAX}" in
     exit 2
     ;;
 esac
+case "${DSPARK_CAPTURE_SHARDED_MARKOV}" in
+  0 | 1) ;;
+  *)
+    echo "DSPARK_CAPTURE_SHARDED_MARKOV must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 case "${DSPARK_PREFER_B12X_ALLREDUCE_RMS}" in
   0 | 1) ;;
   *)
@@ -172,6 +180,20 @@ esac
 if [[ "${DSPARK_REPLICATE_MARKOV_W1}" == 1 && "${DSPARK_SHARD_MARKOV_HEAD}" != 1 ]]; then
   echo "DSPARK_REPLICATE_MARKOV_W1=1 requires DSPARK_SHARD_MARKOV_HEAD=1" >&2
   exit 2
+fi
+if [[ "${DSPARK_CAPTURE_SHARDED_MARKOV}" == 1 ]]; then
+  if [[ "${DSPARK_SHARD_MARKOV_HEAD}" != 1 ]]; then
+    echo "DSPARK_CAPTURE_SHARDED_MARKOV=1 requires DSPARK_SHARD_MARKOV_HEAD=1" >&2
+    exit 2
+  fi
+  if [[ "${DSPARK_B12X_ARGMAX}" != 1 ]]; then
+    echo "DSPARK_CAPTURE_SHARDED_MARKOV=1 requires DSPARK_B12X_ARGMAX=1" >&2
+    exit 2
+  fi
+  if [[ "${KIMI_DSPARK_PCIE_ALLREDUCE_BACKEND:-b12x}" != b12x ]]; then
+    echo "Captured sharded Markov W1 requires the b12x all-reduce backend" >&2
+    exit 2
+  fi
 fi
 case "${KIMI_TARGET_MXFP8_PROFILE}" in
   none | shared_experts | kda_in_proj | attention_o_proj | kda_in_and_o_proj) ;;
@@ -235,6 +257,7 @@ export VLLM_DSPARK_DRAFT_KV_WINDOW="${VLLM_DSPARK_DRAFT_KV_WINDOW:-${DSPARK_DRAF
 export VLLM_DSPARK_SHARD_MARKOV_HEAD="${VLLM_DSPARK_SHARD_MARKOV_HEAD:-${DSPARK_SHARD_MARKOV_HEAD}}"
 export VLLM_DSPARK_REPLICATE_MARKOV_W1="${VLLM_DSPARK_REPLICATE_MARKOV_W1:-${DSPARK_REPLICATE_MARKOV_W1}}"
 export VLLM_KIMI_K3_B12X_DSPARK_ARGMAX="${VLLM_KIMI_K3_B12X_DSPARK_ARGMAX:-${DSPARK_B12X_ARGMAX}}"
+export VLLM_DSPARK_CAPTURE_SHARDED_MARKOV="${VLLM_DSPARK_CAPTURE_SHARDED_MARKOV:-${DSPARK_CAPTURE_SHARDED_MARKOV}}"
 export VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS="${VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS:-${DSPARK_PREFER_B12X_ALLREDUCE_RMS}}"
 if [[ "${VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS}" == 1 ]]; then
   # The fixed DSpark verification batch is [8, 7168] BF16 = 112 KiB. Reserve

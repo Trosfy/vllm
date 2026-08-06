@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
+    VLLM_DSPARK_CAPTURE_SHARDED_MARKOV: bool = False
     VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS: bool = False
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
@@ -1160,6 +1161,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # greedy global argmax operations without gathering the full vocabulary.
     "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
+    ),
+    # Capture a TP-sharded deterministic Markov tail only after replacing its
+    # historical NCCL collectives with graph-safe B12X operations.
+    "VLLM_DSPARK_CAPTURE_SHARDED_MARKOV": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CAPTURE_SHARDED_MARKOV", "0"))
     ),
     # Prefer the bounded-peer B12X reduction followed by vLLM's fused
     # residual-add RMSNorm for the external Kimi-K3 DSpark draft. The target

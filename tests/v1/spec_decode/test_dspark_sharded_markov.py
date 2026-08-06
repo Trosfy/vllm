@@ -105,6 +105,31 @@ def test_sharded_markov_eager_path_still_samples(monkeypatch):
     )
 
 
+def test_sharded_markov_graph_path_samples_inside_capture(monkeypatch):
+    speculator = _make_speculator()
+    speculator._markov_outside_cudagraph = False
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    DSparkSpeculator._generate_draft(
+        speculator,
+        num_reqs=1,
+        num_tokens_padded=8,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+    )
+
+    speculator._sample_sequential.assert_called_once_with(
+        1,
+        speculator._run_model.return_value,
+        7,
+        7,
+        is_profile=False,
+        use_capacity=True,
+    )
+
+
 def test_sharded_markov_finishes_after_backbone_graph_replay():
     speculator = _make_speculator()
 
