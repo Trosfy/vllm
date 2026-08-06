@@ -52,6 +52,11 @@ export MAX_MODEL_LEN MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
 export PYTHONPATH="${VLLM_SOURCE_DIR}:${SPARKINFER_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.985}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Decode uses many small TP16 NCCL reductions. Override the image's generic
+# host-staging fallback for the validated Kimi-K3 topology while retaining an
+# explicit operator escape hatch.
+export NCCL_P2P_DISABLE="${KIMI_NCCL_P2P_DISABLE:-0}"
+unset NCCL_GRAPH_FILE
 export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
 export CUDA_MODULE_DATA_LOADING="${CUDA_MODULE_DATA_LOADING:-LAZY}"
 

@@ -69,8 +69,6 @@ def _fake_impl(monkeypatch) -> tuple[B12xMLAImpl, _FakeDenseMLA]:
     impl._dcp_comm_backend = "a2a"
     impl._dcp_max_batch_size = 64
     impl._compiled_bindings = set()
-    impl._last_binding_key = None
-    impl._last_binding = None
     impl._scratch_by_plan = {}
     impl._padded_io_by_plan = {}
     dense_mla = _FakeDenseMLA()
@@ -202,7 +200,7 @@ def test_b12x_mla_adapter_passes_fp8_scales(monkeypatch) -> None:
     assert binding.kv_scale is layer._k_scale
 
 
-def test_b12x_mla_adapter_reuses_capture_static_binding(monkeypatch) -> None:
+def test_b12x_mla_adapter_builds_fresh_capture_static_binding(monkeypatch) -> None:
     impl, dense_mla = _fake_impl(monkeypatch)
     q = torch.randn(1, 8, 576, dtype=torch.bfloat16)
     cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
@@ -227,7 +225,9 @@ def test_b12x_mla_adapter_reuses_capture_static_binding(monkeypatch) -> None:
 
     assert first.data_ptr() == output.data_ptr()
     assert second.data_ptr() == output.data_ptr()
-    assert len(dense_mla.bindings) == 1
+    assert len(dense_mla.bindings) == 2
+    assert dense_mla.bindings[0] is not dense_mla.bindings[1]
+    assert all(binding.validate is False for binding in dense_mla.bindings)
     assert dense_mla.compile_count == 1
     assert dense_mla.run_count == 2
 

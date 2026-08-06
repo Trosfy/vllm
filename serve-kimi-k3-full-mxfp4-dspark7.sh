@@ -4,6 +4,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Multiprocessing workers inherit sys.path from the launcher's working
+# directory.  Always launch from this checkout so an image-baked vLLM tree
+# cannot precede the selected source tree in forkserver children.
+cd -- "${SCRIPT_DIR}"
 DEFAULT_PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
 if [[ ! -x "${DEFAULT_PYTHON_BIN}" && -x /opt/venv/bin/python ]]; then
   DEFAULT_PYTHON_BIN=/opt/venv/bin/python
@@ -20,6 +24,14 @@ if [[ ! -f "${SPARKINFER_DIR}/sparkinfer/attention/dense_mla/__init__.py" ]]; th
   exit 1
 fi
 export PYTHONPATH="${SCRIPT_DIR}:${SPARKINFER_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# The runtime image carries a conservative host-staging fallback. Kimi-K3
+# M=8 verification executes roughly two NCCL reductions per target layer;
+# forcing host staging makes that exact sequence about 2.4x slower on this
+# validated TP16 topology. Keep a profile-specific escape hatch, and never
+# pass an empty graph-file path to NCCL.
+export NCCL_P2P_DISABLE="${KIMI_NCCL_P2P_DISABLE:-0}"
+unset NCCL_GRAPH_FILE
 
 TP_SIZE="${TP_SIZE:-16}"
 DCP_SIZE="${DCP_SIZE:-1}"

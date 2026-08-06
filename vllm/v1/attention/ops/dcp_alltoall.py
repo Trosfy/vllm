@@ -600,23 +600,35 @@ def warmup_b12x_kimi_projection_gathers(
     ):
         return 0
 
-    local_down = torch.zeros((8, 224), device=device, dtype=torch.bfloat16)
-    local_router = torch.zeros((8, 56), device=device, dtype=torch.float32)
-    paired = _try_b12x_dcp_all_gather_pair(
-        local_down,
-        local_router,
-        projection_group,
-        max_batch_size=8,
-    )
-    if paired is None:
-        raise RuntimeError("B12X Kimi M=8 paired projection gather is unavailable")
-    warmed = 1
+    # A target-only max-num-seqs=1 profile deliberately caps the B12X DCP
+    # path at one token and routes larger batches through its exact NCCL
+    # fallback.  Do not make that profile initialize an M=8 channel it can
+    # never dispatch; DSpark profiles set the cap to at least eight and still
+    # precreate this graph channel before verification capture.
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    warmed = 0
+    if token_cap <= 0 or token_cap >= 8:
+        local_down = torch.zeros((8, 224), device=device, dtype=torch.bfloat16)
+        local_router = torch.zeros((8, 56), device=device, dtype=torch.float32)
+        paired = _try_b12x_dcp_all_gather_pair(
+            local_down,
+            local_router,
+            projection_group,
+            max_batch_size=8,
+        )
+        if paired is None:
+            raise RuntimeError(
+                "B12X Kimi M=8 paired projection gather is unavailable"
+            )
+        warmed += 1
 
     if envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK:
+        local_down = torch.zeros((1, 224), device=device, dtype=torch.bfloat16)
+        local_router = torch.zeros((1, 56), device=device, dtype=torch.float32)
         correction_bias = torch.zeros((896,), device=device, dtype=torch.float32)
         fused = try_dcp_b12x_all_gather_pair_kimi_topk(
-            local_down[:1],
-            local_router[:1],
+            local_down,
+            local_router,
             correction_bias,
             projection_group,
             max_batch_size=1,

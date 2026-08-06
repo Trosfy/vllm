@@ -1086,6 +1086,69 @@ def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
     ]
 
 
+def test_warmup_kimi_projection_gathers_honors_target_only_token_cap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "1")
+    topk_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_all_gather_pair",
+        lambda *args, **kwargs: pytest.fail(
+            "the target-only token cap must not prewarm M=8"
+        ),
+    )
+
+    def fake_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        group,
+        *,
+        max_batch_size,
+    ):
+        topk_calls.append(
+            (
+                local_down.shape,
+                local_router.shape,
+                correction_bias.shape,
+                group,
+                max_batch_size,
+            )
+        )
+        return local_down, local_router
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        fake_topk,
+    )
+    group = _FakeCPGroup(16, None)  # type: ignore[arg-type]
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 1
+    assert topk_calls == [
+        (
+            torch.Size([1, 224]),
+            torch.Size([1, 56]),
+            torch.Size([896]),
+            group,
+            1,
+        )
+    ]
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."

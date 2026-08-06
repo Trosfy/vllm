@@ -332,9 +332,9 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             device=device,
         )
         # Keep query-gather and output addresses stable across piecewise eager
-        # attention replays. Besides making graph ownership explicit, this lets
-        # every layer reuse its validated SparkInfer binding rather than
-        # rebuilding Python views after each DCP gather. All represented layers
+        # attention replays. This makes graph ownership explicit and avoids
+        # allocating per-layer destinations; each layer still builds a fresh
+        # caller-scratch-owned SparkInfer binding. All represented layers
         # execute serially on the model stream, so one pair is sufficient.
         max_rows = self._max_dense_mla_rows
         self._dense_mla_padded_q = torch.empty(
@@ -713,8 +713,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         self._dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
         self._dcp_max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
         self._compiled_bindings: set[tuple[object, ...]] = set()
-        self._last_binding_key: tuple[object, ...] | None = None
-        self._last_binding: Any | None = None
         self._scratch_by_plan: dict[int, torch.Tensor] = {}
         self._padded_io_by_plan: dict[
             tuple[int, torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]
@@ -768,26 +766,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             self._padded_io_by_plan[key] = buffers
         return buffers[0][:batch], buffers[1][:batch]
 
-    @staticmethod
-    def _tensor_binding_key(tensor: torch.Tensor | None) -> tuple[object, ...] | None:
-        """Describe a tensor view without depending on its Python wrapper.
-
-        Dense MLA bindings retain detached views, but their addresses and
-        layouts are capture-static during piecewise replay.  Tensor contents
-        (sequence lengths, page tables, queries, and scales) intentionally do
-        not participate in this key and may change in place between tokens.
-        """
-        if tensor is None:
-            return None
-        return (
-            int(tensor.data_ptr()),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            int(tensor.storage_offset()),
-            tensor.dtype,
-            tensor.device,
-        )
-
     def _bind_dense_mla(
         self,
         plan: Any,
@@ -803,25 +781,8 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         kv_scale: torch.Tensor | None,
         active_splits: int,
     ) -> Any:
-        """Reuse a validated binding while all capture-static views match."""
-        key = (
-            id(plan),
-            self._tensor_binding_key(scratch),
-            self._tensor_binding_key(q),
-            self._tensor_binding_key(kv_cache),
-            self._tensor_binding_key(output),
-            self._tensor_binding_key(page_table),
-            self._tensor_binding_key(cache_seqlens),
-            self._tensor_binding_key(cu_seqlens_q),
-            self._tensor_binding_key(q_scale),
-            self._tensor_binding_key(kv_scale),
-            self.scale,
-            active_splits,
-        )
-        if key == self._last_binding_key:
-            assert self._last_binding is not None
-            return self._last_binding
-        binding = self._dense_mla.bind(
+        """Build a fresh binding from metadata-validated caller scratch."""
+        return self._dense_mla.bind(
             plan,
             scratch=scratch,
             q=q,
@@ -834,10 +795,8 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             kv_scale=kv_scale,
             sm_scale=self.scale,
             active_splits=active_splits,
+            validate=False,
         )
-        self._last_binding_key = key
-        self._last_binding = binding
-        return binding
 
     def forward_mqa(
         self,
