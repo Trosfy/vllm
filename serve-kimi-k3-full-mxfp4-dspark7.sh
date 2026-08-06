@@ -263,6 +263,16 @@ export VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS="${VLLM_DSPARK_PREFER_B12X_ALLREDUC
 # The M=8 fused router is exact and wins its isolated benchmark, but the first
 # full-model A/B reduced verification overlap. Preserve it for profiling while
 # the production default keeps M=8 paired gather plus native routing.
+# Validated B12X projection-transport defaults (handover S15.11). These
+# knobs default to 0 in vllm/envs.py and previously reached production only
+# through the operator's container environment, so a self-contained image
+# would silently serve the NCCL fallback instead of the measured profile.
+export VLLM_KIMI_USE_B12X_PROJECTION_GATHER="${VLLM_KIMI_USE_B12X_PROJECTION_GATHER:-1}"
+export VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER="${VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER:-1}"
+export VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK="${VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK:-1}"
+# The measured profile skips the W4A16 small-M host barrier reset; the b12x
+# default performs it.
+export B12X_W4A16_SMALL_M_HOST_BARRIER_RESET="${B12X_W4A16_SMALL_M_HOST_BARRIER_RESET:-0}"
 export VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK="${VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK:-0}"
 # Exact-math overlap experiment: begin the shared-expert branch before K3's
 # independent router and routed-down projection. Keep disabled until linked
