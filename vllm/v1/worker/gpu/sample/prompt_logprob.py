@@ -297,7 +297,10 @@ def compute_prompt_logprobs_with_chunking(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
-    CHUNK_SIZE = 1024
+    # Full-vocab chunks are memory-hungry ([N, 163840] FP32 per chunk); a
+    # near-full serving profile can lower this for KLD captures without
+    # touching the production default.
+    CHUNK_SIZE = int(os.environ.get("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024"))
     token_ids = []
     scores = []
     ranks = []
