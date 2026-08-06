@@ -260,9 +260,9 @@ class DSparkSpeculator(DFlashSpeculator):
             )
             logger.info_once(
                 "DSpark keeps its TP-sharded Markov collectives outside the "
-                "draft CUDA graph and combines base/Markov logits locally "
-                "before one eager vocabulary gather per draft step; the "
-                "draft backbone and local base logits remain captured."
+                "draft CUDA graph; its model-specific eager sampler combines "
+                "the local base/Markov logits while the draft backbone and "
+                "local base logits remain captured."
             )
         return model
 
@@ -333,8 +333,12 @@ class DSparkSpeculator(DFlashSpeculator):
                 bias = self.model.compute_local_markov_bias(markov_embed)
             else:
                 bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            if self.draft_logits is not None:
+            if self._use_local_draft_argmax:
+                draft_sampled_i = self.model.sample_local_draft_logits(
+                    base_logits[:, i], bias
+                )
+            elif self.draft_logits is not None:
+                logits_i = base_logits[:, i] + bias
                 # Probabilistic: sample in target vocab (a reduced draft vocab is
                 # scattered into its target columns; full vocab is already there).
                 if self._d2t_scatter_index is not None:
@@ -354,9 +358,8 @@ class DSparkSpeculator(DFlashSpeculator):
                     draft_step=self._step_cols[i],
                     draft_logits=self.draft_logits,
                 )
-            elif self._use_local_draft_argmax:
-                draft_sampled_i = self.model.sample_local_draft_logits(logits_i)
             else:
+                logits_i = base_logits[:, i] + bias
                 draft_sampled_i = self.model.map_draft_to_target(
                     logits_i.argmax(dim=-1)
                 )

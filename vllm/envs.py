@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
+    VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
@@ -1153,6 +1154,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at half the memory cost of replicating the complete Markov head.
     "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
         int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
+    ),
+    # Fuse the seven TP-sharded Kimi-K3 DSpark Markov BF16 additions and
+    # greedy global argmax operations without gathering the full vocabulary.
+    "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
     ),
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.

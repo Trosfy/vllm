@@ -259,7 +259,8 @@ def test_k3_dspark_sharded_sampling_gathers_after_local_sum(
     model.lm_head = lm_head
     model.logits_processor = SimpleNamespace(org_vocab_size=6)
 
-    local_logits = torch.randn(2, 4)
+    base_logits = torch.randn(2, 4)
+    markov_bias = torch.randn(2, 4)
     gathered_logits = torch.tensor(
         [
             [-3.0, 1.0, 7.0, 0.0, 2.0, 3.0, 100.0, 99.0],
@@ -272,14 +273,65 @@ def test_k3_dspark_sharded_sampling_gathers_after_local_sum(
         calls.append((logits, dim))
         return gathered_logits
 
-    monkeypatch.setattr(
-        dspark_mla, "tensor_model_parallel_all_gather", fake_all_gather
-    )
+    monkeypatch.setattr(dspark_mla, "tensor_model_parallel_all_gather", fake_all_gather)
 
-    sampled = model.sample_local_draft_logits(local_logits)
+    sampled = model.sample_local_draft_logits(base_logits, markov_bias)
 
     assert sampled.tolist() == [2, 1]
-    assert calls == [(local_logits, -1)]
+    assert len(calls) == 1
+    assert calls[0][1] == -1
+    torch.testing.assert_close(calls[0][0], base_logits + markov_bias)
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_b12x_argmax_receives_unmaterialized_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers import vocab_parallel_embedding
+
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    lm_head = ParallelLMHead(8, 4, disable_tp=True)
+    lm_head.tp_size = 16
+    model = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.lm_head = lm_head
+    model.logits_processor = SimpleNamespace(org_vocab_size=6)
+    model._b12x_dspark_argmax_enabled = True
+    model._b12x_dspark_argmax_max_batch = 8
+    model._b12x_dspark_argmax_output = torch.empty(8, dtype=torch.int64)
+
+    calls = []
+
+    class FakeArgmax:
+        def fused_add_argmax(self, base, bias, out):
+            calls.append((base, bias, out))
+            out.copy_(torch.tensor([3, 5], dtype=torch.int64))
+            return out
+
+    model._b12x_dspark_argmax_runtime = FakeArgmax()
+
+    def fail_gather(*args, **kwargs):
+        raise AssertionError("B12X argmax must not gather full-vocabulary logits")
+
+    monkeypatch.setattr(dspark_mla, "tensor_model_parallel_all_gather", fail_gather)
+    storage = torch.randn(2, 3, 4, dtype=torch.bfloat16)
+    base_logits = storage[:, 1]
+    markov_bias = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    sampled = model.sample_local_draft_logits(base_logits, markov_bias)
+
+    assert sampled.tolist() == [3, 5]
+    assert len(calls) == 1
+    assert calls[0][0] is base_logits
+    assert calls[0][1] is markov_bias
+    assert calls[0][2].data_ptr() == model._b12x_dspark_argmax_output.data_ptr()
 
 
 @pytest.mark.cpu_test

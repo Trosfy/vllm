@@ -3,6 +3,7 @@
 """K3 dense MLA draft model for DSpark speculative decoding."""
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 import vllm._custom_ops as ops
 from vllm import envs
 from vllm.config import VllmConfig
-from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -681,6 +682,12 @@ class K3DSparkForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        self._b12x_dspark_argmax_enabled = bool(envs.VLLM_KIMI_K3_B12X_DSPARK_ARGMAX)
+        self._b12x_dspark_argmax_max_batch = min(
+            vllm_config.scheduler_config.max_num_seqs, 8
+        )
+        self._b12x_dspark_argmax_runtime: Any = None
+        self._b12x_dspark_argmax_output: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -764,12 +771,64 @@ class K3DSparkForCausalLM(nn.Module):
     def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
 
-    def sample_local_draft_logits(self, logits: torch.Tensor) -> torch.Tensor:
+    def _get_b12x_dspark_argmax(
+        self,
+        base_logits: torch.Tensor,
+    ) -> Any:
+        runtime = self._b12x_dspark_argmax_runtime
+        if runtime is not None:
+            return runtime
+
+        from sparkinfer.comm.pcie import VocabParallelArgmax
+
+        tp_group = get_tp_group()
+        runtime = VocabParallelArgmax.from_exchange_group(
+            # IPC handle exchange is metadata-only. Keep it off the primary
+            # TP NCCL communicator whose collective order is captured by the
+            # target and draft CUDA graphs.
+            exchange_group=tp_group.cpu_group,
+            device=base_logits.device,
+            local_vocab_size=base_logits.shape[-1],
+            max_batch_size=self._b12x_dspark_argmax_max_batch,
+        )
+        self._b12x_dspark_argmax_output = torch.empty(
+            self._b12x_dspark_argmax_max_batch,
+            dtype=torch.int64,
+            device=base_logits.device,
+        )
+        self._b12x_dspark_argmax_runtime = runtime
+        logger.info_once(
+            "Kimi-K3 DSpark uses B12X TP16 fused BF16 add/global argmax "
+            "for up to %d requests.",
+            self._b12x_dspark_argmax_max_batch,
+        )
+        return runtime
+
+    def sample_local_draft_logits(
+        self,
+        base_logits: torch.Tensor,
+        markov_bias: torch.Tensor,
+    ) -> torch.Tensor:
         assert isinstance(self.lm_head, VocabParallelEmbedding)
+        batch_size = int(base_logits.shape[0])
+        use_b12x = (
+            getattr(self, "_b12x_dspark_argmax_enabled", False)
+            and self.lm_head.tp_size == 16
+            and base_logits.dtype == torch.bfloat16
+            and markov_bias.dtype == torch.bfloat16
+            and 0 < batch_size <= self._b12x_dspark_argmax_max_batch
+        )
+        if use_b12x:
+            runtime = self._get_b12x_dspark_argmax(base_logits)
+            assert self._b12x_dspark_argmax_output is not None
+            output = self._b12x_dspark_argmax_output[:batch_size]
+            return runtime.fused_add_argmax(base_logits, markov_bias, out=output)
+
         # A full gather is faster than a tiny pair gather on this TP16 PCIe
         # topology (0.55 vs 0.79 ms for all seven Markov steps). Base and
         # Markov logits are added locally first, so this remains one collective
         # per step and no collective is captured in the draft CUDA graph.
+        logits = base_logits + markov_bias
         logits = tensor_model_parallel_all_gather(logits, dim=-1)
         logits = logits[..., : self.logits_processor.org_vocab_size]
         return logits.argmax(dim=-1)
