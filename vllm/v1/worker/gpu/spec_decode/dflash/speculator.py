@@ -283,11 +283,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
 
         target_query_lens = {
-            self.num_query_per_req + 1,
-            32,
-            128,
-            256,
-            1024,
+            query_len
+            for query_len in {
+                self.num_query_per_req + 1,
+                32,
+                128,
+                256,
+                1024,
+            }
+            if query_len <= self.max_num_tokens
         }
         draft_query_lens = (
             range(1, self.num_query_per_req + 1)
