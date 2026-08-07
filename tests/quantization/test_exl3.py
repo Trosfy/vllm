@@ -863,13 +863,13 @@ def test_prepared_dense_weight_is_owned_by_source_tensor(monkeypatch) -> None:
             return SimpleNamespace(trellis=trellis, suh=suh, svh=svh)
 
     api = FakeApi()
-    monkeypatch.setattr(exl3_module, "_load_sparkinfer_trellis_linear", lambda: api)
+    monkeypatch.setattr(exl3_module, "_load_b12x_trellis_linear", lambda: api)
     trellis = torch.empty((8, 8, 96), dtype=torch.int16)
     suh = torch.empty(128, dtype=torch.float16)
     svh = torch.empty(128, dtype=torch.float16)
 
-    first = exl3_module._sparkinfer_trellis_weight(trellis, suh, svh, torch.float16)
-    second = exl3_module._sparkinfer_trellis_weight(trellis, suh, svh, torch.float16)
+    first = exl3_module._b12x_trellis_weight(trellis, suh, svh, torch.float16)
+    second = exl3_module._b12x_trellis_weight(trellis, suh, svh, torch.float16)
     assert first is second
     assert api.calls == 1
 
