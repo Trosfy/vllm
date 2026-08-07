@@ -46,20 +46,20 @@ _B12X_DCP_CAPTURE_SEQUENCES: dict[int, int] = {}
 # Channel currently owned by an in-flight graph capture, per DCP group. The
 # pool refuses eager-channel work while a graph owns its channels, so every
 # call site must follow the capture rather than pin the eager id.
-_B12X_DCP_ACTIVE_CAPTURE_CHANNEL: dict[int, str] = {}
-# Pools created while a capture scope is open; they joined the graph channel
-# themselves and must be released from it when the scope closes.
-_B12X_DCP_LATE_CAPTURE_POOLS: dict[int, list[Any]] = {}
+# Channel, stream and ExitStack owned by an in-flight capture, per DCP group.
+# The stack lets a pool created mid-capture enter the same capture context, so
+# the scope releases it on exit instead of leaving a stale stream binding.
+_B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
 
 
 def _b12x_dcp_channel_id(cp_group: GroupCoordinator | None = None) -> str:
     """Return the channel a DCP a2a call should use right now."""
     if cp_group is not None:
-        active = _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.get(id(cp_group.device_group))
+        active = _B12X_DCP_ACTIVE_CAPTURE.get(id(cp_group.device_group))
         if active is not None:
-            return active
-    elif len(_B12X_DCP_ACTIVE_CAPTURE_CHANNEL) == 1:
-        return next(iter(_B12X_DCP_ACTIVE_CAPTURE_CHANNEL.values()))
+            return active[0]
+    elif len(_B12X_DCP_ACTIVE_CAPTURE) == 1:
+        return next(iter(_B12X_DCP_ACTIVE_CAPTURE.values()))[0]
     return _B12X_DCP_EAGER_CHANNEL_ID
 _B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
 _DCP_A2A_GRAPH_BUFFERS: dict[
@@ -158,18 +158,20 @@ def _get_b12x_dcp_a2a_pool(
         # bound the pools that existed when it opened, so a pool born here
         # must join the graph's channel itself or its first launch is rejected
         # for using the eager channel while a graph owns capture.
-        active_channel = _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.get(
-            id(cp_group.device_group)
-        )
-        channels = (_B12X_DCP_EAGER_CHANNEL_ID,)
-        if active_channel is not None:
-            channels += (active_channel,)
-        pool.prepare_channels(channels)
-        pool.for_stream(channel_id=active_channel or _B12X_DCP_EAGER_CHANNEL_ID)
-        if active_channel is not None:
-            _B12X_DCP_LATE_CAPTURE_POOLS.setdefault(
-                id(cp_group.device_group), []
-            ).append(pool)
+        active = _B12X_DCP_ACTIVE_CAPTURE.get(id(cp_group.device_group))
+        if active is None:
+            pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+            pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
+        else:
+            # Join the capture already in flight, through its own ExitStack so
+            # the scope releases the channel when it closes. Binding the eager
+            # channel here instead would pin this stream to a channel the graph
+            # does not own.
+            active_channel, active_stream, active_stack = active
+            pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID, active_channel))
+            active_stack.enter_context(
+                pool.capture(stream=active_stream, channel_id=active_channel)
+            )
     except Exception as exc:
         init_error = exc
 
@@ -223,8 +225,7 @@ def capture_b12x_dcp_a2a(
     sequence = _B12X_DCP_CAPTURE_SEQUENCES.get(group_id, 0)
     _B12X_DCP_CAPTURE_SEQUENCES[group_id] = sequence + 1
     channel_id = f"vllm:graph:{sequence}"
-    previous_active = _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.get(group_id)
-    _B12X_DCP_ACTIVE_CAPTURE_CHANNEL[group_id] = channel_id
+    previous_active = _B12X_DCP_ACTIVE_CAPTURE.get(group_id)
     matching_pools = sorted(
         (
             (key, pool)
@@ -235,17 +236,15 @@ def capture_b12x_dcp_a2a(
     )
     try:
         with ExitStack() as stack:
+            _B12X_DCP_ACTIVE_CAPTURE[group_id] = (channel_id, stream, stack)
             for _, pool in matching_pools:
                 stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
             yield
     finally:
-        for late_pool in _B12X_DCP_LATE_CAPTURE_POOLS.pop(group_id, ()):
-            with suppress(Exception):
-                late_pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
         if previous_active is None:
-            _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.pop(group_id, None)
+            _B12X_DCP_ACTIVE_CAPTURE.pop(group_id, None)
         else:
-            _B12X_DCP_ACTIVE_CAPTURE_CHANNEL[group_id] = previous_active
+            _B12X_DCP_ACTIVE_CAPTURE[group_id] = previous_active
 
 
 def checkpoint_b12x_dcp_a2a_channels(
