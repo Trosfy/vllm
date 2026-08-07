@@ -1645,10 +1645,10 @@ def get_kv_cache_config_from_groups(
                 )
                 available_memory -= tensor_size
             logger.info_once(
-                "KV cache group with layers %s uses a private window pool of "
-                "%d blocks (%.1f MiB); it no longer taxes shared-pool "
+                "KV cache group of %d window-draft layers uses a private pool "
+                "of %d blocks (%.1f MiB); it no longer taxes shared-pool "
                 "capacity.",
-                group.layer_names,
+                len(group.layer_names),
                 pool_blocks,
                 sum(t.size for t in private_tensors) / (1 << 20),
             )
