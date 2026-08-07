@@ -1013,12 +1013,16 @@ def get_max_concurrency_for_kv_cache_config(
         memory_per_block = _pool_bytes_per_block(vllm_config, groups)
         num_blocks_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     else:
+        # Private-pool groups (DFlash window drafts) do not draw from the
+        # shared pool; their pools are admission-cap-sized so they never
+        # bound concurrency.
         num_blocks_per_request = sum(
             cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 group.kv_cache_spec.page_size_bytes,
             )
             for group in groups
+            if group.private_pool_num_blocks is None
         )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
@@ -1544,6 +1548,48 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _private_window_pool_num_blocks(
+    vllm_config: VllmConfig, group: KVCacheGroupSpec
+) -> int | None:
+    """Blocks for a group that should allocate from a private pool.
+
+    Applies only to DCP-replicated sliding-window groups (the DFlash GQA
+    draft). Their per-request block usage plateaus at the window admission
+    cap, so in the shared pool every block would carry a page for them that
+    they can never use: the group's page taxes ``block_stride`` (shrinking
+    the reported token capacity ~2.5x for Kimi-K3 DFlash) and its tensor is
+    sized to the full shared ``num_blocks``. A private pool sized
+    ``max_num_seqs * admission_cap`` is exhaustion-free by construction
+    (the cap already includes in-flight tokens), so admission accounting
+    can stay entirely on the shared pool.
+
+    Returns None when the group must stay in the shared pool.
+    """
+    if os.environ.get("VLLM_DFLASH_PRIVATE_WINDOW_POOL", "1") == "0":
+        return None
+    if vllm_config.cache_config.enable_prefix_caching:
+        # Window-block recycling with prefix caching keeps blocks alive past
+        # the window; keep the well-tested shared-pool path there.
+        return None
+    spec: KVCacheSpec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        inner = list(spec.kv_cache_specs.values())
+        if not inner or not all(
+            type(s) is SlidingWindowSpec and s.dcp_replicated for s in inner
+        ):
+            return None
+        spec = inner[0]
+    elif not (type(spec) is SlidingWindowSpec and spec.dcp_replicated):
+        return None
+    admission_blocks = spec.max_admission_blocks_per_request(
+        max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+        max_model_len=vllm_config.model_config.max_model_len,
+    )
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    # +1 for the pool's null block, +3 slack for block-boundary rounding.
+    return admission_blocks * max_num_seqs + 4
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1566,6 +1612,58 @@ def get_kv_cache_config_from_groups(
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    # Carve DCP-replicated sliding-window groups (DFlash draft) out into
+    # private, admission-cap-sized pools before shared-slab planning; see
+    # _private_window_pool_num_blocks. Group order (and thus group ids) is
+    # preserved: only the planner below sees the reduced list.
+    private_tensors: list[KVCacheTensor] = []
+    shared_groups = kv_cache_groups
+    if len(kv_cache_groups) > 1 and not _use_lockstep_mla_allocation(
+        kv_cache_groups,
+        vllm_config.parallel_config.decode_context_parallel_size,
+        vllm_config.parallel_config.prefill_context_parallel_size,
+    ):
+        shared_groups = []
+        for group in kv_cache_groups:
+            pool_blocks = _private_window_pool_num_blocks(vllm_config, group)
+            if pool_blocks is None:
+                shared_groups.append(group)
+                continue
+            group.private_pool_num_blocks = pool_blocks
+            spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    page_size = spec.kv_cache_specs[layer_name].page_size_bytes
+                else:
+                    page_size = spec.page_size_bytes
+                tensor_size = page_size * pool_blocks
+                private_tensors.append(
+                    KVCacheTensor(size=tensor_size, shared_by=[layer_name])
+                )
+                available_memory -= tensor_size
+            logger.info_once(
+                "KV cache group with layers %s uses a private window pool of "
+                "%d blocks (%.1f MiB); it no longer taxes shared-pool "
+                "capacity.",
+                group.layer_names,
+                pool_blocks,
+                sum(t.size for t in private_tensors) / (1 << 20),
+            )
+        if not shared_groups:
+            shared_groups = kv_cache_groups
+            private_tensors = []
+            for group in kv_cache_groups:
+                group.private_pool_num_blocks = None
+    if private_tensors:
+        result = get_kv_cache_config_from_groups(
+            vllm_config, shared_groups, available_memory
+        )
+        return KVCacheConfig(
+            num_blocks=result.num_blocks,
+            kv_cache_tensors=result.kv_cache_tensors + private_tensors,
             kv_cache_groups=kv_cache_groups,
         )
 

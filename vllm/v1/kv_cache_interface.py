@@ -1136,6 +1136,13 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # When set, this group allocates from its own BlockPool of this many
+    # blocks instead of the shared pool, and its tensors are sized to it.
+    # Used for DCP-replicated sliding-window draft groups (DFlash): their
+    # per-request footprint plateaus at the window admission cap, so sizing
+    # them like full-length groups would tax every shared-pool block with a
+    # page the window can never use.
+    private_pool_num_blocks: int | None = None
 
 
 @dataclass
