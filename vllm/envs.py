@@ -245,6 +245,8 @@ if TYPE_CHECKING:
     VLLM_PCIE_DMA_FP8: str | None = None
     VLLM_CPP_AR_1STAGE_NCCL_CUTOFF: str | None = None
     VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS: int | None = None
+    VLLM_USE_B12X_PCIE_DMA: bool = False
+    VLLM_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1903,6 +1905,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if (value := os.getenv("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS")) is not None
         else None
     ),
+    # The DS4 launcher exports these for B12X and compiler-cache consumers.
+    # Register them so vLLM validation does not reject a supported launch.
+    "VLLM_USE_B12X_PCIE_DMA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_PCIE_DMA", "0"))
+    ),
+    "VLLM_CACHE_DIR": lambda: os.getenv("VLLM_CACHE_DIR"),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))

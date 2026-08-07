@@ -63,6 +63,8 @@ def _clear_unknown_vllm_envs(monkeypatch: pytest.MonkeyPatch) -> None:
         ("VLLM_PCIE_DMA_FP8", "ring", "ring"),
         ("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF", "56KB", "56KB"),
         ("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "4", 4),
+        ("VLLM_USE_B12X_PCIE_DMA", "1", True),
+        ("VLLM_CACHE_DIR", "/cache/vllm", "/cache/vllm"),
     ],
 )
 def test_gilded_gnosis_runtime_envs_are_registered(
