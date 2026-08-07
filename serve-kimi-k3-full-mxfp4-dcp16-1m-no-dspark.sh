@@ -166,6 +166,21 @@ if [[ "${KIMI_NO_DSPARK_PREFLIGHT_ONLY:-0}" == 1 ]]; then
   exit 0
 fi
 
+# Optional online MXFP8 for the 69 low-sensitivity KDA input projections, the
+# same profile the DSpark launcher uses. It frees about 1.36 GiB/rank, which is
+# what makes room for a draft model on top of this exact-weight target.
+TARGET_QUANT_ARGS=()
+case "${KIMI_TARGET_MXFP8_PROFILE:-none}" in
+  none) ;;
+  kda_in_proj)
+    TARGET_QUANT_ARGS+=(--quantization-config '{"linear":"mxfp8","ignore":["re:^(?!.*self_attn\\.(?:q_proj|k_proj|v_proj|b_proj|f_a_proj)$).*$"]}')
+    ;;
+  *)
+    echo "KIMI_TARGET_MXFP8_PROFILE must be none or kda_in_proj" >&2
+    exit 2
+    ;;
+esac
+
 exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --language-model-only \
   --attention-backend B12X_MLA \
@@ -177,4 +192,5 @@ exec "${SCRIPT_DIR}/serve-kimi-k3-instanttensor.sh" \
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" \
   --no-enable-prefix-caching \
   --additional-config "${KIMI_ADDITIONAL_CONFIG}" \
+  "${TARGET_QUANT_ARGS[@]}" \
   "$@"
