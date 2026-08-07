@@ -20,7 +20,7 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +47,9 @@ _B12X_DCP_CAPTURE_SEQUENCES: dict[int, int] = {}
 # pool refuses eager-channel work while a graph owns its channels, so every
 # call site must follow the capture rather than pin the eager id.
 _B12X_DCP_ACTIVE_CAPTURE_CHANNEL: dict[int, str] = {}
+# Pools created while a capture scope is open; they joined the graph channel
+# themselves and must be released from it when the scope closes.
+_B12X_DCP_LATE_CAPTURE_POOLS: dict[int, list[Any]] = {}
 
 
 def _b12x_dcp_channel_id(cp_group: GroupCoordinator | None = None) -> str:
@@ -150,8 +153,23 @@ def _get_b12x_dcp_a2a_pool(
         # B12X identifies independently replayable channels by a stable
         # semantic name. Stream handles are process-local and can be recycled,
         # so they are not a valid distributed identity.
-        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
-        pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
+        # A pool can be created lazily inside a graph capture (the first
+        # projection gather of the first captured shape). The capture scope
+        # bound the pools that existed when it opened, so a pool born here
+        # must join the graph's channel itself or its first launch is rejected
+        # for using the eager channel while a graph owns capture.
+        active_channel = _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.get(
+            id(cp_group.device_group)
+        )
+        channels = (_B12X_DCP_EAGER_CHANNEL_ID,)
+        if active_channel is not None:
+            channels += (active_channel,)
+        pool.prepare_channels(channels)
+        pool.for_stream(channel_id=active_channel or _B12X_DCP_EAGER_CHANNEL_ID)
+        if active_channel is not None:
+            _B12X_DCP_LATE_CAPTURE_POOLS.setdefault(
+                id(cp_group.device_group), []
+            ).append(pool)
     except Exception as exc:
         init_error = exc
 
@@ -221,6 +239,9 @@ def capture_b12x_dcp_a2a(
                 stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
             yield
     finally:
+        for late_pool in _B12X_DCP_LATE_CAPTURE_POOLS.pop(group_id, ()):
+            with suppress(Exception):
+                late_pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
         if previous_active is None:
             _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.pop(group_id, None)
         else:
