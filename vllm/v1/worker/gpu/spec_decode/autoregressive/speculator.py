@@ -71,6 +71,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
+            channel_id="graph:vllm-speculator-prefill",
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
@@ -85,6 +86,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=1,
+            channel_id="graph:vllm-speculator-decode",
         )
 
     def capture(self) -> None:
