@@ -1615,6 +1615,19 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    for _i, _g in enumerate(kv_cache_groups):
+        _spec = _g.kv_cache_spec
+        logger.info_once(
+            "KV group %d: %s x%d layers, block_size=%s, page=%d B, "
+            "per-request=%d B",
+            _i,
+            type(_spec).__name__,
+            len(_g.layer_names),
+            getattr(_spec, "block_size", "?"),
+            _spec.page_size_bytes,
+            _spec.max_memory_usage_bytes(vllm_config),
+        )
+
     # Carve DCP-replicated sliding-window groups (DFlash draft) out into
     # private, admission-cap-sized pools before shared-slab planning; see
     # _private_window_pool_num_blocks. Group order (and thus group ids) is
