@@ -334,11 +334,17 @@ def _run_mla_query_bmm(
 
 
 def is_packed_quantized_dtype(dtype: torch.dtype) -> bool:
-    """True if ``dtype`` is a container for packed quantized weights.
+    """Return whether ``dtype`` is a packed quantized-weight container.
 
     NVFP4 packs into ``uint8``; compressed-tensors int4/int8 packs into
     ``int32``. Neither is a real activation dtype, so ``kv_c_normed`` must not
     be cast to them -- the linear layer unpacks and quantizes internally.
+
+    Args:
+        dtype: Data type to classify.
+
+    Returns:
+        Whether the data type stores packed quantized weights.
     """
     return dtype in (torch.uint8, torch.int32)
 
