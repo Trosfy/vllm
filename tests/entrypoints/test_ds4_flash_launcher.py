@@ -84,20 +84,74 @@ def test_ds4_launcher_enables_native_kv_offload(tmp_path: Path) -> None:
     assert "allocator=expandable_segments:False" in output
 
 
+def test_ds4_launcher_builds_bounded_native_l2_config(tmp_path: Path) -> None:
+    output = _dry_run(
+        tmp_path,
+        KV_OFFLOADING_SIZE="32",
+        NATIVE_L2_PATH="/cache/native-l2",
+        NATIVE_L2_GB="128",
+    )
+
+    assert "native_l2=1" in output
+    assert "--kv-transfer-config" in output
+    assert "OffloadingConnector" in output
+    assert "TieringOffloadingSpec" in output
+    assert "cache/native-l2" in output
+    assert 'gc_max_size_gb\\":128.0' in output
+
+
+def test_ds4_launcher_native_l2_requires_l1(tmp_path: Path) -> None:
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "DRY_RUN": "1",
+        "NATIVE_L2_PATH": "/cache/native-l2",
+        "NATIVE_L2_GB": "128",
+    }
+    result = subprocess.run(
+        ["bash", str(_LAUNCHER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "NATIVE_L2 requires a positive KV_OFFLOADING_SIZE" in result.stderr
+
+
+def test_ds4_launcher_native_l2_requires_complete_pair(tmp_path: Path) -> None:
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "DRY_RUN": "1",
+        "KV_OFFLOADING_SIZE": "32",
+        "NATIVE_L2_PATH": "/cache/native-l2",
+    }
+    result = subprocess.run(
+        ["bash", str(_LAUNCHER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "NATIVE_L2_PATH and NATIVE_L2_GB must be set together" in result.stderr
+
+
 def test_ds4_launcher_native_offload_preserves_other_allocator_settings(
     tmp_path: Path,
 ) -> None:
     output = _dry_run(
         tmp_path,
         KV_OFFLOADING_SIZE="5.5",
-        PYTORCH_CUDA_ALLOC_CONF=(
-            "max_split_size_mb:256,expandable_segments:True"
-        ),
+        PYTORCH_CUDA_ALLOC_CONF=("max_split_size_mb:256,expandable_segments:True"),
     )
 
-    assert (
-        "allocator=max_split_size_mb:256,expandable_segments:False" in output
-    )
+    assert "allocator=max_split_size_mb:256,expandable_segments:False" in output
 
 
 def test_ds4_launcher_without_offload_keeps_expandable_segments(

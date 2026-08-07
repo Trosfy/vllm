@@ -102,6 +102,8 @@ gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
 load_format=${LOAD_FORMAT:-instanttensor}
 kv_offloading_size=${KV_OFFLOADING_SIZE:-}
+native_l2_path=${NATIVE_L2_PATH:-}
+native_l2_size=${NATIVE_L2_GB:-}
 prefix_cache=$(bool_value PREFIX_CACHE "${PREFIX_CACHE:-1}")
 enable_flashinfer_autotune=$(bool_value ENABLE_FLASHINFER_AUTOTUNE "${ENABLE_FLASHINFER_AUTOTUNE:-1}")
 draft_sample_method=${DRAFT_SAMPLE_METHOD:-probabilistic}
@@ -116,6 +118,28 @@ if [[ -n "${kv_offloading_size}" \
   && ! "${kv_offloading_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   echo "KV_OFFLOADING_SIZE must be a non-negative GiB value; got '${kv_offloading_size}'" >&2
   exit 2
+fi
+native_l2_enabled=0
+if [[ -n "${native_l2_path}" || -n "${native_l2_size}" ]]; then
+  if [[ -z "${native_l2_path}" || -z "${native_l2_size}" ]]; then
+    echo "NATIVE_L2_PATH and NATIVE_L2_GB must be set together" >&2
+    exit 2
+  fi
+  if [[ "${native_l2_path}" != /* ]]; then
+    echo "NATIVE_L2_PATH must be an absolute container path" >&2
+    exit 2
+  fi
+  if [[ ! "${native_l2_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ \
+    || "${native_l2_size}" =~ ^0*([.]0*)?$ ]]; then
+    echo "NATIVE_L2_GB must be a positive GiB value; got '${native_l2_size}'" >&2
+    exit 2
+  fi
+  if [[ -z "${kv_offloading_size}" \
+    || "${kv_offloading_size}" =~ ^0*([.]0*)?$ ]]; then
+    echo "NATIVE_L2 requires a positive KV_OFFLOADING_SIZE for its L1 tier" >&2
+    exit 2
+  fi
+  native_l2_enabled=1
 fi
 if [[ "${mode}" == "dspark" && "${dcp_size}" != "1" ]]; then
   echo "DSpark non-causal attention currently requires DCP_SIZE=1" >&2
@@ -452,6 +476,34 @@ if [[ -n "${kv_offloading_size}" \
     --kv-offloading-size "${kv_offloading_size}"
     --kv-offloading-backend native
   )
+  if [[ "${native_l2_enabled}" == "1" ]]; then
+    export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
+    native_l2_config=$(python3 - "${native_l2_path}" "${native_l2_size}" <<'PY'
+import json
+import sys
+
+root_dir, max_size_gb = sys.argv[1:]
+config = {
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "spec_name": "TieringOffloadingSpec",
+        "secondary_tiers": [
+            {
+                "type": "fs",
+                "root_dir": root_dir,
+                "n_read_threads": 32,
+                "n_write_threads": 16,
+                "gc_max_size_gb": float(max_size_gb),
+            }
+        ],
+    },
+}
+print(json.dumps(config, separators=(",", ":")))
+PY
+    )
+    offloading_args+=(--kv-transfer-config "${native_l2_config}")
+  fi
 fi
 
 capture_args=()
@@ -535,11 +587,12 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s allocator=%s model=%s\n' \
+printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
   "${mode}" "${dspark_depth_mode}" \
   "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
   "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
+  "${native_l2_enabled}" \
   "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
