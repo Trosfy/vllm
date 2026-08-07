@@ -43,7 +43,7 @@ case "${mode}" in
   dspark-off|dspark-mtp0) mode=dspark-mtp0 ;;
   dspark) ;;
   *)
-    echo "MODE must be mtp0, mtp2, mtp3, dspark-mtp0, or dspark; got '${mode}'" >&2
+    echo "MODE must be mtp0, mtp2, mtp3, dspark-off, dspark-mtp0, or dspark; got '${mode}'" >&2
     exit 2
     ;;
 esac

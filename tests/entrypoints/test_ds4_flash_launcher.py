@@ -10,6 +10,15 @@ _LAUNCHER = _REPO_ROOT / "serve-ds4-flash.sh"
 
 
 def _dry_run(tmp_path: Path, **overrides: str) -> str:
+    """Run the DS4 launcher in dry-run mode.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+        **overrides: Environment variables that override launcher defaults.
+
+    Returns:
+        The launcher's standard-error output.
+    """
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -28,6 +37,11 @@ def _dry_run(tmp_path: Path, **overrides: str) -> str:
 
 
 def test_ds4_launcher_defaults_to_0731_fixed_k7(tmp_path: Path) -> None:
+    """Verify the default 0731 fixed-K7 launch profile.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path)
 
     assert "mode=dspark depth=fixed" in output
@@ -40,6 +54,11 @@ def test_ds4_launcher_defaults_to_0731_fixed_k7(tmp_path: Path) -> None:
 
 
 def test_ds4_launcher_dynamic_depth_enables_capacity_mode(tmp_path: Path) -> None:
+    """Verify that dynamic depth selects variable-capacity verification.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path, DSPARK_DEPTH_MODE="dynamic")
 
     assert "mode=dspark depth=dynamic" in output
@@ -48,6 +67,11 @@ def test_ds4_launcher_dynamic_depth_enables_capacity_mode(tmp_path: Path) -> Non
 
 
 def test_ds4_launcher_accepts_cluster_style_aliases(tmp_path: Path) -> None:
+    """Verify compatibility with cluster-style environment aliases.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(
         tmp_path,
         DCP="1",
@@ -59,6 +83,11 @@ def test_ds4_launcher_accepts_cluster_style_aliases(tmp_path: Path) -> None:
 
 
 def test_ds4_launcher_standard_mtp_uses_standard_checkpoint(tmp_path: Path) -> None:
+    """Verify that standard MTP selects the non-DSpark checkpoint.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path, MODE="mtp2")
 
     assert "mode=mtp2 depth=disabled" in output
@@ -69,6 +98,11 @@ def test_ds4_launcher_standard_mtp_uses_standard_checkpoint(tmp_path: Path) -> N
 
 
 def test_ds4_launcher_can_disable_dspark_on_0731(tmp_path: Path) -> None:
+    """Verify target-only serving with the 0731 checkpoint.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path, MODE="dspark-mtp0")
 
     assert "mode=dspark-mtp0 depth=disabled" in output
@@ -77,6 +111,11 @@ def test_ds4_launcher_can_disable_dspark_on_0731(tmp_path: Path) -> None:
 
 
 def test_ds4_launcher_enables_native_kv_offload(tmp_path: Path) -> None:
+    """Verify native host-memory KV offload arguments.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path, KV_OFFLOADING_SIZE="5.5")
 
     assert "--kv-offloading-size 5.5" in output
@@ -85,6 +124,11 @@ def test_ds4_launcher_enables_native_kv_offload(tmp_path: Path) -> None:
 
 
 def test_ds4_launcher_builds_bounded_native_l2_config(tmp_path: Path) -> None:
+    """Verify bounded filesystem L2 configuration generation.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(
         tmp_path,
         KV_OFFLOADING_SIZE="32",
@@ -101,6 +145,11 @@ def test_ds4_launcher_builds_bounded_native_l2_config(tmp_path: Path) -> None:
 
 
 def test_ds4_launcher_native_l2_requires_l1(tmp_path: Path) -> None:
+    """Verify that filesystem L2 requires native host-memory L1.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -122,6 +171,11 @@ def test_ds4_launcher_native_l2_requires_l1(tmp_path: Path) -> None:
 
 
 def test_ds4_launcher_native_l2_requires_complete_pair(tmp_path: Path) -> None:
+    """Verify that both filesystem L2 settings are required.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -145,6 +199,11 @@ def test_ds4_launcher_native_l2_requires_complete_pair(tmp_path: Path) -> None:
 def test_ds4_launcher_native_offload_preserves_other_allocator_settings(
     tmp_path: Path,
 ) -> None:
+    """Verify allocator normalization preserves unrelated settings.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(
         tmp_path,
         KV_OFFLOADING_SIZE="5.5",
@@ -157,18 +216,33 @@ def test_ds4_launcher_native_offload_preserves_other_allocator_settings(
 def test_ds4_launcher_without_offload_keeps_expandable_segments(
     tmp_path: Path,
 ) -> None:
+    """Verify the default allocator when native offload is disabled.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path)
 
     assert "allocator=expandable_segments:True" in output
 
 
 def test_ds4_launcher_zero_kv_offload_stays_disabled(tmp_path: Path) -> None:
+    """Verify that a zero offload size does not enable native offload.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     output = _dry_run(tmp_path, KV_OFFLOADING_SIZE="0.0")
 
     assert "--kv-offloading-size" not in output
 
 
 def test_ds4_launcher_rejects_invalid_kv_offload_size(tmp_path: Path) -> None:
+    """Verify rejection of a nonnumeric native-offload size.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
