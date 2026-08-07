@@ -43,6 +43,21 @@ _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
 _B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
 _B12X_DCP_CAPTURE_SEQUENCES: dict[int, int] = {}
+# Channel currently owned by an in-flight graph capture, per DCP group. The
+# pool refuses eager-channel work while a graph owns its channels, so every
+# call site must follow the capture rather than pin the eager id.
+_B12X_DCP_ACTIVE_CAPTURE_CHANNEL: dict[int, str] = {}
+
+
+def _b12x_dcp_channel_id(cp_group: GroupCoordinator | None = None) -> str:
+    """Return the channel a DCP a2a call should use right now."""
+    if cp_group is not None:
+        active = _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.get(id(cp_group.device_group))
+        if active is not None:
+            return active
+    elif len(_B12X_DCP_ACTIVE_CAPTURE_CHANNEL) == 1:
+        return next(iter(_B12X_DCP_ACTIVE_CAPTURE_CHANNEL.values()))
+    return _B12X_DCP_EAGER_CHANNEL_ID
 _B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
@@ -190,6 +205,8 @@ def capture_b12x_dcp_a2a(
     sequence = _B12X_DCP_CAPTURE_SEQUENCES.get(group_id, 0)
     _B12X_DCP_CAPTURE_SEQUENCES[group_id] = sequence + 1
     channel_id = f"vllm:graph:{sequence}"
+    previous_active = _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.get(group_id)
+    _B12X_DCP_ACTIVE_CAPTURE_CHANNEL[group_id] = channel_id
     matching_pools = sorted(
         (
             (key, pool)
@@ -198,10 +215,16 @@ def capture_b12x_dcp_a2a(
         ),
         key=lambda item: item[0][1:],
     )
-    with ExitStack() as stack:
-        for _, pool in matching_pools:
-            stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
-        yield
+    try:
+        with ExitStack() as stack:
+            for _, pool in matching_pools:
+                stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
+            yield
+    finally:
+        if previous_active is None:
+            _B12X_DCP_ACTIVE_CAPTURE_CHANNEL.pop(group_id, None)
+        else:
+            _B12X_DCP_ACTIVE_CAPTURE_CHANNEL[group_id] = previous_active
 
 
 def checkpoint_b12x_dcp_a2a_channels(
@@ -321,7 +344,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(),
     )
 
 
@@ -377,12 +400,12 @@ def _try_b12x_dcp_all_gather_heads(
     if out is None:
         return pool.all_gather_heads(
             local_input,
-            channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+            channel_id=_b12x_dcp_channel_id(),
         )
     return pool.all_gather_heads(
         local_input,
         out=out,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(),
     )
 
 
@@ -480,7 +503,7 @@ def _try_b12x_dcp_all_gather_pair(
     return pool.all_gather_pair(
         local_first,
         local_second,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(),
     )
 
 
@@ -576,7 +599,7 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
         routed_hidden_states,
         topk_weights,
         topk_ids,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(),
     )
     return routed_hidden_states, routing_payload
 
