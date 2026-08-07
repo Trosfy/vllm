@@ -857,6 +857,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
+            if loaded_weight.is_cuda:
+                # Streaming loaders (InstantTensor) hand out transient views
+                # into a recycled device staging ring, so a tensor buffered
+                # here would read reused storage once iteration moves on --
+                # the copy then fails with CUDA invalid argument. Stage the
+                # weight on the host, which the loader below copies back.
+                loaded_weight = loaded_weight.to("cpu", copy=True)
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
