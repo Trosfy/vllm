@@ -315,7 +315,7 @@ elif [[ "${mode}" == "dspark" ]]; then
         ;;
     esac
     draft_attention_json=$(printf \
-      ',"draft_attention_backend":"%s"' "${draft_attention_backend}")
+      ',"attention_backend":"%s"' "${draft_attention_backend}")
   fi
   dspark_depth_mode=${DSPARK_DEPTH_MODE:-fixed}
   case "${dspark_depth_mode}" in

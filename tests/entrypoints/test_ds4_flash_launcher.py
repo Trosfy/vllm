@@ -66,6 +66,23 @@ def test_ds4_launcher_dynamic_depth_enables_capacity_mode(tmp_path: Path) -> Non
     assert 'dspark_sps_curve\\":\\"auto' in output
 
 
+def test_ds4_launcher_uses_speculative_attention_backend_field(
+    tmp_path: Path,
+) -> None:
+    """Verify the draft backend uses SpeculativeConfig's canonical field.
+
+    Args:
+        tmp_path: Temporary home and cache root.
+    """
+    output = _dry_run(
+        tmp_path,
+        DSPARK_DRAFT_ATTENTION_BACKEND="FLASHINFER_MLA_SPARSE_DSV4",
+    )
+
+    assert 'attention_backend\\":\\"FLASHINFER_MLA_SPARSE_DSV4' in output
+    assert 'draft_attention_backend\\"' not in output
+
+
 def test_ds4_launcher_accepts_cluster_style_aliases(tmp_path: Path) -> None:
     """Verify compatibility with cluster-style environment aliases.
 
