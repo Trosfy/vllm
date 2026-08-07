@@ -1641,7 +1641,11 @@ def get_kv_cache_config_from_groups(
                     page_size = spec.page_size_bytes
                 tensor_size = page_size * pool_blocks
                 private_tensors.append(
-                    KVCacheTensor(size=tensor_size, shared_by=[layer_name])
+                    KVCacheTensor(
+                        size=tensor_size,
+                        shared_by=[layer_name],
+                        private_pool=True,
+                    )
                 )
                 available_memory -= tensor_size
             logger.info_once(
@@ -2619,8 +2623,11 @@ def get_kv_cache_configs(
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
+        # Shrink tensor size proportionally. Private-pool tensors are sized
+        # by their own group's pool, not by num_blocks, so they are exempt.
         for tensor in kv_cache_config.kv_cache_tensors:
+            if tensor.private_pool:
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

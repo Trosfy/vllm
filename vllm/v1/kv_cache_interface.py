@@ -1121,6 +1121,9 @@ class KVCacheTensor:
     shared_by: list[str]  # layer names that share the same KV cache tensor
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    # Sized by a group's private pool rather than KVCacheConfig.num_blocks, so
+    # cross-rank num_blocks equalization must leave it alone.
+    private_pool: bool = False
 
 
 @dataclass
