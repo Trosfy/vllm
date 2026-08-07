@@ -175,8 +175,11 @@ case "${KIMI_TARGET_MXFP8_PROFILE:-none}" in
   kda_in_proj)
     TARGET_QUANT_ARGS+=(--quantization-config '{"linear":"mxfp8","ignore":["re:^(?!.*self_attn\\.(?:q_proj|k_proj|v_proj|b_proj|f_a_proj)$).*$"]}')
     ;;
+  shared_experts)
+    TARGET_QUANT_ARGS+=(--quantization-config '{"linear":"mxfp8","shared_experts":"mxfp8","ignore":["re:^(?!.*shared_experts).*$"]}')
+    ;;
   *)
-    echo "KIMI_TARGET_MXFP8_PROFILE must be none or kda_in_proj" >&2
+    echo "KIMI_TARGET_MXFP8_PROFILE must be none, kda_in_proj or shared_experts" >&2
     exit 2
     ;;
 esac
