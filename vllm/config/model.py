@@ -1056,7 +1056,7 @@ class ModelConfig:
                 "moe_wna16",
                 # Must precede modelopt_fp4: hybrid checkpoints are
                 # modelopt-tagged NVFP4 plus a hybrid_bit_map.
-                "nvfp4_nf3_hybrid",
+                "kquant_hybrid",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",

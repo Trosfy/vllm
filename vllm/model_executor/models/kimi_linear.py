@@ -655,6 +655,12 @@ class KimiRoutedOutputTransform(nn.Module):
             _KIMI_CORRECTNESS_TRACE.capture(
                 self.layer_idx, "routed_latent_reduced", hidden_states
             )
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                collect_kquant_routed_latent,
+            )
+
+            collect_kquant_routed_latent(self.layer_idx, hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         if self._trace_enabled:
@@ -1313,19 +1319,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 continue
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
-            # kquant gives NF3 payloads distinct suffixes so they can coexist
-            # with untouched MXFP4 experts in one checkpoint. Normalize only
-            # the logical loader name; ``loaded_weight`` already contains the
-            # tensor read under the original safetensors key.
-            if name.endswith(".nf3_packed"):
-                name = name.removesuffix(".nf3_packed") + ".weight_packed"
-            elif name.endswith(".nf3_scale"):
-                name = name.removesuffix(".nf3_scale") + ".weight_scale"
-            elif name.endswith(".nf3_refit_packed"):
-                name = name.removesuffix(".nf3_refit_packed") + ".weight_packed"
-            elif name.endswith(".nf3_refit_scale"):
-                name = name.removesuffix(".nf3_refit_scale") + ".weight_scale"
-
             # Fast path for per-expert tensors: at K3 scale (896 experts x 92
             # layers x 3 matrices, ~500k tensors) the linear scan over the
             # expert mapping list is O(experts) substring checks per tensor

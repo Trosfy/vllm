@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Graph-safe Kimi-K3 MoE calibration capture.
 
-The online half of the kquant calibration pipeline deliberately collects from
-the official MXFP4 checkpoint running the ordinary B12X W4A16 MoE kernel.  In
-that path ``intermediate_cache2`` is the canonical, route-indexed post-SiTU
-activation consumed by w2.  The sidecar kernels accumulate into stable device
-buffers, so the same calls can be captured and replayed by CUDA graphs.
+The online half of the kquant calibration pipeline collects the activation
+distribution from the interim hybrid EXL3 checkpoint.  Kept MXFP4 routes expose
+their canonical post-SiTU input directly.  EXL3 routes expose the rotated input
+to the down trellis; a capture-only inverse H128 plus expert-local unscale
+restores the same canonical pre-w2 coordinates before collection.  The sidecar
+kernels accumulate into stable device buffers, so the calls can be captured and
+replayed by CUDA graphs.
 
 Persistence happens after a model step, outside graph replay.  Captures are TP
 rank-sharded: routing is written by rank zero, input moments are expert-sharded,
@@ -33,10 +35,11 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MODEL = "moonshotai/Kimi-K3"
 _REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 _NUM_DECODER_LAYERS = 93
@@ -49,6 +52,61 @@ _TOP_K = 16
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 _state: _KQuantCaptureState | None = None
+
+
+def _capture_routed_latent_impl(
+    source: torch.Tensor,
+    sample_slots: torch.Tensor,
+    sample_values: torch.Tensor,
+    sample_ready: torch.Tensor,
+    layer_row: int,
+) -> None:
+    from sparkinfer.moe.calibration import collect_paired_token_rows
+
+    collect_paired_token_rows(
+        source,
+        sample_slots,
+        sample_values[layer_row],
+        sample_ready[layer_row],
+    )
+
+
+def _capture_routed_latent_fake(
+    source: torch.Tensor,
+    sample_slots: torch.Tensor,
+    sample_values: torch.Tensor,
+    sample_ready: torch.Tensor,
+    layer_row: int,
+) -> None:
+    del source, sample_slots, sample_values, sample_ready, layer_row
+
+
+direct_register_custom_op(
+    op_name="kquant_capture_routed_latent",
+    op_func=_capture_routed_latent_impl,
+    mutates_args=["sample_values", "sample_ready"],
+    fake_impl=_capture_routed_latent_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _inverse_hadamard_128_impl(source: torch.Tensor, output: torch.Tensor) -> None:
+    import exllamav3_ext
+
+    exllamav3_ext.had_r_128(source, output, None, None, 1.0)
+
+
+def _inverse_hadamard_128_fake(source: torch.Tensor, output: torch.Tensor) -> None:
+    del source, output
+
+
+direct_register_custom_op(
+    op_name="kquant_inverse_hadamard_128",
+    op_func=_inverse_hadamard_128_impl,
+    mutates_args=["output"],
+    fake_impl=_inverse_hadamard_128_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -159,6 +217,9 @@ class _KQuantCaptureState:
         self.mid_hessian_sample_rate = _env_int(
             "VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE", 8192
         )
+        self.validation_modulus = _env_int("VLLM_KQUANT_VALIDATION_MODULUS", 16)
+        if self.validation_modulus < 2:
+            raise ValueError("VLLM_KQUANT_VALIDATION_MODULUS must be at least 2")
         self.sample_capacity = _env_int("VLLM_KQUANT_SAMPLE_CAPACITY", 64)
         self.stats_save_every = _env_int("VLLM_KQUANT_STATS_SAVE_EVERY", 128)
         self.sample_save_every = _env_int("VLLM_KQUANT_SAMPLE_SAVE_EVERY", 32)
@@ -227,6 +288,21 @@ class _KQuantCaptureState:
         self.input_sample_observation = zeros(
             _NUM_MOE_LAYERS, input_capacity, dtype=torch.int64
         )
+        self.input_sample_experts = zeros(
+            _NUM_MOE_LAYERS, input_capacity, _TOP_K, dtype=torch.int32
+        )
+        self.input_sample_gates = zeros(
+            _NUM_MOE_LAYERS, input_capacity, _TOP_K, dtype=torch.float32
+        )
+        self.input_sample_split = zeros(
+            _NUM_MOE_LAYERS, input_capacity, dtype=torch.int8
+        )
+        self.input_sample_routed_latent = zeros(
+            _NUM_MOE_LAYERS, input_capacity, _INPUT_SIZE, dtype=torch.bfloat16
+        )
+        self.input_sample_latent_ready = zeros(
+            _NUM_MOE_LAYERS, input_capacity, dtype=torch.int8
+        )
         self.mid_sample_cursor = zeros(_NUM_MOE_LAYERS, dtype=torch.int64)
         self.mid_sample_dropped = zeros(_NUM_MOE_LAYERS, dtype=torch.int64)
         self.mid_sample_values = zeros(
@@ -243,6 +319,9 @@ class _KQuantCaptureState:
         )
         self.mid_sample_expert = zeros(
             _NUM_MOE_LAYERS, self.sample_capacity, dtype=torch.int32
+        )
+        self.mid_sample_split = zeros(
+            _NUM_MOE_LAYERS, self.sample_capacity, dtype=torch.int8
         )
 
         # These route-sized work buffers are reused sequentially by every layer.
@@ -269,7 +348,8 @@ class _KQuantCaptureState:
             "complete": self.finalized,
             "executed_tokens": executed_tokens,
             "corpus": os.getenv("VLLM_KQUANT_CORPUS"),
-            "source": "official_mxfp4_normal_w4a16",
+            "source": os.getenv("VLLM_KQUANT_SOURCE", "official_mxfp4_normal_w4a16"),
+            "teacher_checkpoint": os.getenv("VLLM_KQUANT_TEACHER_CHECKPOINT"),
             "geometry": {
                 "num_layers": _NUM_MOE_LAYERS,
                 "num_experts": _NUM_EXPERTS,
@@ -281,9 +361,24 @@ class _KQuantCaptureState:
                 "activation_moments": self.moment_sample_rate,
                 "input_hessian": self.input_hessian_sample_rate,
                 "mid_hessian_routes": self.mid_hessian_sample_rate,
+                "validation_modulus": self.validation_modulus,
+                "validation_fold": 0,
+                "split_hash": "splitmix64(token_observation xor 0x6a09e667f3bcc909)",
+                "split_labels": {"0": "train", "1": "validation"},
                 "ring_capacity_per_layer": self.sample_capacity,
                 "sample_save_every_steps": self.sample_save_every,
                 "sample_flush_bytes": self.sample_flush_bytes,
+            },
+            "raw_input_contract": {
+                "routes": "post-router top-k expert IDs",
+                "gates": "applied FP32 combine weights",
+                "routed_latent": "post-TP-all-reduce, pre-RMSNorm",
+                "pairing": "input, routes, gates, split, and routed_latent share rows",
+            },
+            "mid_contract": {
+                "coordinates": "canonical post-SiTU, pre-w2",
+                "kept_mxfp4": "ordinary W4A16 route-major cache2",
+                "exl3": "inverse H128(rotated cache2) / down_suh",
             },
         }
 
@@ -382,6 +477,9 @@ class _KQuantCaptureState:
             sample_values=self.input_sample_values[row, :input_capacity],
             sample_weight=self.input_sample_weight[row, :input_capacity],
             sample_observation=self.input_sample_observation[row, :input_capacity],
+            sample_experts=self.input_sample_experts[row, :input_capacity],
+            sample_gates=self.input_sample_gates[row, :input_capacity],
+            sample_split=self.input_sample_split[row, :input_capacity],
         )
         collect_route_input(
             x,
@@ -394,7 +492,39 @@ class _KQuantCaptureState:
             expert_end=self.input_expert_end,
             moment_sample_rate=self.moment_sample_rate,
             hessian_sample_rate=self.input_hessian_sample_rate,
+            validation_modulus=self.validation_modulus,
             collect_routing=self.rank == 0,
+        )
+
+    def collect_routed_latent(
+        self,
+        decoder_layer: int,
+        values: torch.Tensor,
+    ) -> None:
+        if self.rank != 0:
+            return
+        row = int(decoder_layer) - _FIRST_MOE_LAYER
+        if not 0 <= row < _NUM_MOE_LAYERS or row not in self.prefixes:
+            raise RuntimeError(
+                f"KQuant routed-latent capture received unregistered layer "
+                f"{decoder_layer}"
+            )
+        if values.ndim != 2 or int(values.shape[1]) != _INPUT_SIZE:
+            raise RuntimeError(
+                "KQuant routed-latent capture expected "
+                f"[tokens, {_INPUT_SIZE}], got {tuple(values.shape)}"
+            )
+        if int(values.shape[0]) > self.max_tokens or not values.is_contiguous():
+            raise RuntimeError(
+                "KQuant routed-latent capture requires a contiguous tensor within "
+                "the configured token capacity"
+            )
+        torch.ops.vllm.kquant_capture_routed_latent(
+            values,
+            self.input_sample_slots,
+            self.input_sample_routed_latent,
+            self.input_sample_latent_ready,
+            row,
         )
 
     def collect_mid(
@@ -403,6 +533,8 @@ class _KQuantCaptureState:
         source: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        expert_map: torch.Tensor | None = None,
     ) -> None:
         from sparkinfer.moe.calibration import MidBuffers, collect_mid
 
@@ -422,12 +554,13 @@ class _KQuantCaptureState:
             sample_weight=self.mid_sample_weight[row],
             sample_observation=self.mid_sample_observation[row],
             sample_expert=self.mid_sample_expert[row],
+            sample_split=self.mid_sample_split[row],
         )
         collect_mid(
             source,
             topk_weights,
             topk_ids,
-            None,
+            expert_map,
             padding,
             buffers,
             num_experts=_NUM_EXPERTS,
@@ -435,6 +568,7 @@ class _KQuantCaptureState:
             source_stride=self.local_intermediate_size,
             moment_sample_rate=self.moment_sample_rate,
             hessian_sample_rate=self.mid_hessian_sample_rate,
+            validation_modulus=self.validation_modulus,
         )
 
     def _copy_samples(self) -> dict[str, torch.Tensor]:
@@ -442,6 +576,7 @@ class _KQuantCaptureState:
         mid_cursors = self.mid_sample_cursor.detach().cpu()
         input_dropped = self.input_sample_dropped.detach().cpu()
         mid_dropped = self.mid_sample_dropped.detach().cpu()
+        input_latent_ready = self.input_sample_latent_ready.detach().cpu()
         self.input_dropped_total += int(input_dropped.sum().item())
         self.mid_dropped_total += int(mid_dropped.sum().item())
 
@@ -449,17 +584,27 @@ class _KQuantCaptureState:
             "input.values": [],
             "input.weight": [],
             "input.observation": [],
+            "input.experts": [],
+            "input.gates": [],
+            "input.split": [],
+            "input.routed_latent": [],
             "input.layer": [],
             "mid.values": [],
             "mid.weight": [],
             "mid.observation": [],
             "mid.expert": [],
+            "mid.split": [],
             "mid.layer": [],
         }
         input_capacity = int(self.input_sample_values.shape[1])
         for row in self.prefixes:
             ni = min(int(input_cursors[row]), input_capacity)
             if ni:
+                if not torch.all(input_latent_ready[row, :ni] == 1):
+                    raise RuntimeError(
+                        f"KQuant layer {row + _FIRST_MOE_LAYER} has raw inputs "
+                        "without paired routed-latent targets"
+                    )
                 values["input.values"].append(
                     self.input_sample_values[row, :ni].detach().cpu()
                 )
@@ -468,6 +613,18 @@ class _KQuantCaptureState:
                 )
                 values["input.observation"].append(
                     self.input_sample_observation[row, :ni].detach().cpu()
+                )
+                values["input.experts"].append(
+                    self.input_sample_experts[row, :ni].detach().cpu()
+                )
+                values["input.gates"].append(
+                    self.input_sample_gates[row, :ni].detach().cpu()
+                )
+                values["input.split"].append(
+                    self.input_sample_split[row, :ni].detach().cpu()
+                )
+                values["input.routed_latent"].append(
+                    self.input_sample_routed_latent[row, :ni].detach().cpu()
                 )
                 values["input.layer"].append(torch.full((ni,), row, dtype=torch.int16))
             nm = min(int(mid_cursors[row]), self.sample_capacity)
@@ -484,10 +641,14 @@ class _KQuantCaptureState:
                 values["mid.expert"].append(
                     self.mid_sample_expert[row, :nm].detach().cpu()
                 )
+                values["mid.split"].append(
+                    self.mid_sample_split[row, :nm].detach().cpu()
+                )
                 values["mid.layer"].append(torch.full((nm,), row, dtype=torch.int16))
 
         self.input_sample_cursor.zero_()
         self.mid_sample_cursor.zero_()
+        self.input_sample_latent_ready.zero_()
         self.input_sample_dropped.zero_()
         self.mid_sample_dropped.zero_()
         return {key: torch.cat(parts) for key, parts in values.items() if parts}
@@ -541,7 +702,8 @@ class _KQuantCaptureState:
             self.armed = True
             logger.info(
                 "Armed KQuant K3 capture on TP rank %d/%d at %s; the warmup "
-                "request was intentionally excluded.",
+                "profile was intentionally excluded and the first ordinary API "
+                "request will be captured.",
                 self.rank,
                 self.world_size,
                 self.root,
@@ -597,7 +759,7 @@ def register_kquant_capture_layer(
     topk: int,
     quant_mode: str,
 ) -> None:
-    """Register one official-MXFP4 W4A16 K3 MoE before graph capture."""
+    """Register one K3 MoE layer before graph capture."""
 
     if not kquant_capture_enabled():
         return
@@ -606,10 +768,10 @@ def register_kquant_capture_layer(
             "VLLM_KQUANT_CAPTURE_DIR is currently a strict Kimi-K3 collector; "
             f"got hidden/experts/top-k={hidden_size}/{num_experts}/{topk}"
         )
-    if quant_mode != "w4a16":
+    if quant_mode not in ("w4a16", "hybrid_exl3_3"):
         raise RuntimeError(
-            "KQuant reference capture must use the normal W4A16 MoE kernel; "
-            "set B12X_MOE_FORCE_A16=1 and use the official MXFP4 checkpoint"
+            "KQuant reference capture requires ordinary W4A16 or the interim "
+            f"EXL3 hybrid path, got {quant_mode!r}"
         )
     if os.getenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1") != "0":
         raise RuntimeError(
@@ -679,12 +841,101 @@ def collect_kquant_mid(
             "KQuant K3 weighting assumes router weights are applied after w2; "
             "the binding applies them on the expert input"
         )
-    if binding.route_expert_map is not None:
-        raise RuntimeError("KQuant reference capture does not support expert maps/EP")
     source = binding.intermediate_cache2
     if source is None:
         raise RuntimeError("B12X W4A16 binding did not expose intermediate_cache2")
-    _state.collect_mid(prefix, source, topk_weights, topk_ids)
+    _state.collect_mid(
+        prefix,
+        source,
+        topk_weights,
+        topk_ids,
+        expert_map=binding.route_expert_map,
+    )
+
+
+def restore_kquant_exl3_mid(
+    *,
+    binding: Any,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    logical_scratch: torch.Tensor,
+) -> torch.Tensor:
+    """Restore live EXL3 cache2 to its logical pre-w2 coordinates."""
+
+    if binding.implementation != "w4a16" or binding.quant_mode != "w4a16":
+        raise RuntimeError("EXL3 logical-mid restore requires a W4A16 binding")
+    if binding.apply_router_weight_on_input:
+        raise RuntimeError("EXL3 logical-mid restore requires post-w2 router weights")
+    source = binding.intermediate_cache2
+    if source is None:
+        raise RuntimeError("EXL3 W4A16 binding did not expose intermediate_cache2")
+    rows = int(topk_ids.numel())
+    width = int(logical_scratch.shape[-1])
+    elements = rows * width
+    if source.numel() < elements or logical_scratch.numel() < elements:
+        raise RuntimeError("EXL3 logical-mid scratch is smaller than live routes")
+    rotated = source.view(-1)[:elements].view(rows, width)
+    logical = logical_scratch.view(-1)[:elements].view(rows, width)
+    torch.ops.vllm.kquant_inverse_hadamard_128(rotated, logical)
+
+    from sparkinfer.moe.calibration import unscale_route_rows_
+
+    unscale_route_rows_(
+        logical,
+        topk_ids,
+        expert_map,
+        intermediate_rotations,
+        num_experts=_NUM_EXPERTS,
+        scale_stride=3 * width,
+        # B12X's bundle is [gate_svh, up_svh, down_suh].  Cache2 is
+        # H128(h * down_suh), so canonicalization divides by the final block.
+        scale_offset=2 * width,
+    )
+    return logical
+
+
+def collect_kquant_exl3_mid(
+    *,
+    prefix: str,
+    binding: Any,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    logical_scratch: torch.Tensor,
+) -> None:
+    """Restore EXL3 cache2 to canonical pre-w2 coordinates and collect it."""
+
+    if not kquant_capture_enabled():
+        return
+    if _state is None:
+        raise RuntimeError("KQuant EXL3 mid capture ran before layer registration")
+    logical = restore_kquant_exl3_mid(
+        binding=binding,
+        topk_ids=topk_ids,
+        expert_map=expert_map,
+        intermediate_rotations=intermediate_rotations,
+        logical_scratch=logical_scratch,
+    )
+    _state.collect_mid(
+        prefix,
+        logical,
+        topk_weights,
+        topk_ids,
+        expert_map=expert_map,
+    )
+
+
+def collect_kquant_routed_latent(
+    layer_idx: int,
+    values: torch.Tensor,
+) -> None:
+    if not kquant_capture_enabled():
+        return
+    if _state is None:
+        raise RuntimeError("KQuant latent capture ran before B12X layer registration")
+    _state.collect_routed_latent(layer_idx, values)
 
 
 def maybe_flush_kquant_capture() -> None:
@@ -699,6 +950,9 @@ def _reset_kquant_capture_for_tests() -> None:
 
 __all__ = [
     "collect_kquant_mid",
+    "collect_kquant_exl3_mid",
+    "restore_kquant_exl3_mid",
+    "collect_kquant_routed_latent",
     "collect_kquant_route_input",
     "kquant_capture_enabled",
     "maybe_flush_kquant_capture",

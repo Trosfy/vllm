@@ -103,8 +103,8 @@ def _log_device_tensor_census(model: nn.Module, tag: str) -> None:
     """K3-DIAG: log where device memory sits, grouped by param leaf name/dtype."""
     import collections
 
-    alloc = torch.cuda.memory_allocated() / 2**30
-    reserved = torch.cuda.memory_reserved() / 2**30
+    alloc = torch.accelerator.memory_allocated() / 2**30
+    reserved = torch.accelerator.memory_reserved() / 2**30
     by_kind: collections.Counter = collections.Counter()
     seen: set[int] = set()
     for name, tensor in itertools.chain(
@@ -121,7 +121,11 @@ def _log_device_tensor_census(model: nn.Module, tag: str) -> None:
     logger.info(
         "K3-DIAG[%s] cuda_alloc=%.2f reserved=%.2f named_tensor_total=%.2f GiB "
         "(untracked=%.2f)",
-        tag, alloc, reserved, total, alloc - total,
+        tag,
+        alloc,
+        reserved,
+        total,
+        alloc - total,
     )
     for key, nbytes in by_kind.most_common(20):
         if nbytes < 50 * 2**20:
@@ -139,7 +143,7 @@ def process_weights_after_loading(
     modules = list(model.named_modules())
     modules.sort(
         key=lambda nm: type(getattr(nm[1], "quant_method", None)).__name__
-        == "NvFp4Nf3HybridMoEMethod"
+        == "KQuantHybridMoEMethod"
     )
     for _, module in modules:
         quant_method = getattr(module, "quant_method", None)
@@ -197,8 +201,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
             if getattr(p, "_vllm_keep_on_cpu", False):
-                # Deliberately CPU-staged (e.g. streamed NF3 repack at
-                # near-capacity VRAM); the quant method streams it itself.
+                # Deliberately CPU-staged; the quant method streams it itself.
                 continue
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)

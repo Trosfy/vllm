@@ -60,6 +60,7 @@ export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
 
 # Native dense K3 MLA decode on SM120. Override with TRITON_MLA for an A/B run.
 K3_ATTENTION_BACKEND="${K3_ATTENTION_BACKEND:-B12X_MLA}"
+K3_MODEL_DIR="${K3_MODEL_DIR:-/models/Kimi-K3-EXL3-3p09-serve}"
 
 # Opt-in Kimi K3 DSpark drafting. The target uses InstantTensor while the
 # smaller draft uses fastsafetensors.
@@ -95,6 +96,61 @@ case "${K3_DSPARK,,}" in
     exit 1
     ;;
 esac
+
+# Opt-in route-aware calibration from the resident interim EXL3 model. The
+# official MXFP4 checkpoint remains the offline encoder's weight source; it is
+# intentionally not loaded by this TP12 capture process.
+K3_KQUANT_CAPTURE_DIR="${K3_KQUANT_CAPTURE_DIR:-}"
+K3_KQUANT_ARGS=(--enable-prefix-caching)
+K3_COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+if [[ -n "${K3_KQUANT_CAPTURE_DIR}" ]]; then
+  if ((${#K3_DSPARK_ARGS[@]})); then
+    echo "ERROR: KQuant calibration does not support a draft model" >&2
+    exit 1
+  fi
+  export SPARKINFER_W4A16_SMALL_M_DIRECT=0
+  export VLLM_KQUANT_CAPTURE_DIR="${K3_KQUANT_CAPTURE_DIR}"
+  export VLLM_KQUANT_CAPTURE_RUN_ID="${VLLM_KQUANT_CAPTURE_RUN_ID:-$(basename -- "${K3_KQUANT_CAPTURE_DIR}")-$(date +%Y%m%d-%H%M%S)}"
+  export VLLM_KQUANT_CORPUS="${K3_KQUANT_CORPUS:-unspecified}"
+  export VLLM_KQUANT_SOURCE="interim_exl3_3p09_hybrid"
+  export VLLM_KQUANT_TEACHER_CHECKPOINT="${K3_MODEL_DIR}"
+  export VLLM_KQUANT_MOMENT_SAMPLE_RATE="${VLLM_KQUANT_MOMENT_SAMPLE_RATE:-16}"
+  export VLLM_KQUANT_INPUT_HESSIAN_SAMPLE_RATE="${VLLM_KQUANT_INPUT_HESSIAN_SAMPLE_RATE:-512}"
+  export VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE="${VLLM_KQUANT_MID_HESSIAN_SAMPLE_RATE:-8192}"
+  export VLLM_KQUANT_VALIDATION_MODULUS="${VLLM_KQUANT_VALIDATION_MODULUS:-16}"
+  export VLLM_KQUANT_SAMPLE_CAPACITY="${VLLM_KQUANT_SAMPLE_CAPACITY:-64}"
+  export VLLM_KQUANT_SAMPLE_SAVE_EVERY="${VLLM_KQUANT_SAMPLE_SAVE_EVERY:-32}"
+  export VLLM_KQUANT_SAMPLE_FLUSH_BYTES="${VLLM_KQUANT_SAMPLE_FLUSH_BYTES:-268435456}"
+  export VLLM_KQUANT_STATS_SAVE_EVERY="${VLLM_KQUANT_STATS_SAVE_EVERY:-128}"
+  export VLLM_KQUANT_FINALIZE_FILE="${VLLM_KQUANT_FINALIZE_FILE:-${K3_KQUANT_CAPTURE_DIR}.finalize}"
+  K3_KQUANT_ARGS=(--no-enable-prefix-caching)
+  # Keep CUDA graph replay but avoid placing capture-only extension launches
+  # behind Dynamo during calibration.
+  K3_COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1]}'
+  echo "KQuant calibration enabled: ${K3_KQUANT_CAPTURE_DIR} (run ${VLLM_KQUANT_CAPTURE_RUN_ID})" >&2
+  echo "Finalize with: touch ${VLLM_KQUANT_FINALIZE_FILE}; then send one final request" >&2
+fi
+
+# Opt-in full-vocabulary prefill-logit capture for the pinned KLD quality
+# suite. This is mutually exclusive with calibration and speculative decode,
+# uses small prefill chunks, and leaves the capture hook inactive in every
+# ordinary serving process.
+K3_KLD_CAPTURE_DIR="${K3_KLD_CAPTURE_DIR:-}"
+if [[ -n "${K3_KLD_CAPTURE_DIR}" ]]; then
+  if [[ -n "${K3_KQUANT_CAPTURE_DIR}" ]]; then
+    echo "ERROR: KLD capture and KQuant calibration are mutually exclusive" >&2
+    exit 1
+  fi
+  if ((${#K3_DSPARK_ARGS[@]})); then
+    echo "ERROR: KLD capture does not support a draft model" >&2
+    exit 1
+  fi
+  export VLLM_KLD_CAPTURE_DIR="${K3_KLD_CAPTURE_DIR}"
+  K3_KQUANT_ARGS=(--no-enable-prefix-caching)
+  K3_COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1]}'
+  K3_MAX_NUM_BATCHED_TOKENS="${K3_MAX_NUM_BATCHED_TOKENS:-256}"
+  echo "KLD prompt-logit capture enabled: ${K3_KLD_CAPTURE_DIR}" >&2
+fi
 
 K3_PROFILE="${K3_PROFILE:-0}"
 K3_PROFILER_ARGS=()
@@ -172,7 +228,7 @@ esac
 # RTX PRO 6000; 0.9711 preserves the effective KV budget of the old 0.9700
 # setting while still accounting for captured graphs.
 exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
-  "${K3_MODEL_DIR:-/models/Kimi-K3-EXL3-3p09-serve}" \
+  "${K3_MODEL_DIR}" \
   --served-model-name "${K3_SERVED_MODEL_NAME:-kimi-k3-exl3}" \
   --trust-remote-code \
   --host "${K3_HOST:-0.0.0.0}" \
@@ -181,8 +237,8 @@ exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --load-format instanttensor \
   --linear-backend b12x \
   --attention-backend "${K3_ATTENTION_BACKEND}" \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --enable-prefix-caching \
+  --compilation-config "${K3_COMPILATION_CONFIG}" \
+  "${K3_KQUANT_ARGS[@]}" \
   --enable-auto-tool-choice \
   --tool-call-parser kimi_k3 \
   --reasoning-parser kimi_k3 \

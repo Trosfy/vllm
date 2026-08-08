@@ -129,12 +129,12 @@ def test_canonical_grouped_topk_uses_bias_only_for_selection() -> None:
             ),
         ),
         (
-            "model.layers.91.block_sparse_moe.experts.895.w3.nf3_scale",
+            "model.layers.91.block_sparse_moe.experts.895.w3.weight_scale",
             (
                 "model.layers.91.block_sparse_moe.experts",
                 "895",
                 "w3",
-                "nf3_scale",
+                "weight_scale",
             ),
         ),
     ],
