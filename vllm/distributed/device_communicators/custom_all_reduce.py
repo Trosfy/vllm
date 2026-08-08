@@ -80,8 +80,30 @@ def _parse_byte_size(value: str) -> int:
     return int(value)
 
 
-def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
-    allreduce_max_size = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+def _b12x_pcie_allreduce_default_max_size(world_size: int) -> str:
+    """Ask b12x how large an all-reduce it expects to win at, for this world.
+
+    The 84KB default predates the TP16 equal-quarter runtime, which stays ahead
+    of NCCL well past it; hard-coding a single number here would keep that
+    unreachable on every world size at once. An explicit environment setting
+    always wins, so the previous behaviour remains one variable away.
+    """
+
+    configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
+    if configured is not None:
+        return configured
+    try:
+        from b12x.comm.pcie.pcie_allreduce import recommended_max_bytes
+    except Exception:
+        return envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE
+    default = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    return str(recommended_max_bytes(world_size, default=default))
+
+
+def _b12x_pcie_oneshot_limits(world_size: int) -> tuple[int, int, int]:
+    allreduce_max_size = _parse_byte_size(
+        _b12x_pcie_allreduce_default_max_size(world_size)
+    )
     fused_max_size = _parse_byte_size(
         envs.VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
     )
@@ -502,7 +524,7 @@ class CustomAllreduce:
                 self._pcie_allreduce_max_size,
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
-            ) = _b12x_pcie_oneshot_limits()
+            ) = _b12x_pcie_oneshot_limits(world_size)
             self._pcie_composed_add_rms_norm_max_size = (
                 self._pcie_fused_add_rms_norm_max_size
             )
