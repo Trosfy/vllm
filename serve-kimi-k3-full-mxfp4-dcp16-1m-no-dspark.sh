@@ -95,13 +95,21 @@ export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 # the profile-specific override explicitly requests otherwise.
 export VLLM_PCIE_ALLREDUCE_BACKEND="${KIMI_NO_DSPARK_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_SINGLE_CHANNEL="${VLLM_PCIE_ONESHOT_SINGLE_CHANNEL:-1}"
-# The optional two-generation staging path is exact but was 1.2% slower in
-# full-model decode, so retain the single-generation serving default.
-export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
-# The mixed 32/16/32-grid TP16 harness is bit-exact through 48,000 collectives
-# and cuts the measured all-reduce sequence latency by 6.87%.  Keep the switch
-# independently overridable so serving A/B tests can select the legacy path.
-export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-1}"
+# Sync-mode default, re-measured 2026-08-09 on FULL cudagraphs: double-buffer
+# 55.663 vs deferred 54.531 vs plain 51.913 tok/s (no-spec decode, A/B/A'd,
+# healthy machine), DSpark target cycles/s neutral, all three modes bitwise
+# identical at M=1/2/4/8. The earlier "1.2% slower" double-buffer reading
+# predates FULL graphs, whose removal of the per-collective launch changed the
+# economics: deferred pays a separate 3.4us preamble kernel 3x per layer,
+# double-buffer needs neither that nor the in-kernel end-waits. Both knobs
+# stay env-overridable; the guard keeps an explicit DEFERRED=1 from colliding
+# with the double-buffer default (b12x rejects the 1+1 combination).
+export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-0}"
+if [[ "${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION}" == "1" ]]; then
+  export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
+else
+  export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-1}"
+fi
 # K3's 7168/32 and 3584/16 grids both contain exactly 224 BF16 values per
 # block.  The vectorized path processes 112 BF16 pairs with four warps,
 # preserves the scalar FP32 accumulation order, and is bit-exact in the TP16
