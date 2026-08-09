@@ -171,7 +171,8 @@ class FileSystemTierManager(SecondaryTierManager):
                     "emit events.",
                     tier_type,
                 )
-        # Keys of in-flight store jobs, tracked only when events are enabled.
+        # Keys of in-flight stores, used to refresh lookup state on success and
+        # to emit events when enabled.
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
 
         # Extract block size from primary view
@@ -235,8 +236,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
-        if self.events is not None:
-            self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+        self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         self._gc_protect(job_metadata)
         tasks = (
             functools.partial(
@@ -285,12 +285,13 @@ class FileSystemTierManager(SecondaryTierManager):
                 # the tokens are recomputed; leaving them cached as present
                 # would re-submit this same failing load on every step.
                 self._lookup_manager.invalidate(load_keys)
-            if self.events is not None:
-                keys = self._store_job_keys.pop(job_id, None)
-                if success and keys:
+            store_keys = self._store_job_keys.pop(job_id, None)
+            if success and store_keys:
+                self._lookup_manager.mark_present(store_keys)
+                if self.events is not None:
                     self.events.append(
                         OffloadingEvent(
-                            keys=keys,
+                            keys=store_keys,
                             medium=self.medium,
                             removed=False,
                             locality=self.locality,

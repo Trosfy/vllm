@@ -324,6 +324,34 @@ def test_failed_load_invalidates_cached_lookup(fs_tier):
     assert tier.lookup(key(1), _CTX) == LookupResult.MISS
 
 
+def test_successful_restore_revalidates_cached_lookup(fs_tier):
+    """A recomputed block must become visible before active requests finish.
+
+    Continuous overlapping requests can keep the shared lookup state alive, so
+    cleanup is not a sufficient way to recover from a failed load's cached
+    MISS. A successful store is the authoritative signal that the block exists
+    again.
+    """
+    tier, _ = fs_tier
+    block_key = key(1)
+    tier.submit_store(make_job(1, [block_key], [0]))
+    assert all(r.success for r in drain(tier))
+    assert lookup_and_wait(tier, [block_key]) == [LookupResult.HIT]
+
+    os.unlink(tier.file_mapper.get_file_name(block_key))
+    tier.submit_load(make_job(2, [block_key], [0], is_promotion=True))
+    assert not drain(tier)[0].success
+    assert tier.lookup(block_key, _CTX) == LookupResult.MISS
+
+    overlapping_ctx = ReqContext(req_id="overlapping-request")
+    assert tier.lookup(block_key, overlapping_ctx) == LookupResult.MISS
+
+    tier.submit_store(make_job(3, [block_key], [0]))
+    assert all(r.success for r in drain(tier))
+    assert tier.lookup(block_key, _CTX) == LookupResult.HIT
+    assert tier.lookup(block_key, overlapping_ctx) == LookupResult.HIT
+
+
 def test_successful_load_keeps_cached_lookup(fs_tier):
     """The invalidation above must be scoped to failures."""
     tier, _ = fs_tier

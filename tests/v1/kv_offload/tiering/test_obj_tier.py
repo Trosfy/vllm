@@ -465,6 +465,30 @@ class TestMockObjTierFailures:
 
         assert tier.lookup(key(1), _CTX) == LookupResult.MISS
 
+    def test_successful_restore_revalidates_cached_lookup(self):
+        """A successful rewrite supersedes a failed load's cached MISS."""
+        tier, agent = _make_tier(num_blocks=4)
+        block_key = key(1)
+        tier.submit_store(make_job(1, [block_key], [0]))
+        assert all(r.success for r in drain(tier))
+        assert lookup_and_wait(tier, [block_key]) == [LookupResult.HIT]
+
+        agent._stored_obj_keys.clear()
+        original_check_xfer_state = agent.check_xfer_state
+        agent.check_xfer_state = lambda h: "ERR"
+        tier.submit_load(make_job(2, [block_key], [0]))
+        assert not drain(tier)[0].success
+        assert tier.lookup(block_key, _CTX) == LookupResult.MISS
+
+        overlapping_ctx = ReqContext(req_id="overlapping-request")
+        assert tier.lookup(block_key, overlapping_ctx) == LookupResult.MISS
+
+        agent.check_xfer_state = original_check_xfer_state
+        tier.submit_store(make_job(3, [block_key], [0]))
+        assert all(r.success for r in drain(tier))
+        assert tier.lookup(block_key, _CTX) == LookupResult.HIT
+        assert tier.lookup(block_key, overlapping_ctx) == LookupResult.HIT
+
     def test_submission_time_load_failure_invalidates_cached_lookup(self):
         """Loads that die before the transfer starts must invalidate too;
         re-submitting them against the same cached hit is the same livelock."""
