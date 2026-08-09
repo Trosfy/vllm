@@ -138,7 +138,12 @@ export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKS
 export VLLM_MEMORY_PROFILE_INCLUDE_ATTN="${VLLM_MEMORY_PROFILE_INCLUDE_ATTN:-0}"
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
 if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
-  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1],"pass_config":{"fuse_allreduce_rms":true}}'
+  # FULL decode graphs are worth +3.8% here (52.558 -> 54.536 tok/s, no-spec
+  # DCP16 1M, prefill TTFT unchanged) and need the DCP a2a capture-scope fix to
+  # capture at all -- without it startup fails with "PCIe DCP A2A channels are
+  # stream-affine".  The DSpark launcher has requested FULL_AND_PIECEWISE for a
+  # while; this brings the no-speculation profile in line.
+  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1],"pass_config":{"fuse_allreduce_rms":true}}'
 fi
 
 "${PYTHON_BIN}" - <<'PY'
