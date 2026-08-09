@@ -97,7 +97,17 @@ def _b12x_pcie_allreduce_default_max_size(world_size: int) -> str:
     except Exception:
         return envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE
     default = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
-    return str(recommended_max_bytes(world_size, default=default))
+    resolved = recommended_max_bytes(world_size, default=default)
+    if resolved != default:
+        # b12x loggers are not configured by vLLM, so this is the only place the
+        # operator can see that the wider band is in play.
+        logger.info(
+            "b12x raised the PCIe all-reduce limit for TP%d from %d to %d bytes.",
+            world_size,
+            default,
+            resolved,
+        )
+    return str(resolved)
 
 
 def _b12x_pcie_oneshot_limits(world_size: int) -> tuple[int, int, int]:
