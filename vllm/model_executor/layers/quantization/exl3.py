@@ -63,6 +63,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 )
 from vllm.model_executor.layers.quantization.exl3_online_cache import (
     Exl3OnlineCacheKey,
+    Exl3OnlineNonFiniteError,
     cache_mode,
     load_or_quantize,
     resolve_encoder_identity,
@@ -120,6 +121,17 @@ _GLM52_MIXED_TRELLIS_BLOCK32_SIGNATURES = frozenset(
 )
 
 
+def _is_glm52_block32_tier_signature(
+    tier_signature: tuple[tuple[int, int], ...],
+) -> bool:
+    if tier_signature in _GLM52_MIXED_TRELLIS_BLOCK32_SIGNATURES:
+        return True
+    # Three-tier K3/K4/K5 uses a wider cooperative kernel. The block-64
+    # geometry needs 109,568 B of shared memory and cannot launch on SM120;
+    # block-32 is the qualified native geometry for every projection split.
+    return tuple(bits for bits, _ in tier_signature) == (3, 4, 5)
+
+
 def _resolve_mixed_trellis_prefill_block_m(
     *,
     configured_block_m: int,
@@ -145,7 +157,7 @@ def _resolve_mixed_trellis_prefill_block_m(
         and int(device_major) == 12
         and int(hidden_size) == 6144
         and int(intermediate_size) == 512
-        and tier_signature in _GLM52_MIXED_TRELLIS_BLOCK32_SIGNATURES
+        and _is_glm52_block32_tier_signature(tier_signature)
         and int(topk) == 8
         and tuple(int(value) for value in prefill_tile_config) == (128, 128, 32, 512)
     )
@@ -185,6 +197,32 @@ def _online_trellis_bits() -> int | None:
 
 def _online_trellis_shape_supported(input_size: int, output_size: int) -> bool:
     return input_size % _HADAMARD_BLOCK == 0 and output_size % _HADAMARD_BLOCK == 0
+
+
+def _load_online_encoding_with_retry(
+    cache_key: Exl3OnlineCacheKey,
+    *,
+    device: torch.device,
+    quantize: Any,
+) -> Any:
+    """Load/encode one online payload, retrying one non-finite encode."""
+
+    try:
+        return load_or_quantize(cache_key, device=device, quantize=quantize)
+    except Exl3OnlineNonFiniteError:
+        # The fallback encoder uses large randomized GPU reductions. A
+        # transient non-finite result must never become a persistent model
+        # weight, but one clean retry distinguishes that event from a
+        # reproducible checkpoint/encoder defect. The cache layer has already
+        # rejected and removed the invalid payload.
+        logger.warning(
+            "Online EXL3 K%d produced non-finite data for %s on TP rank %d; "
+            "retrying the deterministic encode once",
+            cache_key.bits,
+            cache_key.prefix,
+            cache_key.tp_rank,
+        )
+        return load_or_quantize(cache_key, device=device, quantize=quantize)
 
 
 def _load_exl3_online_quantizer() -> Any:
@@ -382,12 +420,8 @@ def _load_b12x_mixed_trellis() -> Any:
     if _B12X_MIXED_TRELLIS_API is not None:
         return _B12X_MIXED_TRELLIS_API
     try:
-        module = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.mixed_trellis"
-        )
-        prepare = importlib.import_module(
-            "b12x.moe._shared.kernels.w4a16.prepare"
-        )
+        module = importlib.import_module("b12x.moe._shared.kernels.w4a16.mixed_trellis")
+        prepare = importlib.import_module("b12x.moe._shared.kernels.w4a16.prepare")
         host = importlib.import_module("b12x.moe._shared.kernels.w4a16.host")
     except Exception as exc:
         raise RuntimeError(
@@ -396,17 +430,22 @@ def _load_b12x_mixed_trellis() -> Any:
         ) from exc
     api = SimpleNamespace(
         build_tiered_maps=module.build_tiered_maps,
-        # glm52-r7-sparkinfer: absent on an unpatched SparkInfer, which the
+        # Absent on an older B12X build, which the
         # loader checks for before selecting the fused R7 path.
         build_projection_tiered_maps=getattr(
             module, "build_projection_tiered_maps", None
         ),
         combine_trellis_rotations=module.combine_trellis_rotations,
         compile_mixed_trellis=module.compile_mixed_trellis,
+        compile_mixed_trellis3=getattr(module, "compile_mixed_trellis3", None),
         make_mixed_trellis_buffers=module.make_mixed_trellis_buffers,
+        make_mixed_trellis3_buffers=getattr(
+            module, "make_mixed_trellis3_buffers", None
+        ),
         max_packed_route_slots=host.max_packed_route_slots,
         prepare_weights=prepare.prepare_trellis256_moe_weights,
         run_mixed_trellis=module.run_mixed_trellis,
+        run_mixed_trellis3=getattr(module, "run_mixed_trellis3", None),
         warmup_mixed_trellis_route_pack=module.warmup_mixed_trellis_route_pack,
     )
     _B12X_MIXED_TRELLIS_API = api
@@ -498,9 +537,7 @@ def _resolve_r7_a1_min_rows(ext: Any) -> int:
         return 0
     value = int(raw)
     if value < 0:
-        raise ValueError(
-            f"VLLM_EXL3_R7_A1_MIN_ROWS must be >= 0, got {value}"
-        )
+        raise ValueError(f"VLLM_EXL3_R7_A1_MIN_ROWS must be >= 0, got {value}")
     return value
 
 
@@ -509,7 +546,7 @@ def _r7_fused_layer_budget():
 
     raw = os.environ.get("VLLM_EXL3_R7_FUSED_LAYERS")
     if raw is None or raw == "":
-        return 48
+        return None
     value = int(raw)
     return None if value < 0 else value
 
@@ -585,7 +622,7 @@ def _r7_ballast_view(planes: int, like: torch.Tensor) -> torch.Tensor:
 
 
 def _r7_fused_enabled() -> bool:
-    """R7 on SparkInfer's fused MoE. glm52-r7-sparkinfer.
+    """R7 on B12X's fused MoE.
 
     On by default; set VLLM_EXL3_R7_FUSED=0 to force exl3_moe_r7_fused for a
     control run.
@@ -606,6 +643,8 @@ def _shared_mixed_buffers(
     topk,
 ):
     """One scratch arena per model/draft owner and launch geometry."""
+
+    tier_count = 3 if hasattr(launch, "tier2_num_experts") else 2
 
     # glm52-r7-gate-tight: max_m_blocks is DELIBERATELY excluded from the key.
     # It derives from each layer's summed tier slots, which differ per layer
@@ -628,6 +667,7 @@ def _shared_mixed_buffers(
         int(sms),
         str(launch.rotation_input_dtype),
         launch.route_ids_dtype,
+        tier_count,
     )
     # One arena per launch geometry, allocated ONCE. Growing it on a larger
     # max_m_blocks thrashed (51 allocations, old arenas retained by the
@@ -637,14 +677,29 @@ def _shared_mixed_buffers(
     # capacity/block/tile/topk that size it.
     entry = _MIXED_TRELLIS_BUFFERS.get(key)
     if entry is None:
-        # Size the single arena for the STRUCTURAL worst case -- both tiers at
-        # the 256-expert maximum -- so one arena is provably large enough for
-        # every layer's route-block count. Sizing it from the first layer would
-        # under-allocate for a later, wider one; growing it thrashed (51
-        # allocations, old arenas pinned by the runtimes already holding them).
+        # Routing has its own exact global-expert namespace. Projection slots
+        # may total up to 512, but they affect descriptor/weight addressing,
+        # not route-pack capacity. Size one arena from the compiled routing
+        # contract so every layer can share it without projection padding.
+        topk_sum = getattr(launch, "topk_sum", None)
+        if topk_sum is not None:
+            route_num_experts = int(topk_sum.route_num_experts)
+        elif hasattr(launch, "route_num_experts"):
+            route_num_experts = int(launch.route_num_experts)
+        else:
+            # Legacy mixed-Trellis launch objects predate the separate route
+            # namespace. Their tiers partition the routed experts directly,
+            # so the sum is exact. Projection-tight R7 launches always carry
+            # route_num_experts and never take this compatibility branch.
+            route_num_experts = sum(
+                int(getattr(launch, f"tier{tier_id}_num_experts"))
+                for tier_id in range(tier_count)
+            )
         worst_max_m_blocks = (
             mixed_api.max_packed_route_slots(
-                int(capacity) * int(topk), int(block_size_m), 512
+                int(capacity) * int(topk),
+                int(block_size_m),
+                route_num_experts,
             )
             + int(block_size_m)
             - 1
@@ -654,15 +709,26 @@ def _shared_mixed_buffers(
             tier1_num_experts=256,
             max_m_blocks=worst_max_m_blocks,
         )
+        if tier_count == 3:
+            # Only the sum is consumed by buffer planning. Keep every tier
+            # positive while representing the exact 512-slot structural cap.
+            overrides.update(tier1_num_experts=255, tier2_num_experts=1)
         if dataclasses.is_dataclass(launch):
             worst = dataclasses.replace(launch, **overrides)
         else:
             # Production uses the dataclass. Retained API tests use a small
             # namespace carrying the same public fields.
             worst = SimpleNamespace(**{**vars(launch), **overrides})
-        entry = mixed_api.make_mixed_trellis_buffers(
-            worst, device=device, sms=sms
+        make_buffers = (
+            mixed_api.make_mixed_trellis3_buffers
+            if tier_count == 3
+            else mixed_api.make_mixed_trellis_buffers
         )
+        if make_buffers is None:
+            raise RuntimeError(
+                "the installed B12X build lacks three-tier scratch support"
+            )
+        entry = make_buffers(worst, device=device, sms=sms)
         _MIXED_TRELLIS_BUFFERS[key] = entry
         logger.info(
             "R7 fused MoE scratch arena (worst-case sized): capacity=%d "
@@ -962,10 +1028,7 @@ class Exl3Config(QuantizationConfig):
             if not isinstance(_r7, dict):
                 raise ValueError("r7_routed_experts must be an object")
             if _r7.get("schema") != "r7-complete-v2-checkpoint-v1":
-                raise ValueError(
-                    "unsupported R7 EXL3 schema: "
-                    f"{_r7.get('schema')!r}"
-                )
+                raise ValueError(f"unsupported R7 EXL3 schema: {_r7.get('schema')!r}")
             if _r7.get("codebook") != "mcg" or _r7.get("bits") != "mixed_tensor":
                 raise ValueError(
                     "R7 EXL3 requires codebook='mcg' and bits='mixed_tensor'"
@@ -1016,10 +1079,7 @@ class Exl3Config(QuantizationConfig):
         if user_quant is not None and user_quant != "exl3":
             return None
         r7 = hf_quant_cfg.get("r7_routed_experts")
-        if (
-            isinstance(r7, dict)
-            and r7.get("schema") == "r7-complete-v2-checkpoint-v1"
-        ):
+        if isinstance(r7, dict) and r7.get("schema") == "r7-complete-v2-checkpoint-v1":
             return "exl3"
         metadata = getattr(hf_config, "hybrid_tr3_tail", None)
         if isinstance(metadata, dict) and metadata.get("format") == _RANK_SLICED_FORMAT:
@@ -1543,9 +1603,7 @@ class Exl3Config(QuantizationConfig):
             # below. Returning None here makes each of them fail as
             # "unexpected codebook[None]" even though it ships an mcg marker.
             if match is not None:
-                first, last = (
-                    int(v) for v in self.rank_sliced_metadata["moe_layers"]
-                )
+                first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
                 if first <= int(match.group(1)) <= last:
                     return "mcg"
             # --- end glm52-mdispatch ---
@@ -1666,6 +1724,8 @@ class Exl3Parameter(BasevLLMParameter):
         loaded_weight: torch.Tensor,
         shard_id: ShardId = None,
     ) -> None:
+        if getattr(loaded_weight, "_vllm_instanttensor_borrowed", False):
+            loaded_weight = loaded_weight.clone()
         self.exl3_tensors[shard_id] = loaded_weight.contiguous()
 
 
@@ -1835,7 +1895,11 @@ class Exl3OnlineLinearMethod(_Fp8OnlineLinearBase):
                 proxy_error
             )
 
-        result = load_or_quantize(cache_key, device=device, quantize=encode)
+        result = _load_online_encoding_with_retry(
+            cache_key,
+            device=device,
+            quantize=encode,
+        )
 
         layer.register_buffer(
             "exl3_online_trellis_weight",
@@ -2305,8 +2369,9 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        tp_slice: tuple[int, int, int, int] | None = None,
     ):
-        del num_experts, shard_ids, preallocate
+        del num_experts, shard_ids, preallocate, tp_slice
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
@@ -2317,13 +2382,40 @@ class Exl3MoEParameter(BasevLLMParameter):
         num_experts: int = 0,
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
+        tp_slice: tuple[int, int, int, int] | None = None,
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
         self.exl3_num_experts = int(num_experts)
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
+        self.exl3_tp_slice = tp_slice
         super().__init__(data=self.data, weight_loader=weight_loader)
+
+    def _slice_loaded_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        """Materialize only the local TP range from an unsliced R7 tensor."""
+
+        if self.exl3_tp_slice is None:
+            return loaded_weight
+        dim, start, size, quantum = self.exl3_tp_slice
+        if start % quantum or size % quantum:
+            raise ValueError(
+                "EXL3 streaming TP slice is not quantum-aligned: "
+                f"start={start}, size={size}, quantum={quantum}"
+            )
+        offset = start // quantum
+        length = size // quantum
+        if offset + length > loaded_weight.shape[dim]:
+            raise ValueError(
+                "EXL3 streaming TP slice exceeds the loaded tensor: "
+                f"shape={tuple(loaded_weight.shape)}, dim={dim}, "
+                f"offset={offset}, length={length}"
+            )
+        sliced = loaded_weight.narrow(dim, offset, length)
+        # A dim-0 narrow can remain contiguous while retaining the full source
+        # storage. Clone that case so the InstantTensor staging allocation can
+        # be released; a non-contiguous narrow already needs materialization.
+        return sliced.clone() if sliced.is_contiguous() else sliced.contiguous()
 
     def load_exl3_weight(
         self,
@@ -2333,7 +2425,11 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_id: str,
     ) -> None:
         key = (int(expert_id), str(shard_id))
+        borrowed = getattr(loaded_weight, "_vllm_instanttensor_borrowed", False)
+        loaded_weight = self._slice_loaded_weight(loaded_weight)
         if not self.exl3_preallocate:
+            if borrowed and self.exl3_tp_slice is None:
+                loaded_weight = loaded_weight.clone()
             self.exl3_tensors[key] = loaded_weight.contiguous()
             return
         if self.exl3_num_experts <= 0 or shard_id not in self.exl3_shard_ids:
@@ -2465,6 +2561,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_r7_max_num_batched_tokens = int(
                 _r7_scheduler.max_num_batched_tokens
             )
+        # R7 expert files contain unsliced tensors. Slice every payload while
+        # it is consumed instead of retaining the full model on every TP rank
+        # and slicing only after the loader has exhausted the checkpoint.
+        # At TP4 that changes the peak from the full ~320 GiB expert payload
+        # per rank to its local quarter and is required for 96 GiB GPUs.
+        r7_stream_tp = layer.exl3_r7_graph and layer.exl3_tp_size > 1
+        layer.exl3_r7_stream_tp_sliced = r7_stream_tp
+        r7_slice_start = layer.exl3_tp_rank * layer.exl3_intermediate_size_per_partition
+        r7_slice_size = layer.exl3_intermediate_size_per_partition
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
         # --- glm52-mdispatch: route per layer, not per checkpoint ---
         # A checkpoint may carry a rank-sliced TAIL (e.g. hybrid_tr3_tail
@@ -2552,6 +2657,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     (prefix == "w13" and suffix == "suh")
                     or (prefix == "w2" and suffix == "svh")
                 )
+                tp_slice = None
+                if r7_stream_tp:
+                    if (prefix, suffix) == ("w13", "svh"):
+                        tp_slice = (0, r7_slice_start, r7_slice_size, 1)
+                    elif (prefix, suffix) == ("w13", "trellis"):
+                        tp_slice = (1, r7_slice_start, r7_slice_size, 16)
+                    elif (prefix, suffix) == ("w2", "suh"):
+                        tp_slice = (0, r7_slice_start, r7_slice_size, 1)
+                    elif (prefix, suffix) == ("w2", "trellis"):
+                        tp_slice = (0, r7_slice_start, r7_slice_size, 16)
                 layer.register_parameter(
                     f"{prefix}_{suffix}",
                     Exl3MoEParameter(
@@ -2565,6 +2680,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             if getattr(layer, "exl3_mixed_bitrate", False)
                             else {"suh", "svh", "trellis"}
                         ),
+                        tp_slice=tp_slice,
                     ),
                 )
 
@@ -2607,7 +2723,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer,
             "exl3_rank_sliced",
             self.quant_config.rank_sliced_metadata is not None,
-        ):
+        ) and not getattr(layer, "exl3_r7_stream_tp_sliced", False):
             self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
         for prefix in ("w13", "w2"):
@@ -2644,27 +2760,36 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         _dbg = os.environ.get("VLLM_EXL3_R7_DEBUG", "")
         if _dbg and _dbg in str(getattr(layer, "layer_name", "")):
             import torch as _t
-            _out = [f"R7DBG {layer.layer_name} rank={layer.exl3_tp_rank} "
-                    f"shared_h={getattr(layer, 'exl3_shared_h_rotations', None)} "
-                    f"rank_sliced={_rs} local_experts={layer.local_num_experts}"]
-            for _g, _a, _k in (("w13", "suh", (0, "w1")), ("w13", "suh", (5, "w3")),
-                               ("w13", "svh", (5, "w1")), ("w13", "trellis", (5, "w1")),
-                               ("w2", "suh", (5, "w2")), ("w2", "svh", (5, "w2")),
-                               ("w2", "trellis", (5, "w2"))):
+
+            _out = [
+                f"R7DBG {layer.layer_name} rank={layer.exl3_tp_rank} "
+                f"shared_h={getattr(layer, 'exl3_shared_h_rotations', None)} "
+                f"rank_sliced={_rs} local_experts={layer.local_num_experts}"
+            ]
+            for _g, _a, _k in (
+                ("w13", "suh", (0, "w1")),
+                ("w13", "suh", (5, "w3")),
+                ("w13", "svh", (5, "w1")),
+                ("w13", "trellis", (5, "w1")),
+                ("w2", "suh", (5, "w2")),
+                ("w2", "svh", (5, "w2")),
+                ("w2", "trellis", (5, "w2")),
+            ):
                 _tt = getattr(layer, f"{_g}_{_a}").exl3_tensors.get(_k)
                 if _tt is None:
                     _out.append(f"  {_g}_{_a}{_k}: MISSING")
                 else:
                     _v = _tt.to(_t.float64)
-                    _out.append(f"  {_g}_{_a}{_k}: shape={tuple(_tt.shape)} "
-                                f"dtype={_tt.dtype} sum={_v.sum().item():.6f}")
+                    _out.append(
+                        f"  {_g}_{_a}{_k}: shape={tuple(_tt.shape)} "
+                        f"dtype={_tt.dtype} sum={_v.sum().item():.6f}"
+                    )
             print(chr(10).join(_out), flush=True)
         # --- end glm52-mdispatch ---
 
         if getattr(layer, "exl3_r7_graph", False):
-            # glm52-r7-sparkinfer: prefer the fused mixed-Trellis kernel; layers
-            # carrying a third K on either phase keep exl3_moe_r7_fused.
-            if _r7_fused_enabled() and self._prepare_r7_sparkinfer_weights(layer):
+            # Prefer the native two- or three-tier B12X mixed-Trellis kernel.
+            if _r7_fused_enabled() and self._prepare_r7_b12x_weights(layer):
                 layer.exl3_r7_fused = True
                 return
             self._prepare_r7_graph_weights(layer)
@@ -3056,6 +3181,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "prefill_tiers": tuple(prefill_tiers),
             "tier_ids": tuple(tier_ids),
             "tier_bits": tuple(tiers),
+            "trellis_codebook": "mcg",
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
             "rotations": combined_rotations,
@@ -3274,6 +3400,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tier_signature = policy["tier_signature"]
         broadcast_suh = bool(mixed["broadcast_suh"])
         broadcast_svh = bool(mixed["broadcast_svh"])
+        route_num_experts = int(layer.local_num_experts)
         owner_token = _runtime_owner_token(self.quant_config, layer)
         key = (
             owner_token,
@@ -3283,6 +3410,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             int(layer.exl3_hidden_size),
             int(layer.exl3_intermediate_size_per_partition),
             tier_signature,
+            route_num_experts,
             topk,
             max_decode_m,
             max_batched_tokens,
@@ -3310,7 +3438,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         mixed_api = _load_b12x_mixed_trellis()
         device = x.device
-        total_experts = sum(experts for _, experts in tier_signature)
+        tier_count = len(tier_signature)
+        if tier_count not in (2, 3):
+            raise RuntimeError(
+                f"mixed Trellis requires two or three bitrate tiers, got {tier_count}"
+            )
 
         def make_state(
             capacity: int,
@@ -3320,16 +3452,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             route_slots = mixed_api.max_packed_route_slots(
                 capacity * topk,
                 block_size_m,
-                total_experts,
+                route_num_experts,
             )
-            launch = mixed_api.compile_mixed_trellis(
+            compile_mixed = (
+                mixed_api.compile_mixed_trellis3
+                if tier_count == 3
+                else mixed_api.compile_mixed_trellis
+            )
+            if compile_mixed is None:
+                raise RuntimeError(
+                    "the installed B12X build lacks native three-tier Trellis support"
+                )
+            tier_kwargs = {
+                f"tier{tier_id}_num_experts": experts
+                for tier_id, (_bits, experts) in enumerate(tier_signature)
+            }
+            tier_kwargs.update(
+                {
+                    f"tier{tier_id}_bits": bits
+                    for tier_id, (bits, _experts) in enumerate(tier_signature)
+                }
+            )
+            launch = compile_mixed(
                 size_m=capacity,
                 hidden_size=int(layer.exl3_hidden_size),
                 intermediate_size=int(layer.exl3_intermediate_size_per_partition),
-                tier0_num_experts=tier_signature[0][1],
-                tier1_num_experts=tier_signature[1][1],
-                tier0_bits=tier_signature[0][0],
-                tier1_bits=tier_signature[1][0],
                 top_k=topk,
                 max_m_blocks=(route_slots + block_size_m - 1) // block_size_m,
                 moe_block_size=block_size_m,
@@ -3340,6 +3487,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 route_ids_dtype=topk_ids.dtype,
                 broadcast_suh=broadcast_suh,
                 broadcast_svh=broadcast_svh,
+                trellis_codebook=mixed["trellis_codebook"],
+                route_num_experts=route_num_experts,
+                **tier_kwargs,
             )
             return {
                 "capacity": capacity,
@@ -3419,7 +3569,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             slice_weights: torch.Tensor,
             slice_ids: torch.Tensor,
             state: dict[str, Any],
-            tiers: tuple[Any, Any],
+            tiers: tuple[Any, ...],
         ) -> torch.Tensor:
             run_kwargs = {}
             gate_experts = mixed.get("tier_gate_experts")
@@ -3429,26 +3579,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "projection-tight R7 tiers require paired gate/up counts"
                 )
             if gate_experts is not None:
-                run_kwargs.update(
-                    gate_experts=gate_experts, up_experts=up_experts
-                )
-            return (
-                runtime["mixed_api"]
-                .run_mixed_trellis(
-                    slice_x,
-                    tiers[0],
-                    tiers[1],
-                    slice_weights,
-                    slice_ids,
-                    mixed["global_to_combined"],
-                    mixed["descriptor_map"],
-                    mixed["rotations"],
-                    state["launch"],
-                    state["buffers"],
-                    **run_kwargs,
-                )
-                .to(slice_x.dtype)
+                run_kwargs.update(gate_experts=gate_experts, up_experts=up_experts)
+            run_mixed = (
+                runtime["mixed_api"].run_mixed_trellis3
+                if len(tiers) == 3
+                else runtime["mixed_api"].run_mixed_trellis
             )
+            if run_mixed is None:
+                raise RuntimeError(
+                    "the installed B12X build lacks native three-tier Trellis support"
+                )
+            return run_mixed(
+                slice_x,
+                *tiers,
+                slice_weights,
+                slice_ids,
+                mixed["global_to_combined"],
+                mixed["descriptor_map"],
+                mixed["rotations"],
+                state["launch"],
+                state["buffers"],
+                **run_kwargs,
+            ).to(slice_x.dtype)
 
         if m <= runtime["max_decode_m"]:
             return run_state(
@@ -3570,11 +3722,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     # order-dependent. The config is per model load and shared by its layers.
 
     def _r7_projection_tiers(self, layer: RoutedExperts):
-        """Split experts into two bitrate tiers per projection.
+        """Split experts into two or three bitrate tiers per projection.
 
         Returns (tier_bits, {projection: (tier_id_per_expert, ...)}) or None
-        when any projection carries more than two distinct K, which keeps that
-        layer on exl3_moe_r7_fused. glm52-r7-sparkinfer.
+        for layouts outside the native mixed-Trellis contracts.
         """
 
         # Derived from the payloads, not from layer.exl3_r7_bitrates: that
@@ -3602,24 +3753,25 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"R7 routed experts use bitrates {invalid} not declared by "
                 f"r7_routed_experts.k_values={sorted(declared_k)}"
             )
-        if len(present) != 2:
+        if len(present) not in (2, 3):
             return None
-        lookup = {present[0]: 0, present[1]: 1}
+        lookup = {bits: tier_id for tier_id, bits in enumerate(present)}
         return tuple(present), {
             name: tuple(lookup[b] for b in values)
             for name, values in projections.items()
         }
 
-    def _prepare_r7_sparkinfer_weights(self, layer: RoutedExperts) -> bool:
-        """Pack R7 experts into SparkInfer tier stacks. False -> keep exl3_moe."""
+    def _prepare_r7_b12x_weights(self, layer: RoutedExperts) -> bool:
+        """Pack R7 experts into native B12X tier stacks."""
 
         split = self._r7_projection_tiers(layer)
         if split is None:
             return False
-        # The fused layout costs ~1.385 GiB/layer against ~1.031 GiB for the
-        # per-expert one, so converting all 75 exhausts the GPU around layer 58.
-        # Cap the count until that overhead is tracked down; the rest keep
-        # exl3_moe_r7_fused, which the loader already selects per layer.
+        # Streaming TP slicing and prompt release of source tensors keep the
+        # native stacks within the checkpoint's steady-state footprint, so all
+        # supported layers are native by default. This remains a diagnostic
+        # cap only; a non-negative value can deliberately retain the external
+        # fallback after that many layers.
         budget = _r7_fused_layer_budget()
         if budget is not None:
             used = int(getattr(self.quant_config, "_r7_fused_layers", 0))
@@ -3632,9 +3784,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         mixed_api = _load_b12x_mixed_trellis()
         if getattr(mixed_api, "build_projection_tiered_maps", None) is None:
             raise RuntimeError(
-                "R7 fused MoE requires the projection-tier SparkInfer patch; "
+                "R7 fused MoE requires the projection-tier B12X API; "
                 "the kernel and loader patches must be installed together"
             )
+        if len(tier_bits) == 3 and any(
+            getattr(mixed_api, name, None) is None
+            for name in (
+                "compile_mixed_trellis3",
+                "make_mixed_trellis3_buffers",
+                "run_mixed_trellis3",
+            )
+        ):
+            raise RuntimeError(
+                "R7 K3/K4/K5 layers require native three-tier B12X support"
+            )
+        trellis_codebook = str(self.quant_config.r7_routed_experts["codebook"]).lower()
         hidden_size = int(layer.exl3_hidden_size)
         intermediate_size = int(layer.exl3_intermediate_size_per_partition)
         num_experts = int(layer.local_num_experts)
@@ -3661,15 +3825,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # Combined-expert indexed, so global order -- no tier reordering.
         intermediate_rotations = torch.cat(
             (
-                torch.stack([
-                    layer.w13_svh.exl3_tensors[(e, "w1")] for e in range(num_experts)
-                ]),
-                torch.stack([
-                    layer.w13_svh.exl3_tensors[(e, "w3")] for e in range(num_experts)
-                ]),
-                torch.stack([
-                    layer.w2_suh.exl3_tensors[(e, "w2")] for e in range(num_experts)
-                ]),
+                torch.stack(
+                    [layer.w13_svh.exl3_tensors[(e, "w1")] for e in range(num_experts)]
+                ),
+                torch.stack(
+                    [layer.w13_svh.exl3_tensors[(e, "w3")] for e in range(num_experts)]
+                ),
+                torch.stack(
+                    [layer.w2_suh.exl3_tensors[(e, "w2")] for e in range(num_experts)]
+                ),
             ),
             dim=1,
         ).contiguous()
@@ -3826,7 +3990,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         params_dtype=torch.float16,
                         w13_layout="trellis3_t256_proj",
                         trellis_bits=bits,
-                        codebook="mcg",
+                        codebook=trellis_codebook,
                         # prepare wants tier-local rows (or the broadcast
                         # form); the launch wants the padded combined table.
                         # Both are validate-and-carry here, and R7's gate/up
@@ -3834,8 +3998,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         # is the honest thing to hand prepare.
                         gate_suh=gate_suh[:1].contiguous(),
                         up_suh=up_suh[:1].contiguous(),
-                        intermediate_rotations=intermediate_rotations[:n]
-                        .contiguous(),
+                        intermediate_rotations=intermediate_rotations[:n].contiguous(),
                         down_svh=down_svh[:1].contiguous(),
                         tile_config=cfg,
                         # glm52-r7-ballast-dealias: a view into the ballast
@@ -3853,11 +4016,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 # contents are never read. Allocating it per layer leaked
                 # ~200 MiB a layer and OOMed around layer 68 of 75, so it is
                 # cached and shared across every layer and tier.
-                fc1_w2 = (
-                    w2
-                    if fc2_slots == slots
-                    else _r7_fc1_ballast(slots, w2)
-                )
+                fc1_w2 = w2 if fc2_slots == slots else _r7_fc1_ballast(slots, w2)
                 # prepare validates a padded [2, slots] w13 and builds a view
                 # of it that is discarded here, so it gets a shared never-read
                 # ballast; the served w13 is the tight [gate|up] buffer bound
@@ -3943,7 +4102,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_tiers.append(prepare_tier_fn(prefill_tile_config))
             torch.cuda.empty_cache()
 
-
         global_to_combined, descriptor_map = mixed_api.build_projection_tiered_maps(
             tiers["gate"],
             tiers["up"],
@@ -3955,6 +4113,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "tiers": tuple(prepared_tiers),
             "prefill_tiers": tuple(prefill_tiers),
             "tier_bits": tuple(tier_bits),
+            "trellis_codebook": trellis_codebook,
             # FC1 slot counts: what sizes the launch and the policy signature.
             "tier_ids": tuple(fc1_counts),
             # Real gate plane count per tier, threaded to run_mixed_trellis so
@@ -3991,15 +4150,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             torch.cuda.memory_allocated(device) / 2**30,
             torch.cuda.memory_reserved(device) / 2**30,
         )
-        logger.info(
-            "R7 fused MoE %s: tier0=K%d(%d gate/%d up/%d down) tier1=K%d",
-            layer.layer_name,
-            tier_bits[0],
-            sum(1 for t in tiers["gate"] if t == 0),
-            sum(1 for t in tiers["up"] if t == 0),
-            sum(1 for t in tiers["down"] if t == 0),
-            tier_bits[1],
+        tier_summary = ", ".join(
+            f"K{bits}("
+            f"{sum(1 for value in tiers['gate'] if value == tier_id)} gate/"
+            f"{sum(1 for value in tiers['up'] if value == tier_id)} up/"
+            f"{sum(1 for value in tiers['down'] if value == tier_id)} down)"
+            for tier_id, bits in enumerate(tier_bits)
         )
+        logger.info("R7 fused B12X MoE %s: %s", layer.layer_name, tier_summary)
         return True
 
     def _r7_graph_runtime(
@@ -4111,14 +4269,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             ),
         }
         _R7_GRAPH_RUNTIMES[key] = runtime
-        arena_mib = (
-            sum(
-                value.numel() * value.element_size()
-                for value in runtime.values()
-                if isinstance(value, torch.Tensor)
-            )
-            / (1 << 20)
-        )
+        arena_mib = sum(
+            value.numel() * value.element_size()
+            for value in runtime.values()
+            if isinstance(value, torch.Tensor)
+        ) / (1 << 20)
         logger.info_once(
             "R7 EXL3 CUDA-graph runtime planned: capacity=%d route_block=%d "
             "concurrency=%d topk=%d experts=%d arena=%.1fMiB a1_min_rows=%d",

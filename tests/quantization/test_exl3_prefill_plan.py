@@ -98,8 +98,10 @@ class _FakeFusedMoeApi:
 class _FakeMixedTrellisApi:
     def __init__(self):
         self.compiled = []
+        self.compiled3 = []
         self.routed = []
         self.calls = []
+        self.calls3 = []
 
     def max_packed_route_slots(self, routed_rows, block_size, experts):
         del block_size, experts
@@ -110,13 +112,28 @@ class _FakeMixedTrellisApi:
         self.compiled.append(launch)
         return launch
 
+    def compile_mixed_trellis3(self, **kwargs):
+        launch = SimpleNamespace(**kwargs)
+        self.compiled3.append(launch)
+        return launch
+
     def make_mixed_trellis_buffers(self, launch, **kwargs):
+        del kwargs
+        return SimpleNamespace(scratch=torch.empty(launch.size_m, dtype=torch.uint8))
+
+    def make_mixed_trellis3_buffers(self, launch, **kwargs):
         del kwargs
         return SimpleNamespace(scratch=torch.empty(launch.size_m, dtype=torch.uint8))
 
     def run_mixed_trellis(self, *args):
         x, tier0, tier1, topk_weights, topk_ids = args[:5]
         self.calls.append((int(x.shape[0]), tier0, tier1))
+        self.routed.append((topk_weights.clone(), topk_ids.clone()))
+        return x.to(torch.float32)
+
+    def run_mixed_trellis3(self, *args):
+        x, tier0, tier1, tier2, topk_weights, topk_ids = args[:6]
+        self.calls3.append((int(x.shape[0]), tier0, tier1, tier2))
         self.routed.append((topk_weights.clone(), topk_ids.clone()))
         return x.to(torch.float32)
 
@@ -157,6 +174,27 @@ def _make_mixed_layer():
         "prefill_tiers": (object(), object()),
         "tier_ids": ((0, 1, 2, 3), (4, 5, 6, 7)),
         "tier_bits": (3, 4),
+        "trellis_codebook": "mcg",
+        "global_to_combined": object(),
+        "descriptor_map": object(),
+        "rotations": object(),
+        "broadcast_suh": False,
+        "broadcast_svh": False,
+        "tile_config": (64, 128, 64, 128),
+        "prefill_tile_config": (128, 128, 128, 128),
+    }
+    return layer
+
+
+def _make_mixed3_layer():
+    layer = _make_layer()
+    layer.exl3_mixed_bitrate = True
+    layer.exl3_mixed_trellis = {
+        "tiers": (object(), object(), object()),
+        "prefill_tiers": (object(), object(), object()),
+        "tier_ids": ((0, 1, 2), (3, 4, 5), (6, 7)),
+        "tier_bits": (3, 4, 5),
+        "trellis_codebook": "mcg",
         "global_to_combined": object(),
         "descriptor_map": object(),
         "rotations": object(),
@@ -338,6 +376,9 @@ def test_mixed_prefill_capacity_slices_rows_and_routing():
 
         assert [launch.size_m for launch in h.mixed_api.compiled] == [32, 128]
         assert [launch.moe_block_size for launch in h.mixed_api.compiled] == [8, 64]
+        assert all(
+            launch.route_num_experts == EXPERTS for launch in h.mixed_api.compiled
+        )
         assert h.mixed_api.compiled[1].force_tile_config == (128, 128, 128, 128)
         assert not h.planned_caps()
         assert not h.api.bound
@@ -345,6 +386,36 @@ def test_mixed_prefill_capacity_slices_rows_and_routing():
         assert all(
             call[1:] == layer.exl3_mixed_trellis["prefill_tiers"]
             for call in h.mixed_api.calls
+        )
+        assert torch.equal(out, x)
+        assert torch.equal(
+            torch.cat([route[0] for route in h.mixed_api.routed]), weights
+        )
+        assert torch.equal(torch.cat([route[1] for route in h.mixed_api.routed]), ids)
+
+
+def test_three_tier_prefill_uses_native_b12x_dispatch():
+    with _Harness(env={"VLLM_EXL3_PREFILL_CAPACITY": "128"}) as h:
+        method = _make_method()
+        layer = _make_mixed3_layer()
+        rows = 200
+        x = torch.arange(rows, dtype=torch.bfloat16).unsqueeze(1).expand(-1, HIDDEN)
+        weights = torch.arange(rows * TOPK, dtype=torch.float32).reshape(rows, TOPK)
+        ids = torch.arange(rows * TOPK, dtype=torch.int64).reshape(rows, TOPK)
+        ids = ids.remainder(EXPERTS)
+
+        out = method._apply_rank_sliced(layer, x, weights, ids)
+
+        assert not h.mixed_api.compiled
+        assert [launch.size_m for launch in h.mixed_api.compiled3] == [32, 128]
+        assert all(launch.trellis_codebook == "mcg" for launch in h.mixed_api.compiled3)
+        assert all(
+            launch.route_num_experts == EXPERTS for launch in h.mixed_api.compiled3
+        )
+        assert [call[0] for call in h.mixed_api.calls3] == [128, 72]
+        assert all(
+            call[1:] == layer.exl3_mixed_trellis["prefill_tiers"]
+            for call in h.mixed_api.calls3
         )
         assert torch.equal(out, x)
         assert torch.equal(
@@ -409,6 +480,17 @@ def test_mixed_buffer_pool_is_scoped_to_target_or_draft_owner():
 
         assert target_again is target
         assert draft is not target
+
+        launch3 = SimpleNamespace(
+            **{
+                **vars(launch),
+                "tier2_num_experts": 1,
+            }
+        )
+        three_tier = exl3_module._shared_mixed_buffers(
+            (1, False), h.mixed_api, launch3, *args[2:]
+        )
+        assert three_tier is not target
 
 
 def test_mixed_runtime_forwards_shared_h_broadcast_contract():

@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.exl3 import (
     Exl3MoEMethod,
     Exl3MoEParameter,
     Exl3OnlineLinearMethod,
+    Exl3Parameter,
 )
 from vllm.model_executor.layers.quantization.exl3_online_cache import (
     Exl3OnlineCacheResult,
@@ -524,6 +525,98 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
+@pytest.mark.parametrize(
+    ("shape", "tp_slice", "expected"),
+    [
+        ((12,), (0, 4, 4, 1), torch.arange(4, 8)),
+        (
+            (4, 6, 2),
+            (1, 32, 32, 16),
+            torch.tensor(
+                [
+                    [[4, 5], [6, 7]],
+                    [[16, 17], [18, 19]],
+                    [[28, 29], [30, 31]],
+                    [[40, 41], [42, 43]],
+                ]
+            ),
+        ),
+        ((6, 4, 2), (0, 32, 32, 16), torch.arange(16, 32).reshape(2, 4, 2)),
+    ],
+)
+def test_r7_parameter_streams_owned_tp_slice(monkeypatch, shape, tp_slice, expected):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    source = torch.arange(torch.tensor(shape).prod().item(), dtype=torch.int16).reshape(
+        shape
+    )
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=1,
+        shard_ids=("w1",),
+        tp_slice=tp_slice,
+    )
+
+    param.load_exl3_weight(source, expert_id=0, shard_id="w1")
+    loaded = param.exl3_tensors[(0, "w1")]
+
+    torch.testing.assert_close(loaded, expected.to(torch.int16))
+    assert loaded.is_contiguous()
+    assert loaded.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert loaded.untyped_storage().nbytes() == loaded.numel() * loaded.element_size()
+
+
+def test_r7_parameter_streaming_tp_slice_fails_closed(monkeypatch):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    param = Exl3MoEParameter(
+        weight_loader=lambda *args, **kwargs: None,
+        num_experts=1,
+        shard_ids=("w1",),
+        tp_slice=(1, 24, 32, 16),
+    )
+
+    with pytest.raises(ValueError, match="not quantum-aligned"):
+        param.load_exl3_weight(
+            torch.zeros((4, 8, 2), dtype=torch.int16),
+            expert_id=0,
+            shard_id="w1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("parameter_cls", "load_kwargs"),
+    [
+        (Exl3Parameter, {"shard_id": "w1"}),
+        (Exl3MoEParameter, {"expert_id": 0, "shard_id": "w1"}),
+    ],
+)
+def test_exl3_parameters_own_borrowed_instanttensor_storage(
+    monkeypatch, parameter_cls, load_kwargs
+):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    source = torch.arange(8, dtype=torch.int16)
+    source._vllm_instanttensor_borrowed = True
+    kwargs = {"weight_loader": lambda *args, **kwargs: None}
+    if parameter_cls is Exl3MoEParameter:
+        kwargs.update(num_experts=1, shard_ids=("w1",))
+    param = parameter_cls(**kwargs)
+
+    param.load_exl3_weight(source, **load_kwargs)
+    loaded = next(iter(param.exl3_tensors.values()))
+    source.zero_()
+
+    torch.testing.assert_close(loaded, torch.arange(8, dtype=torch.int16))
+    assert loaded.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+
+
 def test_rank_sliced_broadcast_pointer_table_repeats_one_physical_row():
     slab = torch.ones((1, 128), dtype=torch.float16)
 
@@ -686,9 +779,7 @@ def test_rank_sliced_weights_pass_shared_h_rows_without_expansion(monkeypatch):
         def prepare_weights(**kwargs):
             return SimpleNamespace(**kwargs)
 
-    monkeypatch.setattr(
-        exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe()
-    )
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: FakeFusedMoe())
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
@@ -965,6 +1056,38 @@ def test_mixed_trellis_prefill_block_policy_qualified_partitions(
     )
 
 
+@pytest.mark.parametrize(
+    "tier_signature",
+    [
+        ((3, 171), (4, 86), (5, 1)),
+        ((3, 197), (4, 58), (5, 2)),
+    ],
+)
+def test_mixed_trellis_prefill_block_policy_qualifies_native_k5(
+    tier_signature,
+) -> None:
+    assert (
+        exl3_module._resolve_mixed_trellis_prefill_block_m(
+            configured_block_m=64,
+            explicit_override=False,
+            hidden_size=6144,
+            intermediate_size=512,
+            tier_signature=tier_signature,
+            topk=8,
+            device_major=12,
+            prefill_tile_config=(128, 128, 32, 512),
+        )
+        == 32
+    )
+
+
+def test_r7_native_layer_budget_is_unlimited_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_EXL3_R7_FUSED_LAYERS", raising=False)
+    assert exl3_module._r7_fused_layer_budget() is None
+    monkeypatch.setenv("VLLM_EXL3_R7_FUSED_LAYERS", "48")
+    assert exl3_module._r7_fused_layer_budget() == 48
+
+
 def test_mixed_trellis_prefill_block_policy_rejects_unqualified_partition() -> None:
     common = {
         "configured_block_m": 64,
@@ -1006,6 +1129,42 @@ def test_mixed_trellis_prefill_block_policy_rejects_unqualified_partition() -> N
 )
 def test_mixed_trellis_uses_large_m_safe_tile_geometry(hidden, intermediate, expected):
     assert Exl3MoEMethod._mixed_trellis_tile_config(hidden, intermediate) == expected
+
+
+def test_r7_projection_tiers_accept_native_k3_k4_k5() -> None:
+    projection_bits = {
+        ("w13", "w1"): (3, 4, 5, 3),
+        ("w13", "w3"): (4, 3, 5, 4),
+        ("w2", "w2"): (5, 4, 3, 5),
+    }
+
+    def parameter(group: str, shard: str):
+        return SimpleNamespace(
+            exl3_tensors={
+                (expert, shard): torch.empty((1, 1, 16 * bits), dtype=torch.int16)
+                for expert, bits in enumerate(projection_bits[(group, shard)])
+            }
+        )
+
+    layer = SimpleNamespace(
+        local_num_experts=4,
+        w13_trellis=SimpleNamespace(exl3_tensors={}),
+        w2_trellis=SimpleNamespace(exl3_tensors={}),
+    )
+    layer.w13_trellis.exl3_tensors.update(parameter("w13", "w1").exl3_tensors)
+    layer.w13_trellis.exl3_tensors.update(parameter("w13", "w3").exl3_tensors)
+    layer.w2_trellis.exl3_tensors.update(parameter("w2", "w2").exl3_tensors)
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(r7_routed_experts={"k_values": (3, 4, 5)})
+
+    bits, tiers = method._r7_projection_tiers(layer)
+
+    assert bits == (3, 4, 5)
+    assert tiers == {
+        "gate": (0, 1, 2, 0),
+        "up": (1, 0, 2, 1),
+        "down": (2, 1, 0, 2),
+    }
 
 
 def test_rank_sliced_runtime_scope_is_per_owning_model():
@@ -1055,15 +1214,17 @@ def test_r7_schema_rejects_lossy_integer_coercion(field, value):
 
 
 def test_r7_schema_normalizes_declared_integer_contract():
-    config = Exl3Config.from_config({
-        "r7_routed_experts": {
-            "schema": "r7-complete-v2-checkpoint-v1",
-            "codebook": "mcg",
-            "bits": "mixed_tensor",
-            "moe_layers": [3, 77],
-            "k_values": [5, 3, 4, 3],
+    config = Exl3Config.from_config(
+        {
+            "r7_routed_experts": {
+                "schema": "r7-complete-v2-checkpoint-v1",
+                "codebook": "mcg",
+                "bits": "mixed_tensor",
+                "moe_layers": [3, 77],
+                "k_values": [5, 3, 4, 3],
+            }
         }
-    })
+    )
     assert config.r7_routed_experts["moe_layers"] == (3, 77)
     assert config.r7_routed_experts["k_values"] == (3, 4, 5)
 

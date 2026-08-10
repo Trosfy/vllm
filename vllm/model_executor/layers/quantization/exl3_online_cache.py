@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 from collections.abc import Callable, Mapping
@@ -27,6 +28,10 @@ _CACHE_SCHEMA = 1
 _CACHE_TENSORS = frozenset({"trellis", "suh", "svh"})
 CacheMode = Literal["off", "readonly", "readwrite"]
 QuantizeFn = Callable[[], tuple[Mapping[str, torch.Tensor], float | None]]
+
+
+class Exl3OnlineNonFiniteError(ValueError):
+    """An online EXL3 payload contains a non-finite scale or error metric."""
 
 
 @dataclass(frozen=True)
@@ -232,6 +237,19 @@ def _validate_tensors(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"online EXL3 cache {name} must be contiguous")
+        if tensor.is_floating_point() and not torch.isfinite(tensor).all():
+            raise Exl3OnlineNonFiniteError(
+                f"online EXL3 cache {name} contains non-finite values for "
+                f"{key.prefix} (TP rank {key.tp_rank})"
+            )
+
+
+def _validate_proxy_error(proxy_error: float | None, key: Exl3OnlineCacheKey) -> None:
+    if proxy_error is not None and not math.isfinite(proxy_error):
+        raise Exl3OnlineNonFiniteError(
+            "online EXL3 encoder returned a non-finite proxy error for "
+            f"{key.prefix} (TP rank {key.tp_rank})"
+        )
 
 
 def _load(path: Path, key: Exl3OnlineCacheKey) -> Exl3OnlineCacheResult:
@@ -244,6 +262,7 @@ def _load(path: Path, key: Exl3OnlineCacheKey) -> Exl3OnlineCacheResult:
     _validate_tensors(tensors, key)
     raw_error = metadata.get("proxy_error")
     proxy_error = None if raw_error in (None, "") else float(raw_error)
+    _validate_proxy_error(proxy_error, key)
     return Exl3OnlineCacheResult(dict(tensors), proxy_error, True, path)
 
 
@@ -266,6 +285,7 @@ def _quantize(
     tensors, proxy_error = quantize()
     tensors = {name: tensor.contiguous() for name, tensor in tensors.items()}
     _validate_tensors(tensors, key)
+    _validate_proxy_error(proxy_error, key)
     return Exl3OnlineCacheResult(tensors, proxy_error, False, path)
 
 

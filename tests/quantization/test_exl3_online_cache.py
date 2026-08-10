@@ -8,8 +8,12 @@ from dataclasses import replace
 import pytest
 import torch
 
+from vllm.model_executor.layers.quantization.exl3 import (
+    _load_online_encoding_with_retry,
+)
 from vllm.model_executor.layers.quantization.exl3_online_cache import (
     Exl3OnlineCacheKey,
+    Exl3OnlineNonFiniteError,
     cache_mode,
     cache_path,
     load_or_quantize,
@@ -90,6 +94,68 @@ def test_corrupt_cache_is_replaced_atomically(tmp_path, monkeypatch):
     assert calls == 1
     assert not result.hit
     assert reloaded.hit
+
+
+@pytest.mark.parametrize("bad_field", ["suh", "svh", "proxy_error"])
+def test_nonfinite_encoding_is_rejected(tmp_path, monkeypatch, bad_field):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "readwrite")
+    key = _key()
+
+    def quantize():
+        tensors = _tensors(key)
+        proxy_error = 0.125
+        if bad_field == "proxy_error":
+            proxy_error = float("nan")
+        else:
+            tensors[bad_field][0] = float("nan")
+        return tensors, proxy_error
+
+    with pytest.raises(Exl3OnlineNonFiniteError, match="non-finite"):
+        load_or_quantize(key, device=torch.device("cpu"), quantize=quantize)
+
+    assert not cache_path(key).exists()
+
+
+def test_online_encoding_retries_one_nonfinite_result(monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "off")
+    key = _key()
+    calls = 0
+
+    def quantize():
+        nonlocal calls
+        calls += 1
+        tensors = _tensors(key)
+        if calls == 1:
+            tensors["svh"][0] = float("nan")
+        return tensors, 0.125
+
+    result = _load_online_encoding_with_retry(
+        key, device=torch.device("cpu"), quantize=quantize
+    )
+
+    assert calls == 2
+    assert torch.isfinite(result.tensors["svh"]).all()
+
+
+def test_online_encoding_fails_after_second_nonfinite_result(monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "off")
+    key = _key()
+    calls = 0
+
+    def quantize():
+        nonlocal calls
+        calls += 1
+        tensors = _tensors(key)
+        tensors["suh"][0] = float("nan")
+        return tensors, 0.125
+
+    with pytest.raises(Exl3OnlineNonFiniteError, match="non-finite"):
+        _load_online_encoding_with_retry(
+            key, device=torch.device("cpu"), quantize=quantize
+        )
+
+    assert calls == 2
 
 
 def test_readonly_miss_does_not_publish(tmp_path, monkeypatch):
