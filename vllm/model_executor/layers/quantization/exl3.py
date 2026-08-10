@@ -1481,10 +1481,10 @@ class Exl3Config(QuantizationConfig):
             logger.warning_once(
                 "EXL3 BF16 online Trellis: encoding eligible non-EXL3 "
                 "linear weights at K=%d; 128-unaligned matrices retain the "
-                "configured MXFP8 path (module example: %s).",
+                "configured MXFP8 path.",
                 bits,
-                prefix,
             )
+            logger.debug("EXL3 BF16 online Trellis overlay applied to %s", prefix)
             return Exl3OnlineLinearMethod(
                 bits=bits,
                 prefix=prefix,
@@ -1494,9 +1494,8 @@ class Exl3Config(QuantizationConfig):
 
         logger.info_once(
             "EXL3 BF16 online overlay: quantizing non-EXL3 %s projections "
-            "to MXFP8 at load time (module example: %s).",
+            "to MXFP8 at load time.",
             "shared-expert" if shared_expert else "dense-linear",
-            prefix,
         )
         logger.debug("EXL3 BF16 MXFP8 overlay applied to %s", prefix)
         return Mxfp8OnlineLinearMethod()

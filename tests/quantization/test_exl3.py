@@ -201,6 +201,30 @@ def test_exl3_online_trellis_selects_cached_k6_method(monkeypatch):
     assert method.encoder_identity == "encoder"
 
 
+def test_exl3_online_trellis_logs_one_stable_summary(monkeypatch):
+    config = Exl3Config()
+    config._online_model_identity = "model"  # noqa: SLF001
+    config._online_encoder_identity = "encoder"  # noqa: SLF001
+    _set_online_overlay(monkeypatch, QuantizationConfigArgs(linear="mxfp8"))
+    monkeypatch.setattr(
+        fp8_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_TRELLIS_BITS", "6")
+    warning_keys = set()
+    monkeypatch.setattr(
+        exl3_module.logger,
+        "warning_once",
+        lambda message, *args: warning_keys.add((message, args)),
+    )
+
+    config.get_quant_method(_mock_linear(), "model.layers.3.self_attn.o_proj")
+    config.get_quant_method(_mock_linear(), "model.layers.4.self_attn.o_proj")
+
+    assert len(warning_keys) == 1
+
+
 def test_online_trellis_cache_off_does_not_require_hub_commit(tmp_path, monkeypatch):
     config = Exl3Config()
     monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "off")
