@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.exl3_online_cache import (
     Exl3OnlineNonFiniteError,
     cache_mode,
     cache_path,
+    cache_root,
     load_or_quantize,
     resolve_encoder_identity,
     resolve_model_identity,
@@ -94,6 +95,40 @@ def test_corrupt_cache_is_replaced_atomically(tmp_path, monkeypatch):
     assert calls == 1
     assert not result.hit
     assert reloaded.hit
+
+
+def test_cache_publish_failure_keeps_completed_encoding(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "readwrite")
+    key = _key()
+    calls = 0
+
+    def quantize():
+        nonlocal calls
+        calls += 1
+        return _tensors(key), 0.25
+
+    def fail_save(*args, **kwargs):
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.exl3_online_cache._save",
+        fail_save,
+    )
+
+    result = load_or_quantize(key, device=torch.device("cpu"), quantize=quantize)
+
+    assert calls == 1
+    assert not result.hit
+    assert result.path is None
+    assert result.proxy_error == pytest.approx(0.25)
+
+
+def test_cache_root_uses_vllm_cache_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_EXL3_ONLINE_CACHE_DIR", raising=False)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+
+    assert cache_root() == tmp_path / "exl3_online"
 
 
 @pytest.mark.parametrize("bad_field", ["suh", "svh", "proxy_error"])
@@ -241,9 +276,12 @@ def test_local_model_identity_tracks_metadata_and_shards(tmp_path):
 
     before = resolve_model_identity(str(model))
     config.write_text('{"model_type":"changed"}', encoding="utf-8")
-    after = resolve_model_identity(str(model))
+    after_config = resolve_model_identity(str(model))
+    shard.write_bytes(b"changed weight payload")
+    after_shard = resolve_model_identity(str(model))
 
-    assert before != after
+    assert before != after_config
+    assert after_config != after_shard
 
 
 def test_hub_model_identity_tracks_resolved_revision():

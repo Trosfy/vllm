@@ -227,11 +227,13 @@ def test_online_trellis_encoder_requires_quantize_entrypoint(tmp_path, monkeypat
         lambda name: SimpleNamespace(),
     )
 
-    with pytest.raises(RuntimeError, match="has no quantize_exl3"):
-        exl3_module._load_exl3_online_quantizer()
-    for name in tuple(exl3_module.sys.modules):
-        if name == "_vllm_exl3_encoder" or name.startswith("_vllm_exl3_encoder."):
-            monkeypatch.delitem(exl3_module.sys.modules, name, raising=False)
+    try:
+        with pytest.raises(RuntimeError, match="has no quantize_exl3"):
+            exl3_module._load_exl3_online_quantizer()
+    finally:
+        for name in tuple(exl3_module.sys.modules):
+            if name == "_vllm_exl3_encoder" or name.startswith("_vllm_exl3_encoder."):
+                exl3_module.sys.modules.pop(name, None)
 
 
 def test_exl3_online_trellis_cache_hit_skips_encoder(monkeypatch):

@@ -20,6 +20,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -195,8 +196,7 @@ def cache_root() -> Path:
     configured = os.getenv("VLLM_EXL3_ONLINE_CACHE_DIR")
     if configured and configured.strip():
         return Path(configured).expanduser()
-    vllm_root = Path(os.getenv("VLLM_CACHE_ROOT", "~/.cache/vllm")).expanduser()
-    return vllm_root / "exl3_online"
+    return Path(envs.VLLM_CACHE_ROOT) / "exl3_online"
 
 
 def cache_path(key: Exl3OnlineCacheKey) -> Path:
@@ -329,7 +329,7 @@ def load_or_quantize(
     if path.is_file():
         try:
             return _to_device(_load(path, key), device)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - invalid caches are regenerated
             logger.warning("Ignoring invalid online EXL3 cache %s: %s", path, exc)
 
     if mode == "readonly":
@@ -342,13 +342,24 @@ def load_or_quantize(
             if path.is_file():
                 try:
                     return _to_device(_load(path, key), device)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - invalid caches are replaced
                     logger.warning(
                         "Replacing invalid online EXL3 cache %s: %s", path, exc
                     )
                     path.unlink(missing_ok=True)
             result = _quantize(key, quantize, path=path)
-            _save(path, key, result)
+            try:
+                _save(path, key, result)
+            except Exception as exc:  # noqa: BLE001 - cache publication is optional
+                logger.warning(
+                    "Unable to publish online EXL3 cache %s; using the encoded "
+                    "weights for this process: %s",
+                    path,
+                    exc,
+                )
+                return Exl3OnlineCacheResult(
+                    result.tensors, result.proxy_error, False, None
+                )
             return result
     except OSError as exc:
         logger.warning(

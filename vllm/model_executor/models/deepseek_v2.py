@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import operator
 import re
 import typing
 from collections.abc import Callable, Iterable
@@ -2195,6 +2196,19 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 # Compatibility with
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-Base/blob/main/configuration_deepseek.py
+def _nonnegative_layer_count(config, name: str, *, default: int = 0) -> int | None:
+    """Return an integral layer count, or None for malformed config values."""
+
+    value = getattr(config, name, default)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        value = operator.index(value)
+    except TypeError:
+        return None
+    return value if value >= 0 else None
+
+
 def _skip_disabled_mtp_weight(config, name: str) -> bool:
     """Report whether a checkpoint weight targets a disabled MTP layer.
 
@@ -2210,10 +2224,9 @@ def _skip_disabled_mtp_weight(config, name: str) -> bool:
         MTP-layer tensor with no destination module; False otherwise.
     """
 
-    try:
-        nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
-        hidden = int(getattr(config, "num_hidden_layers", 0) or 0)
-    except (TypeError, ValueError):
+    nextn = _nonnegative_layer_count(config, "num_nextn_predict_layers")
+    hidden = _nonnegative_layer_count(config, "num_hidden_layers")
+    if nextn is None or hidden is None:
         return False
     if nextn != 0 or hidden <= 0:
         return False
@@ -2224,16 +2237,15 @@ def _skip_disabled_mtp_weight(config, name: str) -> bool:
 def get_spec_layer_idx_from_weight_name(
     config: DeepseekV2Config | DeepseekV3Config, weight_name: str
 ) -> int | None:
-    if (
-        hasattr(config, "num_nextn_predict_layers")
-        and config.num_nextn_predict_layers > 0
-    ):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(
-                f"model.layers.{layer_idx + i}."
-            ) or weight_name.startswith(f"layers.{layer_idx + i}."):
-                return layer_idx + i
+    nextn = _nonnegative_layer_count(config, "num_nextn_predict_layers")
+    layer_idx = _nonnegative_layer_count(config, "num_hidden_layers")
+    if nextn is None or layer_idx is None or nextn == 0:
+        return None
+    for i in range(nextn):
+        if weight_name.startswith(
+            f"model.layers.{layer_idx + i}."
+        ) or weight_name.startswith(f"layers.{layer_idx + i}."):
+            return layer_idx + i
     return None
 
 
