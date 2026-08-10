@@ -2241,11 +2241,12 @@ def get_spec_layer_idx_from_weight_name(
     layer_idx = _nonnegative_layer_count(config, "num_hidden_layers")
     if nextn is None or layer_idx is None or nextn == 0:
         return None
-    for i in range(nextn):
-        if weight_name.startswith(
-            f"model.layers.{layer_idx + i}."
-        ) or weight_name.startswith(f"layers.{layer_idx + i}."):
-            return layer_idx + i
+    match = re.match(r"^(?:model\.)?layers\.(\d+)\.", weight_name)
+    if match is None:
+        return None
+    weight_layer_idx = int(match.group(1))
+    if layer_idx <= weight_layer_idx < layer_idx + nextn:
+        return weight_layer_idx
     return None
 
 

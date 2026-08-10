@@ -424,7 +424,7 @@ def test_three_tier_prefill_uses_native_b12x_dispatch():
         assert torch.equal(torch.cat([route[1] for route in h.mixed_api.routed]), ids)
 
 
-def test_mixed_runtime_policy_is_resolved_once(monkeypatch):
+def test_mixed_runtime_policy_is_resolved_once():
     calls = 0
 
     def properties(device):
@@ -438,7 +438,7 @@ def test_mixed_runtime_policy_is_resolved_once(monkeypatch):
         )
 
     with _Harness() as h:
-        monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+        torch.cuda.get_device_properties = properties
         method = _make_method()
         layer = _make_mixed_layer()
         x = torch.zeros((16, HIDDEN), dtype=torch.bfloat16)

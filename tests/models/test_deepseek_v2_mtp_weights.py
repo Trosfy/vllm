@@ -26,6 +26,18 @@ def test_spec_layer_index_uses_valid_layer_counts():
     assert get_spec_layer_idx_from_weight_name(config, "model.layers.81.weight") is None
 
 
+def test_spec_layer_index_does_not_scan_configured_layer_count():
+    config = SimpleNamespace(
+        num_hidden_layers=78,
+        num_nextn_predict_layers=10**12,
+    )
+
+    assert get_spec_layer_idx_from_weight_name(config, "model.layers.80.weight") == 80
+    assert (
+        get_spec_layer_idx_from_weight_name(config, "model.embed_tokens.weight") is None
+    )
+
+
 @pytest.mark.parametrize("invalid", [None, True, "3", 3.0, -1, [3]])
 def test_malformed_mtp_layer_counts_fail_closed(invalid):
     valid = SimpleNamespace(num_hidden_layers=78, num_nextn_predict_layers=3)

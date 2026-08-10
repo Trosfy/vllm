@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import filelock
 import pytest
 import torch
 
@@ -122,6 +123,39 @@ def test_cache_publish_failure_keeps_completed_encoding(tmp_path, monkeypatch):
     assert not result.hit
     assert result.path is None
     assert result.proxy_error == pytest.approx(0.25)
+
+
+def test_cache_lock_timeout_falls_back_to_uncached_encoding(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_EXL3_ONLINE_CACHE_MODE", "readwrite")
+    key = _key()
+    observed_timeout = None
+
+    class HeldLock:
+        def __init__(self, lock_file, *, timeout):
+            nonlocal observed_timeout
+            self.lock_file = lock_file
+            observed_timeout = timeout
+
+        def __enter__(self):
+            raise filelock.Timeout(self.lock_file)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(filelock, "FileLock", HeldLock)
+
+    result = load_or_quantize(
+        key,
+        device=torch.device("cpu"),
+        quantize=lambda: (_tensors(key), 0.375),
+    )
+
+    assert observed_timeout == 600.0
+    assert not result.hit
+    assert result.path is None
+    assert result.proxy_error == pytest.approx(0.375)
+    assert not cache_path(key).exists()
 
 
 def test_cache_root_uses_vllm_cache_root(tmp_path, monkeypatch):

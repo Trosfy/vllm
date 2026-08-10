@@ -27,6 +27,9 @@ logger = init_logger(__name__)
 
 _CACHE_SCHEMA = 1
 _CACHE_TENSORS = frozenset({"trellis", "suh", "svh"})
+# A competing loader may need several minutes to encode a large projection.
+# After this bound, local encoding is preferable to blocking model startup.
+_CACHE_LOCK_TIMEOUT_SECONDS = 600.0
 CacheMode = Literal["off", "readonly", "readwrite"]
 QuantizeFn = Callable[[], tuple[Mapping[str, torch.Tensor], float | None]]
 
@@ -337,7 +340,7 @@ def load_or_quantize(
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock = filelock.FileLock(f"{path}.lock")
+        lock = filelock.FileLock(f"{path}.lock", timeout=_CACHE_LOCK_TIMEOUT_SECONDS)
         with lock:
             if path.is_file():
                 try:
@@ -361,6 +364,15 @@ def load_or_quantize(
                     result.tensors, result.proxy_error, False, None
                 )
             return result
+    except filelock.Timeout as exc:
+        logger.warning(
+            "Online EXL3 cache lock remained held for %.0f seconds at %s; "
+            "encoding without cache: %s",
+            _CACHE_LOCK_TIMEOUT_SECONDS,
+            path,
+            exc,
+        )
+        return _quantize(key, quantize, path=None)
     except OSError as exc:
         logger.warning(
             "Online EXL3 cache is unavailable at %s; encoding without cache: %s",
