@@ -105,9 +105,10 @@ _B12X_TRELLIS_WARMED_DEVICES: set[int] = set()
 _B12X_TRELLIS_C_TMP_CAP = 192 * 4 * 64 * 256
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
-# glm52-r7-sparkinfer: keyed on launch geometry, shared across layers.
+# Mixed-bitrate scratch buffers are keyed by launch geometry and shared across
+# layers owned by the same model or draft runner.
 _MIXED_TRELLIS_BUFFERS: dict[tuple[Any, ...], Any] = {}
-# glm52-r7-cudagraph: fused projection-wise mixed-K path
+# The projection-wise mixed-bitrate fallback owns graph-stable runtime storage.
 _R7_GRAPH_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
@@ -516,24 +517,20 @@ def _positive_env_int(name: str, default: int) -> int:
 
 
 def _resolve_r7_a1_min_rows(ext: Any) -> int:
-    """Rows at or above which the R7 MoE uses the A1 re-tile entry.
+    """Resolve the row threshold for ``exl3_moe_r7_fused_retile``.
 
-    Returns 0 when A1 is unavailable or disabled, which keeps every launch on
-    exl3_moe_r7_fused. glm52-r7-a1-mixed.
+    Zero disables the retile entry and keeps every launch on
+    ``exl3_moe_r7_fused``.
     """
 
     if not hasattr(ext, "exl3_moe_r7_fused_retile"):
         return 0
     raw = os.environ.get("VLLM_EXL3_R7_A1_MIN_ROWS")
     if raw is None:
-        # MEASURED OFF. At min_rows=33 (prefill only) A1 cost 14.7% prefill and
-        # 12.9-26.4% decode against an otherwise identical control on the same
-        # image (see A1_MEASUREMENT.md). The decode half of that should not be
-        # reachable at all, which is itself unexplained -- the leading suspect
-        # is the 100,352 B MOE_A1_SMEM_MAX_BYTES opt-in leaving almost no L1 on
-        # a 128 KiB unified SM, and the carve-out reconfiguration bleeding into
-        # neighbouring launches. Set to 33 to re-enable prefill-only A1, or 1 to
-        # take it everywhere; do not change this default without a control run.
+        # Disabled by default. On RTX PRO 6000 Blackwell, a threshold of 33
+        # reduced prefill throughput by 14.7% and decode throughput by
+        # 12.9-26.4% under the conditions recorded in A1_MEASUREMENT.md.
+        # VLLM_EXL3_R7_A1_MIN_ROWS explicitly enables the retile entry.
         return 0
     value = int(raw)
     if value < 0:
@@ -542,7 +539,7 @@ def _resolve_r7_a1_min_rows(ext: Any) -> int:
 
 
 def _r7_fused_layer_budget():
-    """Max layers to convert, or None for no cap. glm52-r7-sparkinfer."""
+    """Return the mixed-bitrate B12X layer limit, or ``None`` when uncapped."""
 
     raw = os.environ.get("VLLM_EXL3_R7_FUSED_LAYERS")
     if raw is None or raw == "":
@@ -555,30 +552,26 @@ _R7_FC1_BALLAST: dict[tuple[Any, ...], torch.Tensor] = {}
 
 
 def _r7_fc1_ballast(slots: int, like: torch.Tensor) -> torch.Tensor:
-    """Shared, never-read w2 stand-in for the FC1 prepare. glm52-r7-sparkinfer.
+    """Return the shared FC2 placeholder required while preparing FC1.
 
-    Keyed on the tail shape only. Keying on `slots` as well allocated a fresh
-    buffer for nearly every layer -- slots is the per-layer max(gate, up) count
-    -- and retained all of them, which is where the ~0.35 GiB/layer of load
-    growth came from. One buffer per (tail shape, dtype, device) is sized at the
-    maximum expert count and narrowed; narrowing the leading dimension of a
-    contiguous tensor stays contiguous, which is all prepare validates.
+    ``prepare_weights`` validates this tensor but does not read it. The shared
+    pool is keyed by tail shape, dtype, and device, then narrowed to ``slots``;
+    including the layer-specific slot count in the key retains about
+    0.35 GiB of redundant storage per distinct layer geometry.
     """
 
-    return _r7_ballast_view(int(slots), like)  # glm52-r7-gate-tight: shared pool
+    return _r7_ballast_view(int(slots), like)
 
 
 _R7_W13_BALLAST: dict[tuple[Any, ...], torch.Tensor] = {}
 
 
 def _r7_w13_ballast(slots: int, like: torch.Tensor) -> torch.Tensor:
-    """Shared never-read [2, slots, ...] w13 stand-in for prepare. gate-tight.
+    """Return the shared ``[2, slots, ...]`` FC1 preparation placeholder.
 
-    prepare_weights requires the projection-major [2,E,...] w13 shape but only
-    validates it and returns a view this loader discards (rebinding w13 to the
-    tight [gate|up] buffer). So one zero buffer, sized to the max 2*slots and
-    reshaped from a contiguous flat prefix, serves every layer -- avoiding the
-    padded (2,max) allocation the earlier code kept resident (~0.6 GiB/layer).
+    ``prepare_weights`` requires a projection-major ``[2, E, ...]`` tensor but
+    only validates it. The loader binds the returned tier to a projection-tight
+    ``[gate | up]`` buffer, so every layer can alias one zero-filled pool.
     """
 
     plane = tuple(like.shape[1:])
@@ -591,18 +584,12 @@ _R7_BALLAST_POOL: dict[Any, torch.Tensor] = {}
 
 
 def _r7_ballast_view(planes: int, like: torch.Tensor) -> torch.Tensor:
-    """A view of ONE shared never-read scratch pool. glm52-r7-gate-tight.
+    """Return a view into the shared, never-read preparation pool.
 
-    prepare_weights validates w13/w2 shapes but this loader discards the views
-    it builds from them, so the contents are never read -- which means every
-    ballast request across layers, tiers and bitrates can alias one allocation.
-
-    Sizing per request instead re-allocated as tier sizes grew and fragmented
-    the heap enough to OOM during weight load; a per-bitrate max-size buffer
-    instead wasted ~2.1 GiB. One pool, allocated once at the worst case
-    (2 x 256 experts of the widest bitrate), costs ~0.8 GiB total and never
-    reallocates. The pool is int16-native and reshaped per request, so a K3
-    request simply uses a shorter contiguous prefix than a K4 one.
+    ``prepare_weights`` validates the shape but the loader discards every view
+    derived from this pool. One allocation therefore serves all layers, tiers,
+    and bitrates. Its 512-plane capacity covers two projections for 256 experts;
+    narrower encodings use a contiguous prefix.
     """
 
     plane = tuple(like.shape[1:])
@@ -622,10 +609,9 @@ def _r7_ballast_view(planes: int, like: torch.Tensor) -> torch.Tensor:
 
 
 def _r7_fused_enabled() -> bool:
-    """R7 on B12X's fused MoE.
+    """Return whether mixed-bitrate routed experts use fused B12X MoE.
 
-    On by default; set VLLM_EXL3_R7_FUSED=0 to force exl3_moe_r7_fused for a
-    control run.
+    ``VLLM_EXL3_R7_FUSED=0`` selects the projection-wise fallback.
     """
 
     return os.environ.get("VLLM_EXL3_R7_FUSED", "1") != "0"
@@ -646,14 +632,10 @@ def _shared_mixed_buffers(
 
     tier_count = 3 if hasattr(launch, "tier2_num_experts") else 2
 
-    # glm52-r7-gate-tight: max_m_blocks is DELIBERATELY excluded from the key.
-    # It derives from each layer's summed tier slots, which differ per layer
-    # (262, 273, 272, ... on this checkpoint), so keying on it produced a
-    # separate ~574 MiB prefill arena for every distinct tier signature --
-    # ~4.6 GiB of duplicate scratch that logger.info_once hid from the logs.
-    # Instead one arena per launch geometry is grown to the largest
-    # max_m_blocks seen; the arena is scratch, so a larger one serves any
-    # smaller launch.
+    # max_m_blocks is intentionally excluded from the key. It derives from
+    # projection-tier slot counts and varies by layer, while route capacity is
+    # fixed by the global-expert namespace below. Including it retains one
+    # approximately 574 MiB arena per distinct tier signature.
     key = (
         owner_token,
         device.index if hasattr(device, "index") else device,
@@ -669,12 +651,9 @@ def _shared_mixed_buffers(
         launch.route_ids_dtype,
         tier_count,
     )
-    # One arena per launch geometry, allocated ONCE. Growing it on a larger
-    # max_m_blocks thrashed (51 allocations, old arenas retained by the
-    # per-signature runtimes that already hold them), so the first arena for a
-    # geometry is sized by the first launch and reused. Scratch is indexed by
-    # the kernel's own bounds, and every launch sharing this key shares the
-    # capacity/block/tile/topk that size it.
+    # Each launch geometry owns one immutable arena. Every launch sharing this
+    # key also shares the capacity, block, tile, top-k, and routing dimensions
+    # that define the required storage.
     entry = _MIXED_TRELLIS_BUFFERS.get(key)
     if entry is None:
         # Routing has its own exact global-expert namespace. Projection slots
@@ -1020,9 +999,8 @@ class Exl3Config(QuantizationConfig):
             version=config.get("version"),
             tensor_storage=config.get("tensor_storage"),
         )
-        # --- glm52-mdispatch: r7 routed experts describe themselves ---
-        # They are absent from `tensor_storage`; keep their block so codebook
-        # and layer-range lookups can resolve them.
+        # Mixed-bitrate routed experts use the dedicated
+        # `r7_routed_experts` metadata block rather than `tensor_storage`.
         _r7 = config.get("r7_routed_experts")
         if _r7 is not None:
             if not isinstance(_r7, dict):
@@ -1066,7 +1044,6 @@ class Exl3Config(QuantizationConfig):
                 "moe_layers": tuple(layers),
                 "k_values": tuple(normalized_k),
             }
-        # --- end glm52-mdispatch ---
         return instance
 
     @classmethod
@@ -1554,16 +1531,11 @@ class Exl3Config(QuantizationConfig):
     def _moe_prefix_is_exl3(
         self, prefix: str, layer: torch.nn.Module | None = None
     ) -> bool:
-        # --- glm52-mdispatch: r7 routed experts are EXL3 too ---
-        # They are declared in `r7_routed_experts`, not `tensor_storage`, so
-        # stock detection returns False -> get_quant_method returns None ->
-        # fused_moe/routed_experts.py:209 SILENTLY substitutes
-        # UnquantizedFusedMoEMethod, allocating full-width BF16 expert buffers
-        # (~3.5x the real footprint) with no diagnostic. Fall through for
-        # everything else so the rank-sliced tail keeps its own detection.
+        # The `r7_routed_experts` metadata block is authoritative for its MoE
+        # layer range. Those weights are absent from `tensor_storage`, so they
+        # must be recognized here to avoid selecting an unquantized method.
         if self._r7_layer_range_contains(prefix):
             return True
-        # --- end glm52-mdispatch ---
         if self.rank_sliced_metadata is not None:
             match = re.search(r"layers\.(\d+)\b", prefix)
             if match is None:
@@ -1594,28 +1566,21 @@ class Exl3Config(QuantizationConfig):
     def codebook_for_prefix(self, prefix: str) -> str | None:
         if self.rank_sliced_metadata is not None:
             match = re.search(r"layers\.(\d+)\b", prefix)
-            # --- glm52-mdispatch: hybrid checkpoints ---
-            # A rank-sliced TAIL does not make the whole checkpoint
-            # rank-sliced. Claim "mcg" only for layers actually inside
-            # moe_layers; every other prefix (dense/attention EXL3 recorded in
-            # tensor_storage, and the r7 routed experts) must still resolve
-            # below. Returning None here makes each of them fail as
-            # "unexpected codebook[None]" even though it ships an mcg marker.
+            # Rank-sliced metadata applies only to its declared MoE layer
+            # range. Dense, attention, and mixed-bitrate routed-expert weights
+            # resolve their codebooks through their own metadata below.
             if match is not None:
                 first, last = (int(v) for v in self.rank_sliced_metadata["moe_layers"])
                 if first <= int(match.group(1)) <= last:
                     return "mcg"
-            # --- end glm52-mdispatch ---
         entry = self._storage_entry(prefix)
         if entry is None:
-            # --- glm52-mdispatch: r7 routed experts declare their own ---
-            # Without this the shipped mcg markers read as "unexpected
-            # codebook marker". Inert without an r7 block.
+            # Mixed-bitrate routed experts declare their codebook in
+            # `r7_routed_experts` rather than `tensor_storage`.
             if self._r7_layer_range_contains(prefix):
                 _cb = getattr(self, "r7_routed_experts", {}).get("codebook")
                 if _cb in ("mcg", "mul1"):
                     return str(_cb)
-            # --- end glm52-mdispatch ---
             return None
         suffixes = {name.rsplit(".", 1)[-1] for name in entry.get("stored_tensors", {})}
         if "mcg" in suffixes:
@@ -1627,15 +1592,14 @@ class Exl3Config(QuantizationConfig):
     def _r7_layer_range_contains(self, prefix: str) -> bool:
         """True when `prefix` names a layer inside r7_routed_experts.moe_layers.
 
-        glm52-mdispatch. The r7 layout keeps its own layer range instead of
-        appearing in `tensor_storage`; nothing in stock vLLM reads it.
+        The `r7_routed_experts` checkpoint schema stores its MoE layer range
+        independently from `tensor_storage`.
         """
         r7 = getattr(self, "r7_routed_experts", None)
         if not isinstance(r7, dict):
             return False
-        # r7_routed_experts describes ROUTED EXPERTS only. Without this the
-        # range would also claim attention/dense prefixes in the same layers
-        # (e.g. kv_b_proj, which is BF16 here).
+        # The metadata applies only to routed experts; attention and dense
+        # prefixes in the same layer can use a different storage format.
         if ".mlp.experts" not in prefix:
             return False
         layers = r7.get("moe_layers")
@@ -1651,10 +1615,9 @@ class Exl3Config(QuantizationConfig):
 
     def normalize_rank_sliced_weight_name(self, name: str) -> str | None:
         """Drop non-local TP payloads and remove the serialized rank segment."""
-        # --- glm52-mdispatch: r7 shared rotations (topology-neutral) ---
-        # ONE h-side rotation per layer, shared by every expert, no rank
-        # segment. Rewrite into expert 0's slot; exl3_shared_h_rotations then
-        # makes the existing shared-parameter machinery serve it.
+        # The checkpoint stores one hidden-side rotation per layer with no TP
+        # rank segment. Expert zero is the canonical storage slot; the loader
+        # aliases that tensor for the remaining experts.
         if getattr(self, "r7_routed_experts", None) is not None:
             _r7 = re.match(
                 r"^(?P<experts_prefix>.+\.experts)\.r7_shared\."
@@ -1665,7 +1628,6 @@ class Exl3Config(QuantizationConfig):
                 if _r7.group("field") == "gate_up_suh":
                     return f"{_r7.group('experts_prefix')}.0.gate_proj.suh"
                 return f"{_r7.group('experts_prefix')}.0.down_proj.svh"
-        # --- end glm52-mdispatch ---
         if self.rank_sliced_metadata is None:
             return name
         shared_match = _SHARED_H_WEIGHT_RE.match(name)
@@ -2523,24 +2485,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
-        # glm52-r7-cudagraph: checkpoint-driven; no serving env switch.
+        # The checkpoint's routed-expert metadata selects this path; no
+        # serving-time switch is required.
         layer.exl3_r7_graph = self.quant_config._r7_layer_range_contains(
             str(layer.layer_name)
         )
-        # glm52-r7-prefill: plan the R7 arena against the scheduler contract
-        #
-        # The rank-sliced path reads scheduler_config.max_num_batched_tokens
-        # here and plans one prefill-sized arena from it. The R7 path had no
-        # equivalent, so it planned a fixed 128-row arena and re-entered the
-        # fused MoE once per 128 tokens. Stamp the same capacity, for the same
-        # reason the rank-sliced branch stamps it here and not at forward time:
-        # the profile pass and CUDA-graph capture both run after
-        # set_current_vllm_config has exited, where
-        # get_current_vllm_config_or_none() returns None.
-        #
-        # R7 layers take the `rank_sliced = False` branch below (their layer
-        # range is disjoint from rank_sliced_metadata["moe_layers"]), so they
-        # never reach the rank-sliced stamp.
+        # Plan the mixed-bitrate staging arena from the scheduler's maximum
+        # token batch while model-construction config is available. Profile and
+        # CUDA graph capture run after this config context has exited.
         if layer.exl3_r7_graph:
             _r7_vllm_config = get_current_vllm_config_or_none()
             _r7_scheduler = (
@@ -2570,13 +2522,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         r7_slice_start = layer.exl3_tp_rank * layer.exl3_intermediate_size_per_partition
         r7_slice_size = layer.exl3_intermediate_size_per_partition
         rank_sliced = self.quant_config.rank_sliced_metadata is not None
-        # --- glm52-mdispatch: route per layer, not per checkpoint ---
-        # A checkpoint may carry a rank-sliced TAIL (e.g. hybrid_tr3_tail
-        # moe_layers [78,78], "carried_mtp78_only") alongside a body stored in
-        # a non-rank-sliced layout. Deciding globally drags the body onto the
-        # slab path, which stacks every expert at one bitrate and dies on
-        # mixed k. Honour the declared range instead, and stamp the decision on
-        # the layer so later branches agree with this one.
+        # Rank-sliced metadata can cover only a subset of MoE layers. Record
+        # the per-layer decision so weight loading, preparation, and execution
+        # use the same storage contract.
         if rank_sliced:
             _rs_layers = self.quant_config.rank_sliced_metadata.get("moe_layers")
             _rs_match = re.search(r"layers\.(\d+)\b", str(layer.layer_name))
@@ -2589,16 +2537,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     int(_rs_layers[0]) <= int(_rs_match.group(1)) <= int(_rs_layers[1])
                 )
         layer.exl3_rank_sliced = rank_sliced
-        # --- end glm52-mdispatch ---
         shared_h = (
             rank_sliced
             and self.quant_config.rank_sliced_rotation_layout
             == _SHARED_H_ROTATION_LAYOUT
         )
-        # --- glm52-mdispatch: r7 layers share (w13,suh) and (w2,svh) ---
+        # The mixed-bitrate schema stores one hidden-side rotation per layer.
         if self.quant_config._r7_layer_range_contains(str(layer.layer_name)):
             shared_h = True
-        # --- end glm52-mdispatch ---
         layer.exl3_shared_h_rotations = shared_h
         if rank_sliced:
             checkpoint_tp = int(self.quant_config.rank_sliced_metadata["tp"])
@@ -2685,14 +2631,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         required = {"w13": ("w1", "w3"), "w2": ("w2",)}
-        # --- glm52-mdispatch: r7 stores ONE gate_up_suh for gate AND up ---
-        # shared_h_v1 keeps a separate shared tensor per projection; r7 keeps
-        # one, because gate_proj and up_proj consume the same activation.
+        # `r7_shared.gate_up_suh` is shared by gate and up projections because
+        # both consume the same activation.
         if getattr(layer, "exl3_shared_h_rotations", False):
             _w13_suh = layer.w13_suh.exl3_tensors
             if (0, "w1") in _w13_suh and (0, "w3") not in _w13_suh:
                 _w13_suh[(0, "w3")] = _w13_suh[(0, "w1")]
-        # --- end glm52-mdispatch ---
         missing: list[str] = []
         for prefix, shard_ids in required.items():
             for attr in ("suh", "svh", "trellis"):
@@ -2717,7 +2661,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 + (" ..." if len(missing) > 32 else "")
             )
         self._validate_codebooks(layer)
-        # glm52-mdispatch: per-layer routing (see create_weights)
+        # Apply TP slicing only to layers whose metadata does not already
+        # provide rank-local payloads.
         if not getattr(
             layer,
             "exl3_rank_sliced",
@@ -2733,13 +2678,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         device=device, non_blocking=True
                     ).contiguous()
         self._validate_moe_shapes(layer)
-        # --- glm52-mdispatch: broadcast shared rotations on the std path ---
-        # `_apply_expert` indexes suh/svh by (expert_id, shard_id), so every
-        # expert needs a key. The rank-sliced path broadcasts a 1-row slab in
-        # `_select_rotation_rows`; the standard path has no equivalent. Alias
-        # the SAME device tensor into each expert's slot -- dict entries, not
-        # copies -- and never clobber a genuine per-expert tensor. Runs after
-        # the TP narrow and the device move so the alias is already final.
+        # `_apply_expert` indexes rotations by (expert_id, shard_id). For a
+        # shared-H checkpoint, populate every key with the same device tensor;
+        # these are aliases, not copies, and explicit per-expert tensors win.
         _rs = getattr(
             layer,
             "exl3_rank_sliced",
@@ -2784,8 +2725,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         f"dtype={_tt.dtype} sum={_v.sum().item():.6f}"
                     )
             print(chr(10).join(_out), flush=True)
-        # --- end glm52-mdispatch ---
-
         if getattr(layer, "exl3_r7_graph", False):
             # Prefer the native two- or three-tier B12X mixed-Trellis kernel.
             if _r7_fused_enabled() and self._prepare_r7_b12x_weights(layer):
@@ -3811,10 +3750,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
 
         def rotation(group: str, attr: str, shard_id: str) -> torch.Tensor:
-            # glm52-r7-broadcast-rotations: R7 stores ONE shared row per
-            # layer (r7_shared.gate_up_suh / r7_shared.down_svh, [hidden]).
-            # r28's ABI v6 takes it as a broadcast row, so hand it (1, hidden)
-            # instead of num_experts bit-identical copies (~700 MiB saved).
+            # ABI v6 accepts `r7_shared.gate_up_suh` and
+            # `r7_shared.down_svh` as one `[1, hidden]` broadcast row. Expanding
+            # them to one identical row per expert costs about 700 MiB/rank.
             tensors = getattr(layer, f"{group}_{attr}").exl3_tensors
             return tensors[(0, shard_id)].unsqueeze(0).contiguous()
 
@@ -3863,14 +3801,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             def plane(expert_ids, shard_id, param, slots, out=None, row=0, base=None):
                 """Copy experts into a preallocated slab, releasing each source.
 
-                torch.stack would hold a whole extra layer while every source
-                expert is still resident, which accumulated until load OOMed
-                around layer 68 of 75. Popping each tensor out of exl3_tensors
-                as it is consumed keeps the extra to one expert.
-
-                glm52-r7-gate-tight: base!=None packs directly into a flat
-                [gate|up] buffer at out[base+index], so no padded (2,max) w13 is
-                ever materialised.
+                Consuming one source at a time limits transient storage to one
+                expert. When ``base`` is set, gate and up planes occupy a
+                projection-tight ``[gate | up]`` buffer without a padded
+                ``[2, max(gate, up)]`` intermediate.
                 """
                 if out is None:
                     if not expert_ids:
@@ -3973,9 +3907,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 # dtype view, not a repack -- w2_scale = the shared four-byte
                 # dummy, and w2_global_scale = ones(num_experts). So FC2 is
                 # constructed directly at its own count and only FC1 goes
-                # through prepare. That removes the full-size counterpart
-                # tensor the earlier splice needed, which was OOMing at ~558
-                # MiB during load.
+                # through prepare. A full-size counterpart is unnecessary and
+                # would add approximately 558 MiB of transient load storage.
                 def call(n, w13_in, w2_in):
                     return mixed_api.prepare_weights(
                         w13=w13_in,
@@ -4000,11 +3933,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         intermediate_rotations=intermediate_rotations[:n].contiguous(),
                         down_svh=down_svh[:1].contiguous(),
                         tile_config=cfg,
-                        # glm52-r7-ballast-dealias: a view into the ballast
-                        # pool would be stored verbatim in the frozen tier,
-                        # keeping the whole ~576 MiB allocation alive (192
-                        # live aliases per rank). Hand prepare an equivalent
-                        # standalone scalar so the pool can actually be freed.
+                        # The prepared tier retains this object. A standalone
+                        # scalar avoids retaining the approximately 576 MiB
+                        # shared preparation pool through a one-element view.
                         workspace=torch.zeros(
                             1, dtype=torch.int32, device=w13_in.device
                         ),
@@ -4067,10 +3998,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # glm52-r7-pad-before-prepare: the padding MUST happen before the
-        # prepare loop. prepare stores the [:1]/[:n] slices it is handed as
-        # views, so padding afterwards leaves the unpadded originals pinned
-        # alongside the padded copies -- 448.5 MiB per rank on this model.
+        # Padding must precede preparation because prepared tiers retain the
+        # slices they receive. Padding after preparation retains both tables,
+        # adding 448.5 MiB/rank for the qualified GLM-5.2 checkpoint.
         # Every combined-expert-indexed table is sized by the summed tier slot
         # counts, not by the real expert count, so the padded stride applies to
         # the rotations as well. Padding rows are never addressed: the kernel
@@ -4085,10 +4015,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             intermediate_rotations = torch.cat(
                 (intermediate_rotations, pad), dim=0
             ).contiguous()
-            # glm52-r7-broadcast-rotations: gate_suh/up_suh/down_svh are
-            # single broadcast rows now; padding them to `stride` would
-            # reinstate exactly the duplication this removes. Only the
-            # per-expert intermediate table is combined-expert indexed.
+            # gate_suh, up_suh, and down_svh are broadcast rows. Only the
+            # per-expert intermediate table uses combined-expert indexing.
             rotations = SimpleNamespace(
                 intermediate=intermediate_rotations,
                 gate_suh=gate_suh,
@@ -4123,8 +4051,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "global_to_combined": global_to_combined,
             "descriptor_map": descriptor_map,
             "rotations": rotations,
-            # glm52-r7-broadcast-rotations: the shared runtime builder reads
-            # these by direct index; omitting them raises KeyError on r28.
+            # The B12X runtime uses these flags to interpret one-row hidden-side
+            # rotations as broadcast values.
             "broadcast_suh": True,
             "broadcast_svh": True,
             "tile_config": tile_config,
@@ -4165,9 +4093,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> dict[str, Any]:
-        # glm52-r7-prefill: the token batch and the per-expert route block are
-        # two independent quantities, and the previous plan collapsed them into
-        # one `chunk = 128`.
+        # Token-batch capacity and the per-expert route block are independent.
         #
         #   * The token batch is exl3_moe's `bsz = hidden_state.size(0)`. The
         #     kernel imposes no upper bound on it: the only shape tie between
@@ -4178,18 +4104,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         #     many rows, and each block re-streams and re-decodes that expert's
         #     whole gate/up/down trellis.
         #
-        # Batching 128 tokens at a time therefore did not bound the arena (the
-        # route block did); it multiplied the number of fused-MoE entries per
-        # layer by ceil(max_num_batched_tokens / 128) and, because a 128-token
-        # batch routes only ~topk*128/num_experts rows to each expert, it made
-        # every expert tile a nearly empty M32 tile that still paid the full
-        # trellis decode. Planning the token batch at the scheduler capacity and
-        # keeping the route block at its previous value restores one entry per
-        # layer without changing the per-expert GEMM geometry.
+        # The scheduler batch therefore sizes token staging, while the route
+        # block sizes per-expert scratch. Keeping these dimensions separate
+        # permits one fused-MoE entry per scheduler batch without changing the
+        # per-expert GEMM geometry.
         max_batched_tokens = int(layer.exl3_r7_max_num_batched_tokens)
         capacity = _resolve_prefill_capacity(max_batched_tokens)
-        # Same role as VLLM_EXL3_PREFILL_BLOCK_M on the rank-sliced plan. The
-        # default reproduces the previously measured per-expert tiling exactly.
+        # This is the mixed-bitrate counterpart of
+        # VLLM_EXL3_PREFILL_BLOCK_M for rank-sliced weights.
         route_block = _positive_env_int("VLLM_EXL3_R7_ROUTE_BLOCK", 128)
         topk = int(topk_ids.shape[1])
         device_index = x.device.index
@@ -4218,8 +4140,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         route_capacity = capacity * topk
         runtime = {
             "ext": ext,
-            # glm52-r7-a1-mixed: resolved during the eager profile pass, never
-            # under capture, so the env read cannot vary between replays.
+            # Resolve environment policy during profile planning so CUDA graph
+            # replays use an immutable launch choice.
             "a1_min_rows": _resolve_r7_a1_min_rows(ext),
             "capacity": capacity,
             "route_block": route_block,
@@ -4296,8 +4218,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         runtime = self._r7_graph_runtime(layer, x, topk_ids)
         m = int(x.shape[0])
         capacity = int(runtime["capacity"])
-        # glm52-r7-prefill: fail closed rather than silently re-chunking a batch
-        # the scheduler promised would not occur.
+        # The scheduler contract is a hard capacity bound; execution does not
+        # silently re-plan or allocate under CUDA graph capture.
         if m > int(layer.exl3_r7_max_num_batched_tokens):
             raise ValueError(
                 "R7 EXL3 batch exceeds its planned capacity: "
@@ -4309,7 +4231,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         gate_bits, up_bits, down_bits = layer.exl3_r7_bitrates
         pointer_args = layer.exl3_r7_pointer_tables
         ext = runtime["ext"]
-        # glm52-r7-a1-mixed: a pure function of the captured static shape.
+        # The retile decision is a pure function of the captured static shape.
         a1_min_rows = int(runtime["a1_min_rows"])
         expert_map = layer.exl3_r7_expert_map
         # One entry per scheduler batch. The trip count is a pure function of
@@ -4796,7 +4718,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         ids = topk_ids.reshape(x_2d.shape[0], -1).contiguous()
         weights = topk_weights.reshape_as(ids).to(torch.float32).contiguous()
-        # glm52-mdispatch: per-layer routing (see create_weights)
+        # Execute the storage path selected and recorded during weight creation.
         if getattr(
             layer,
             "exl3_rank_sliced",
@@ -4805,9 +4727,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             output = self._apply_rank_sliced(layer, x_2d, weights, ids)
             return output.reshape(*original_shape, output.shape[-1])
         if getattr(layer, "exl3_r7_fused", False):
-            # glm52-r7-sparkinfer: the prepared dict uses the mixed-Trellis
-            # contract exactly, so the existing launch, runtime planning and
-            # prefill chunking are reused unchanged.
+            # The prepared mapping implements the mixed-Trellis launch contract,
+            # including graph-stable scratch and prefill capacity planning.
             output = self._apply_mixed_rank_sliced(layer, x_2d, weights, ids)
             return output.reshape(*original_shape, output.shape[-1])
         if getattr(layer, "exl3_r7_graph", False):
