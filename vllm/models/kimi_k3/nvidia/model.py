@@ -163,9 +163,10 @@ def _pack_aux_hidden_states_into_attn_res_workspace(
         raise ValueError("K3 auxiliary hidden states must match the target chunk")
     packed_width = len(aux_hidden_states) * hidden_size
     if packed_width > num_blocks * hidden_size:
-        raise ValueError(
-            "K3 auxiliary states exceed the dead AttnRes workspace capacity"
-        )
+        # Truncated validation models can expose more DSpark feature taps than
+        # reusable AttnRes blocks. Preserve the standard list representation
+        # when the dead workspace cannot hold every feature tensor.
+        return aux_hidden_states
     # The target has finished consuming every residual block. Reinterpret the
     # existing storage as a token-major contiguous matrix, then perform the
     # same copies torch.cat would have made without allocating another 140 MiB
