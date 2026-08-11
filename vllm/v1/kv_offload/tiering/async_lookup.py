@@ -172,6 +172,47 @@ class AsyncLookupManager(ABC):
                 if state is not None:
                     state.result = result
 
+    def invalidate(self, keys: Iterable[OffloadKey]) -> None:
+        """Mark keys as absent so the next lookup() stops reporting a hit.
+
+        A cached ``True`` is only a snapshot of the tier at the time of the
+        existence check; the block can disappear afterwards (evicted by this
+        instance's own capacity management, by another instance sharing
+        ``root_dir``, or by any external cleanup). Nothing else clears the
+        entry until every request that looked the key up has finished, so a
+        transfer that fails on a vanished block would otherwise be retried
+        against the same stale ``True`` on every subsequent step, and the
+        request that is waiting for it never finishes -- a livelock, with the
+        failing job re-submitted forever.
+
+        ``False`` rather than ``None``: a fresh lookup is only ever queued for a
+        key with no state at all, so ``None`` would make lookup() report RETRY
+        forever instead of recomputing. Whether absence is also literally true
+        depends on the tier -- the fs tier's ``load_block`` unlinks any file it
+        could not read, while a failed object-store read leaves the object in
+        place -- but a pessimistic ``False`` is always safe: it costs at most a
+        recompute, and it expires with the requests that looked the key up,
+        after which a fresh existence check can hit again.
+        """
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is not None:
+                state.result = False
+
+    def mark_present(self, keys: Iterable[OffloadKey]) -> None:
+        """Refresh cached states after an authoritative successful store.
+
+        A failed load marks an entry absent so the request can recompute it.
+        Overlapping requests may keep that shared state alive after the
+        recomputed block has been stored again, so waiting for cleanup would
+        leave a stale miss until all of them finish. Only update existing
+        states; a key nobody has looked up does not need a cache entry.
+        """
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is not None:
+                state.result = True
+
     def cleanup(self, req_id: str) -> None:
         """Remove entries no longer needed by any active request.
 

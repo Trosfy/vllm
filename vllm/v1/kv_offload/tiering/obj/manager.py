@@ -139,8 +139,12 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
                     "emit events.",
                     tier_type,
                 )
-        # Keys of in-flight store jobs, tracked only when events are enabled.
+        # Keys of in-flight stores, used to refresh lookup state on success and
+        # to emit events when enabled.
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
+        # Keys of in-flight load jobs, so a failed load can invalidate the
+        # cached existence results that sent it here.
+        self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
 
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
@@ -273,14 +277,18 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         return LookupResult.HIT if result else LookupResult.MISS
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
-        if self.events is not None:
-            self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+        self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
         self._submit_transfer(
             job_metadata.job_id, job_metadata.block_ids, obj_keys, NIXL_WRITE
         )
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        # Recorded before _submit_transfer so its submission-time failure
+        # paths (register_memory, prep_xfer_dlist, make_prepped_xfer,
+        # transfer) also invalidate the cached lookups that routed this
+        # load here, not just transfers that fail in flight.
+        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
         self._submit_transfer(
             job_metadata.job_id, job_metadata.block_ids, obj_keys, NIXL_READ
@@ -323,13 +331,26 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._poll_active_transfers()
         results = self._pending_results
         self._pending_results = []
-        if self.events is not None:
-            for result in results:
-                keys = self._store_job_keys.pop(result.job_id, None)
-                if result.success and keys:
+        for result in results:
+            load_keys = self._load_job_keys.pop(result.job_id, None)
+            if load_keys is not None and not result.success:
+                # The store no longer answers for these keys (vanished object
+                # or persistently failing read). Drop the cached existence
+                # results so the next lookup reports a miss and the tokens are
+                # recomputed; leaving them cached as present would re-submit
+                # this same failing load on every step. Unlike the fs tier's
+                # load_block, a failed read does not remove the object, so
+                # this can be pessimistic -- but only until the requests that
+                # looked the keys up finish, after which a fresh existence
+                # probe can hit again.
+                self._lookup_manager.invalidate(load_keys)
+            store_keys = self._store_job_keys.pop(result.job_id, None)
+            if result.success and store_keys:
+                self._lookup_manager.mark_present(store_keys)
+                if self.events is not None:
                     self.events.append(
                         OffloadingEvent(
-                            keys=keys,
+                            keys=store_keys,
                             medium=self.medium,
                             removed=False,
                             locality=self.locality,
