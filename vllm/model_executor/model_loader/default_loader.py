@@ -255,7 +255,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: "Source", *, instanttensor_owning_tensors: bool = False
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -300,6 +300,7 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
                     indexed_tensor_files=indexed_tensor_files,
+                    owning_tensors=instanttensor_owning_tensors,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
@@ -352,6 +353,17 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        instanttensor_owning_tensors = self.load_config.load_format == (
+            "instanttensor"
+        ) and any(
+            getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
+            for module in model.modules()
+        )
+        if instanttensor_owning_tensors:
+            logger.info_once(
+                "InstantTensor is using owning views for the online-quantized "
+                "model; the target model remains on the zero-copy path."
+            )
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -362,14 +374,20 @@ class DefaultModelLoader(BaseModelLoader):
                 model, "checkpoint_weight_name_prefixes", None
             ),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(
+            primary_weights,
+            instanttensor_owning_tensors=instanttensor_owning_tensors,
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(
+                source,
+                instanttensor_owning_tensors=instanttensor_owning_tensors,
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -446,33 +464,6 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        if self.load_config.load_format == "instanttensor" and (
-            meta_device_layers := sorted(
-                {
-                    type(quant_method).__name__
-                    for module in model.modules()
-                    if getattr(
-                        (quant_method := getattr(module, "quant_method", None)),
-                        "uses_meta_device",
-                        False,
-                    )
-                }
-            )
-        ):
-            # Online-quantized layers route loads through the layerwise
-            # wrapper, which buffers yielded tensors until a module's last
-            # shard arrives. InstantTensor's copy=False views alias
-            # ring-buffer storage that is recycled as soon as the loader
-            # returns, so deferred replay reads whichever bytes landed there
-            # later -- nondeterministic weight corruption keyed to IO timing.
-            raise ValueError(
-                "load_format='instanttensor' cannot load models with online-"
-                f"quantized (meta-device) layers ({', '.join(meta_device_layers)}): "
-                "deferred weight buffering outlives InstantTensor's zero-copy "
-                "ring-buffer views. Use --load-format safetensors or "
-                "fastsafetensors, whose iterators yield owned tensors."
-            )
-
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (

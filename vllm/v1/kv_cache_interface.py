@@ -742,6 +742,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     compress_ratio: int = 1
     model_version: str | None = None
     dcp_sharded: bool = False
+    # DSpark flattens its non-causal query block into independent decode rows.
+    # Keep this execution marker when its MLA cache is window-bounded.
+    non_causal_multi_token_decode: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -834,6 +837,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
             dcp_sharded=dcp_sharded_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
     def is_uniform_with_collection(
@@ -1115,6 +1121,9 @@ class KVCacheTensor:
     shared_by: list[str]  # layer names that share the same KV cache tensor
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    # Sized by a group's private pool rather than KVCacheConfig.num_blocks, so
+    # cross-rank num_blocks equalization must leave it alone.
+    private_pool: bool = False
 
 
 @dataclass
@@ -1130,6 +1139,13 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # When set, this group allocates from its own BlockPool of this many
+    # blocks instead of the shared pool, and its tensors are sized to it.
+    # Used for DCP-replicated sliding-window draft groups (DFlash): their
+    # per-request footprint plateaus at the window admission cap, so sizing
+    # them like full-length groups would tax every shared-pool block with a
+    # page the window can never use.
+    private_pool_num_blocks: int | None = None
 
 
 @dataclass

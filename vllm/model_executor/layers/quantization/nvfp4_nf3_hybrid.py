@@ -210,8 +210,8 @@ def _unpack_nf3_codes(packed: torch.Tensor, size_k: int) -> torch.Tensor:
 
 def _apply_nf3_codebook_override(levels: list[float]) -> None:
     """Install the checkpoint NF3 codebook for preparation and execution."""
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as kernel_module
-    from sparkinfer.moe._shared.kernels.w4a16 import prepare as prepare_module
+    from b12x.moe._shared.kernels.w4a16 import kernel as kernel_module
+    from b12x.moe._shared.kernels.w4a16 import prepare as prepare_module
 
     codebook = tuple(float(value) for value in levels)
     if tuple(kernel_module._NF3_CODEBOOK) != codebook:
@@ -221,7 +221,7 @@ def _apply_nf3_codebook_override(levels: list[float]) -> None:
         )
         kernel_module._NF3_CODEBOOK = codebook
         prepare_module._NF3_CODEBOOK = codebook
-    os.environ["SPARKINFER_NF3_CODEBOOK"] = ",".join(
+    os.environ["B12X_NF3_CODEBOOK"] = ",".join(
         f"{value:.10g}" for value in codebook
     )
 
@@ -993,7 +993,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         are known there, and the first forward is vLLM's eager profile run,
         so nothing compiles inside CUDA-graph capture).
         """
-        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+        from b12x.moe._shared.kernels.w4a16.prepare import (
             PreparedNF3MoeWeights,
             W4A16PackedWeights,
             _make_workspace,
@@ -1023,7 +1023,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             parameter.data = parameter.data.new_empty((0,))
 
         if num_nf3 > 0 and self.quant_config.demoted_format == "exl3_3":
-            from sparkinfer.moe import fused_moe
+            from b12x.moe import fused_moe
 
             w13_trellis = layer.w13_exl3_trellis.data.permute(
                 1, 0, 2, 3, 4
@@ -1233,10 +1233,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         routing and a fused top-k sum; if that compile is unavailable the
         packed launch also serves decode.
         """
-        from sparkinfer.moe._shared.kernels.w4a16.host import (
+        from b12x.moe._shared.kernels.w4a16.host import (
             max_packed_route_slots,
         )
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        from b12x.moe._shared.kernels.w4a16.kernel import (
             compile_w4a16_fused_moe,
         )
 
@@ -1422,10 +1422,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 getattr(props, "shared_memory_per_block_optin", 101_376)
             )
             if runtime.grid188_launch is None:
-                from sparkinfer.moe._shared.kernels.w4a16.host import (
+                from b12x.moe._shared.kernels.w4a16.host import (
                     packed_gemm_scratch_elements,
                 )
-                from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+                from b12x.moe._shared.kernels.w4a16.kernel import (
                     compile_w4a16_fused_moe_hybrid,
                 )
 
@@ -1457,7 +1457,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 ):
                     raise RuntimeError("compiled hybrid launch failed admission")
                 if not hasattr(
-                    torch.ops.sparkinfer,
+                    torch.ops.b12x,
                     "w4a16_fused_moe_hybrid_launch",
                 ):
                     raise RuntimeError("hybrid one-grid custom op is unavailable")
@@ -1524,7 +1524,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         assert state.grid188_tier_map is not None
         assert state.grid188_output is not None
         m = int(x.shape[0])
-        torch.ops.sparkinfer.w4a16_fused_moe_hybrid_launch(
+        torch.ops.b12x.w4a16_fused_moe_hybrid_launch(
             x,
             *state.grid188_weight_views,
             topk_ids.view(-1),
@@ -1570,7 +1570,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         scratch/buffer set. The first apply is vLLM's eager profile run at
         max_num_batched_tokens, so max_m sizes itself to the serving
         ceiling and nothing compiles during CUDA-graph capture."""
-        from sparkinfer.moe._shared.kernels.w4a16.host import (
+        from b12x.moe._shared.kernels.w4a16.host import (
             make_w4a16_packed_buffers,
             max_packed_route_slots,
         )
@@ -1589,7 +1589,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if state.prep_kept is not None:
             state.launch_kept = self._get_launch_pair(state.prep_kept, state)
         if state.trellis_weights is not None:
-            from sparkinfer.moe import fused_moe
+            from b12x.moe import fused_moe
 
             key = (
                 "trellis",
@@ -1684,7 +1684,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         decode: bool,
     ) -> torch.Tensor:
         """Run one tier through its preplanned b12x launch."""
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 
         runtime = self.quant_config.shared_runtime
         use_decode = decode and launch_pair[0] is not launch_pair[1]
@@ -1835,7 +1835,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 decode,
             )
         if state.trellis_weights is not None:
-            from sparkinfer.moe import fused_moe
+            from b12x.moe import fused_moe
 
             trellis_ids = (
                 topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)

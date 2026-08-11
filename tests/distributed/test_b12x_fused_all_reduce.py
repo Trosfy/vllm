@@ -77,6 +77,7 @@ def make_b12x_custom_allreduce(
     custom_allreduce._pcie_capture_stream = None
     custom_allreduce._pcie_allreduce_max_size = allreduce_max_size
     custom_allreduce._pcie_fused_add_rms_norm_max_size = fused_max_size
+    custom_allreduce._pcie_composed_add_rms_norm_max_size = fused_max_size
     custom_allreduce._pcie_logged_first_allreduce = False
     custom_allreduce._IS_CAPTURING = False
     custom_allreduce._ptr = 0
@@ -138,6 +139,23 @@ def test_b12x_fused_allreduce_falls_back_above_its_cutoff() -> None:
         1e-6,
     )
     runtime.all_reduce_fused_add_rms_norm.assert_not_called()
+
+
+def test_b12x_composed_allreduce_uses_independent_cutoff() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=16,
+        fused_max_size=32,
+    )
+    inp = torch.randn(2, 4)
+    reduced = torch.randn_like(inp)
+    runtime.all_reduce.return_value = reduced
+
+    assert not custom_allreduce.should_custom_ar(inp)
+    assert (
+        custom_allreduce.try_all_reduce_for_composed_add_rms_norm(inp)
+        is reduced
+    )
+    runtime.all_reduce.assert_called_once_with(inp, stream=None)
 
 
 def test_b12x_fused_allreduce_zero_cutoff_disables_support() -> None:

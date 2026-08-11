@@ -683,6 +683,14 @@ class GroupCoordinator:
         else:
             return self._all_reduce_out_place(input_)
 
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """All-reduce a tensor whose input storage may be overwritten."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce_in_place(input_)
+
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -1602,17 +1610,29 @@ def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any],
         if checkpoint is not None:
             checkpoints.append((rollback_fn, checkpoint))
 
-    if _DCP is not None and _DCP.world_size > 1:
+    b12x_pool_groups: list[GroupCoordinator] = []
+    seen_b12x_device_groups: set[int] = set()
+    for group in (_DCP, _TP):
+        if group is None or group.world_size <= 1:
+            continue
+        group_id = id(group.device_group)
+        if group_id in seen_b12x_device_groups:
+            continue
+        seen_b12x_device_groups.add(group_id)
+        b12x_pool_groups.append(group)
+
+    if b12x_pool_groups:
         from vllm.v1.attention.ops.dcp_alltoall import (
             checkpoint_b12x_dcp_a2a_channels,
             rollback_b12x_dcp_a2a_channels,
         )
 
-        checkpoints.append(
+        checkpoints.extend(
             (
                 rollback_b12x_dcp_a2a_channels,
-                checkpoint_b12x_dcp_a2a_channels(_DCP),
+                checkpoint_b12x_dcp_a2a_channels(group),
             )
+            for group in b12x_pool_groups
         )
     return tuple(checkpoints)
 
@@ -1694,21 +1714,29 @@ def graph_capture(
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
-    if _DCP is not None and get_dcp_group().world_size > 1:
+    b12x_pool_groups: list[GroupCoordinator] = []
+    seen_b12x_device_groups: set[int] = set()
+    for group in (_DCP, _TP):
+        if group is None or group.world_size <= 1:
+            continue
+        group_id = id(group.device_group)
+        if group_id in seen_b12x_device_groups:
+            continue
+        seen_b12x_device_groups.add(group_id)
+        b12x_pool_groups.append(group)
+
+    if b12x_pool_groups:
         # Import locally to avoid making distributed initialization depend on
-        # attention modules. The helper is a no-op until DCP warmup creates a
-        # SparkInfer pool for this process group.
+        # attention modules. The helper is a no-op until warmup creates a
+        # SparkInfer pool for the DCP attention or TP projection group.
         from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
 
-        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
-    else:
-        maybe_b12x_dcp_capture = nullcontext()
-    with (
-        get_tp_group().graph_capture(context),
-        get_pp_group().graph_capture(context),
-        maybe_dcp_capture,
-        maybe_b12x_dcp_capture,
-    ):
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(get_tp_group().graph_capture(context))
+        stack.enter_context(get_pp_group().graph_capture(context))
+        stack.enter_context(maybe_dcp_capture)
+        for group in b12x_pool_groups:
+            stack.enter_context(capture_b12x_dcp_a2a(group, context.stream))
         yield context
 
 

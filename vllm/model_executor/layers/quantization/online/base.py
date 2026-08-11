@@ -151,6 +151,16 @@ class OnlineQuantizationConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        # ``ParallelLMHead`` deliberately derives from the vocabulary embedding
+        # class rather than ``LinearBase``, but its inference path is a plain
+        # linear projection through ``quant_method.apply``.  Supporting it here
+        # lets small, untied draft heads use the same online weight-only MXFP8
+        # kernels as ordinary linears.  Keep the import local to avoid a module
+        # cycle while vocab_parallel_embedding is defining the class.
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+        )
+
         if isinstance(layer, LinearBase):
             if should_ignore_layer(
                 prefix,
@@ -166,6 +176,16 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             method = self._dispatch(spec, _ONLINE_LINEAR_METHODS, layer)
             return method if method is not None else UnquantizedLinearMethod()
+        elif isinstance(layer, ParallelLMHead):
+            if should_ignore_layer(
+                prefix,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                # Returning None makes ParallelLMHead retain its native
+                # UnquantizedEmbeddingMethod, including weight tying support.
+                return None
+            return self._dispatch(self.args.linear, _ONLINE_LINEAR_METHODS, layer)
         elif isinstance(layer, RoutedExperts):
             if should_ignore_layer(
                 prefix,

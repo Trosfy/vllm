@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import pytest
 
 from vllm.config.cache import CacheConfig
-from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
+from vllm.config.utils import get_hash_factors, hash_factors, normalize_value, replace
 
 # Helpers
 
@@ -34,8 +34,28 @@ class SimpleConfig:
     b: object | None = None
 
 
+@dataclass
+class ReplaceConfig:
+    value: int
+    derived: int = field(init=False)
+
+    def __post_init__(self):
+        self.derived = self.value * 2
+
+
 class DummyLogprobsMode(Enum):
     RAW_LOGITS = "raw_logits"
+
+
+def test_replace_ignores_non_fields_and_non_init_fields():
+    config = ReplaceConfig(value=3)
+    config.runtime_cache = object()
+
+    updated = replace(config, value=5)
+
+    assert updated.value == 5
+    assert updated.derived == 10
+    assert not hasattr(updated, "runtime_cache")
 
 
 def test_hash_factors_deterministic():

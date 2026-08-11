@@ -260,6 +260,18 @@ def test_runner_v2_limits_drafts_to_adaptive_depth():
     )
 
 
+def test_runner_v2_zero_depth_returns_no_drafts():
+    draft_tokens = torch.tensor([[1], [2]])
+
+    limited = limit_draft_tokens(
+        draft_tokens,
+        num_speculative_tokens=0,
+        max_num_speculative_tokens=7,
+    )
+
+    assert limited.shape == (2, 0)
+
+
 def test_synthetic_scheduler_output_uses_default_speculative_depth():
     output = SchedulerOutput.make_empty()
 

@@ -590,11 +590,25 @@ class Scheduler(SchedulerInterface):
                 effective_lookahead_tokens = (
                     0 if request.is_prefill_chunk else self.num_lookahead_tokens
                 )
+                current_num_speculative_tokens = 0
+                if request.spec_token_ids:
+                    current_num_speculative_tokens = max(
+                        0,
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders,
+                    )
+                    current_num_speculative_tokens = min(
+                        current_num_speculative_tokens,
+                        len(request.spec_token_ids),
+                    )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=effective_lookahead_tokens,
+                        num_speculative_tokens=current_num_speculative_tokens,
                     )
 
                     if new_blocks is not None:
@@ -998,6 +1012,9 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
+                    num_speculative_tokens=(
+                        self.num_spec_tokens if pad_spec_decode else 0
+                    ),
                 )
 
                 if new_blocks is None:
@@ -1443,6 +1460,7 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        block_ids_to_overwrite: set[str] = set()
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1469,9 +1487,10 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            allocated_blocks = req_to_new_blocks[req_id]
+            new_block_ids.append(allocated_blocks.get_block_ids(allow_none=True))
+            if allocated_blocks.overwrite:
+                block_ids_to_overwrite.add(req_id)
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1485,6 +1504,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            block_ids_to_overwrite=block_ids_to_overwrite,
         )
 
     def _try_schedule_encoder_inputs(

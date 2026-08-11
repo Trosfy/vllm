@@ -80,8 +80,39 @@ def _parse_byte_size(value: str) -> int:
     return int(value)
 
 
-def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
-    allreduce_max_size = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+def _b12x_pcie_allreduce_default_max_size(world_size: int) -> str:
+    """Resolve the PCIe all-reduce limit from configuration and b12x policy.
+
+    ``VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE`` has highest priority. Otherwise,
+    b12x supplies a world-size-specific threshold when it is installed, and
+    environments without b12x use the vLLM configuration default.
+    """
+
+    configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
+    if configured is not None:
+        return configured
+    try:
+        from b12x.comm.pcie.pcie_allreduce import recommended_max_bytes
+    except Exception:
+        return envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE
+    default = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    resolved = recommended_max_bytes(world_size, default=default)
+    if resolved != default:
+        # b12x loggers are not configured by vLLM, so this is the only place the
+        # operator can see that the wider band is in play.
+        logger.info(
+            "b12x raised the PCIe all-reduce limit for TP%d from %d to %d bytes.",
+            world_size,
+            default,
+            resolved,
+        )
+    return str(resolved)
+
+
+def _b12x_pcie_oneshot_limits(world_size: int) -> tuple[int, int, int]:
+    allreduce_max_size = _parse_byte_size(
+        _b12x_pcie_allreduce_default_max_size(world_size)
+    )
     fused_max_size = _parse_byte_size(
         envs.VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
     )
@@ -107,7 +138,7 @@ def _b12x_pcie_dma_min_bytes() -> int | None:
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_allreduce() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import AllReduce as PCIeAllReduce
+        from b12x.comm.pcie import AllReduce as PCIeAllReduce
     except Exception:
         return None
     return PCIeAllReduce
@@ -116,7 +147,7 @@ def _load_b12x_pcie_allreduce() -> Any | None:
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_dma() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import DmaAllReduce as PCIeDmaAllReduce
+        from b12x.comm.pcie import DmaAllReduce as PCIeDmaAllReduce
     except Exception:
         return None
     return PCIeDmaAllReduce
@@ -293,6 +324,7 @@ class CustomAllreduce:
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_allreduce_max_size: int | None = None
         self._pcie_fused_add_rms_norm_max_size: int | None = None
+        self._pcie_composed_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._pcie_cpp_backend = False
@@ -473,7 +505,7 @@ class CustomAllreduce:
             if allreduce_cls is None:
                 logger.warning(
                     "PCIe custom allreduce was requested, but "
-                    "sparkinfer.comm.pcie.AllReduce is unavailable."
+                    "b12x.comm.pcie.AllReduce is unavailable."
                 )
                 return
             # DMA must accommodate the largest scheduled prefill tensor. The
@@ -501,7 +533,10 @@ class CustomAllreduce:
                 self._pcie_allreduce_max_size,
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
-            ) = _b12x_pcie_oneshot_limits()
+            ) = _b12x_pcie_oneshot_limits(world_size)
+            self._pcie_composed_add_rms_norm_max_size = (
+                self._pcie_fused_add_rms_norm_max_size
+            )
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because b12x PCIe oneshot "
@@ -576,7 +611,7 @@ class CustomAllreduce:
             elif dma_cls is None:
                 logger.warning(
                     "b12x PCIe DMA allreduce unavailable "
-                    "(sparkinfer.comm.pcie.DmaAllReduce not importable); "
+                    "(b12x.comm.pcie.DmaAllReduce not importable); "
                     "large allreduces stay on PyNCCL."
                 )
             else:
@@ -795,7 +830,7 @@ class CustomAllreduce:
     def capture(self, stream: torch.cuda.Stream | None = None):
         """Bind communicator resources to the enclosing CUDA graph capture.
 
-        Legacy custom all-reduce registers graph buffers on exit. SparkInfer
+        Legacy custom all-reduce registers graph buffers on exit. B12X
         PCIe channels are instead created on the graph's owning stream and
         remain valid for the graph lifetime.
         """
@@ -815,7 +850,7 @@ class CustomAllreduce:
                 self.register_graph_buffers()
 
     def checkpoint_pcie_channels(self) -> Any | None:
-        """Snapshot SparkInfer PCIe channels before a disposable capture.
+        """Snapshot B12X PCIe channels before a disposable capture.
 
         Returns:
             An opaque runtime checkpoint, or ``None`` when PCIe all-reduce is
@@ -828,18 +863,18 @@ class CustomAllreduce:
         return checkpoint()
 
     def rollback_pcie_channels(self, checkpoint: Any) -> None:
-        """Release SparkInfer PCIe channels created after ``checkpoint``.
+        """Release B12X PCIe channels created after ``checkpoint``.
 
         Args:
             checkpoint: Opaque state returned by ``checkpoint_pcie_channels``.
 
         Raises:
-            RuntimeError: If the SparkInfer PCIe runtime is unavailable.
+            RuntimeError: If the B12X PCIe runtime is unavailable.
         """
         runtime = self._pcie_runtime
         rollback = getattr(runtime, "rollback_channels", None)
         if rollback is None:
-            raise RuntimeError("SparkInfer PCIe all-reduce runtime is unavailable")
+            raise RuntimeError("B12X PCIe all-reduce runtime is unavailable")
         rollback(checkpoint)
 
     def _pcie_runtime_stream(self) -> torch.cuda.Stream | None:
@@ -1000,6 +1035,33 @@ class CustomAllreduce:
                 "all_reduce_fused_add_rms_norm",
             )
         )
+
+    def try_all_reduce_for_composed_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Run B12X AR for a caller-provided fused add + RMSNorm.
+
+        This has an independent cutoff from generic all-reduce dispatch. It
+        lets an eager model path select the measured B12X collective without
+        changing the target model's all-reduce crossover.
+        """
+        inp_size = inp.numel() * inp.element_size()
+        runtime = self._pcie_runtime
+        max_size = self._pcie_composed_add_rms_norm_max_size
+        if (
+            self.disabled
+            or runtime is None
+            or max_size is None
+            or max_size <= 0
+            or inp_size > max_size
+        ):
+            return None
+        stream = self._pcie_runtime_stream()
+        channel = runtime.for_stream(stream)
+        if not channel.should_allreduce(inp):
+            return None
+        return runtime.all_reduce(inp, stream=stream)
 
     def try_fused_add_rms_norm(
         self,
@@ -1244,6 +1306,26 @@ def get_b12x_pcie_allreduce() -> CustomAllreduce | None:
     if (
         isinstance(custom_allreduce, CustomAllreduce)
         and custom_allreduce.supports_fused_add_rms_norm()
+    ):
+        return custom_allreduce
+    return None
+
+
+def get_active_b12x_pcie_allreduce() -> CustomAllreduce | None:
+    """Return the active TP B12X runtime, including hierarchical mode."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        device_communicator = get_tp_group().device_communicator
+    except (AssertionError, RuntimeError):
+        return None
+    if device_communicator is None:
+        return None
+    custom_allreduce = getattr(device_communicator, "ca_comm", None)
+    if (
+        isinstance(custom_allreduce, CustomAllreduce)
+        and not custom_allreduce.disabled
+        and custom_allreduce._pcie_runtime is not None
     ):
         return custom_allreduce
     return None

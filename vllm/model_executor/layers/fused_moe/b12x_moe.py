@@ -404,8 +404,8 @@ def _plan_b12x_moe_fp4_scratch(
     swiglu_beta: float | None = None,
     collect_activation_amax: bool = False,
 ):
-    from sparkinfer.moe.fused_moe import Caps as TPMoEScratchCaps
-    from sparkinfer.moe.fused_moe import plan as plan_tp_moe_scratch
+    from b12x.moe.fused_moe import Caps as TPMoEScratchCaps
+    from b12x.moe.fused_moe import plan as plan_tp_moe_scratch
 
     return plan_tp_moe_scratch(
         TPMoEScratchCaps(
@@ -438,7 +438,7 @@ def _plan_b12x_moe_execution(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ):
-    from sparkinfer.moe.fused_moe import plan_execution as plan_tp_moe_execution
+    from b12x.moe.fused_moe import plan_execution as plan_tp_moe_execution
 
     return plan_tp_moe_execution(
         num_tokens=max(int(tokens), 1),
@@ -454,7 +454,7 @@ def _plan_b12x_moe_execution(
 
 
 def _b12x_moe_plan_supports_aux_stream_overlap(plan: Any) -> bool:
-    # Namespaced SparkInfer does not yet publish a plan capability predicate.
+    # Namespaced B12X does not yet publish a plan capability predicate.
     # Some resident-grid plans use device-wide barriers, so lack of an explicit
     # guarantee must conservatively disable auxiliary-stream overlap.
     return False
@@ -479,7 +479,7 @@ def _dynamic_moe_warmup_tokens(
     """Return a small token count that selects b12x's dynamic MoE backend."""
     # This warmup-only policy probe is not exposed by the public facade. Actual
     # planning, binding, and execution below all use the public API.
-    from sparkinfer.moe.fused_moe._impl import select_tp_moe_backend
+    from b12x.moe.fused_moe._impl import select_tp_moe_backend
 
     tokens = max(int(requested_tokens), 1)
     topk = max(int(topk), 1)
@@ -561,7 +561,7 @@ def _run_b12x_moe_fp4(
     layer_idx: int | None = None,
 ) -> None:
     """Call b12x MoE with caller-owned live scratch."""
-    from sparkinfer.moe.fused_moe import run as b12x_moe_fp4
+    from b12x.moe.fused_moe import run as b12x_moe_fp4
 
     if _moe_zero_scratch_enabled():
         if _is_current_stream_capturing():
@@ -774,7 +774,7 @@ def _normalize_modelopt_expert_scale(scale: torch.Tensor) -> torch.Tensor:
 
 def _has_b12x() -> bool:
     try:
-        from sparkinfer.moe.fused_moe import run as b12x_moe_fp4  # noqa: F401
+        from b12x.moe.fused_moe import run as b12x_moe_fp4  # noqa: F401
 
         return True
     except ImportError:
@@ -1145,11 +1145,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             a1_gscale = unit_scale
             a2_gscale = unit_scale
 
-        from sparkinfer.moe._shared.execution import PreparedWeightLayout
-        from sparkinfer.moe.fused_moe import (
+        from b12x.moe._shared.execution import PreparedWeightLayout
+        from b12x.moe.fused_moe import (
             plan_weights as plan_b12x_fp4_moe_weights,
         )
-        from sparkinfer.moe.fused_moe import (
+        from b12x.moe.fused_moe import (
             prepare_weights as prepare_b12x_fp4_moe_weights,
         )
 
@@ -1360,10 +1360,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_alpha=meta.swiglu_alpha,
                 swiglu_beta=meta.swiglu_beta,
             )
-            launch_tokens.setdefault(
-                _b12x_moe_warmup_plan_signature(launch_plan),
-                tokens,
-            )
+            # ModelOpt's small-M direct kernel specializes on the exact M,
+            # even when B12X's high-level execution plan is otherwise
+            # identical. Keep every graph-visible M instead of collapsing the
+            # range to the first plan signature.
+            launch_tokens[
+                (*_b12x_moe_warmup_plan_signature(launch_plan), "direct_m", tokens)
+            ] = tokens
         for requested_tokens in sorted(set(int(count) for count in token_counts)):
             tokens = _dynamic_moe_warmup_tokens(
                 topk=meta.topk,
@@ -1588,6 +1591,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             # Exact graph-visible MoE kernels are compiled by
             # warmup_dynamic_launches. Do not launch them again while walking
             # the model solely to resolve attention bindings.
+            output.zero_()
+            return
+        if int(hidden_states.shape[0]) == 0:
+            # DCP can leave a rank with no local rows for a graph-visible
+            # global batch. There is no routed work to launch, and compiling
+            # an M=0 small-M specialization is both unnecessary and invalid.
             output.zero_()
             return
         if os.environ.get("VLLM_KIMI_DEBUG_FINITE") == "1":

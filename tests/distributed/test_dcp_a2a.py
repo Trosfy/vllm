@@ -690,6 +690,7 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
     class _FakeGroup:
         def __init__(self, *, world_size, communicator=None):
             self.world_size = world_size
+            self.device_group = object()
             self.device_communicator = type(
                 "DeviceCommunicator", (), {"ca_comm": communicator}
             )()
@@ -704,7 +705,9 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
     monkeypatch.setattr(
         dcp_alltoall,
         "checkpoint_b12x_dcp_a2a_channels",
-        lambda group: events.append("checkpoint-dcp") or "dcp-checkpoint",
+        lambda group: (
+            events.append(("checkpoint-b12x", group)) or ("b12x-checkpoint", group)
+        ),
     )
     monkeypatch.setattr(
         dcp_alltoall,
@@ -717,8 +720,10 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
 
     assert events == [
         "checkpoint-tp",
-        "checkpoint-dcp",
-        ("rollback-dcp", "dcp-checkpoint"),
+        ("checkpoint-b12x", dcp_group),
+        ("checkpoint-b12x", tp_group),
+        ("rollback-dcp", ("b12x-checkpoint", tp_group)),
+        ("rollback-dcp", ("b12x-checkpoint", dcp_group)),
         ("rollback-tp", "tp-checkpoint"),
     ]
 
@@ -731,6 +736,9 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
 
     class _FakeGroup:
         world_size = 2
+
+        def __init__(self):
+            self.device_group = object()
 
         @contextmanager
         def graph_capture(self, context):
@@ -748,6 +756,7 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
         yield
 
     monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(parallel_state, "_TP", tp_group)
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
@@ -756,7 +765,7 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
     with parallel_state.graph_capture(torch.device("cpu"), context) as actual:
         assert actual is context
 
-    assert events == [(dcp_group, stream)]
+    assert events == [(dcp_group, stream), (tp_group, stream)]
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
@@ -812,6 +821,52 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     )
     # Batch above the cap declines B12X so the caller picks an NCCL path.
     assert result is None
+
+
+def test_oversized_b12x_batch_routes_to_head_major_ag_rs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import common, dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    monkeypatch.setenv("VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs")
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_lse_reduce", lambda *a, **k: None)
+    sentinel = torch.zeros(1)
+    captured: dict[str, Any] = {}
+
+    def fake_ag_rs(output, lse, group, **kwargs):
+        captured.update(output=output, lse=lse, group=group, **kwargs)
+        return sentinel
+
+    monkeypatch.setattr(common, "cp_lse_ag_out_rs", fake_ag_rs)
+    group = _FakeCPGroup(2, None)  # type: ignore[arg-type]
+    output = torch.zeros(5, 8, 16, dtype=torch.bfloat16)
+    lse = torch.zeros(5, 8, dtype=torch.float32)
+    ctx = object()
+
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        output,
+        lse,
+        group,  # type: ignore[arg-type]
+        ctx=ctx,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        use_b12x=True,
+        b12x_max_batch_size=4,
+        b12x_query_head_dim=16,
+    )
+
+    assert actual is sentinel
+    assert captured == {
+        "output": output,
+        "lse": lse,
+        "group": group,
+        "ctx": ctx,
+        "return_lse": False,
+        "is_lse_base_on_e": True,
+        "head_major_output": True,
+    }
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
@@ -968,6 +1023,154 @@ def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
         head_dim=512,
         query_head_dim=576,
     )
+
+
+@pytest.mark.parametrize("batched_topk", [False, True])
+def test_warmup_kimi_projection_gathers_precreates_m8_and_m1(
+    monkeypatch: pytest.MonkeyPatch,
+    batched_topk: bool,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "1")
+    monkeypatch.setenv(
+        "VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK",
+        str(int(batched_topk)),
+    )
+    pair_calls: list[tuple] = []
+    topk_calls: list[tuple] = []
+
+    def fake_pair(local_down, local_router, group, *, max_batch_size):
+        pair_calls.append((local_down.shape, local_router.shape, group, max_batch_size))
+        return local_down, local_router
+
+    def fake_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        group,
+        *,
+        max_batch_size,
+    ):
+        topk_calls.append(
+            (
+                local_down.shape,
+                local_router.shape,
+                correction_bias.shape,
+                group,
+                max_batch_size,
+            )
+        )
+        return local_down, local_router
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_all_gather_pair", fake_pair)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        fake_topk,
+    )
+    group = _FakeCPGroup(16, None)  # type: ignore[arg-type]
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 2
+    expected_m8 = (
+        torch.Size([8, 224]),
+        torch.Size([8, 56]),
+        group,
+        8,
+    )
+    assert pair_calls == ([] if batched_topk else [expected_m8])
+    expected_topk = [
+        (
+            torch.Size([1, 224]),
+            torch.Size([1, 56]),
+            torch.Size([896]),
+            group,
+            1,
+        )
+    ]
+    if batched_topk:
+        expected_topk.insert(
+            0,
+            (
+                torch.Size([8, 224]),
+                torch.Size([8, 56]),
+                torch.Size([896]),
+                group,
+                8,
+            ),
+        )
+    assert topk_calls == expected_topk
+
+
+def test_warmup_kimi_projection_gathers_honors_target_only_token_cap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "1")
+    monkeypatch.setenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "1")
+    topk_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_all_gather_pair",
+        lambda *args, **kwargs: pytest.fail(
+            "the target-only token cap must not prewarm M=8"
+        ),
+    )
+
+    def fake_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        group,
+        *,
+        max_batch_size,
+    ):
+        topk_calls.append(
+            (
+                local_down.shape,
+                local_router.shape,
+                correction_bias.shape,
+                group,
+                max_batch_size,
+            )
+        )
+        return local_down, local_router
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        fake_topk,
+    )
+    group = _FakeCPGroup(16, None)  # type: ignore[arg-type]
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 1
+    assert topk_calls == [
+        (
+            torch.Size([1, 224]),
+            torch.Size([1, 56]),
+            torch.Size([896]),
+            group,
+            1,
+        )
+    ]
 
 
 class TestPackedA2AKernels:
@@ -1370,8 +1573,8 @@ def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
     from sparkinfer.comm.pcie.pcie_dcp_a2a import _load_extension
 
     world_size = int(os.getenv("VLLM_TEST_B12X_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8):
-        pytest.skip("B12X DCP A2A supports world sizes 2, 4, and 8")
+    if world_size not in (2, 4, 8, 16):
+        pytest.skip("B12X DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs")
     _load_extension()

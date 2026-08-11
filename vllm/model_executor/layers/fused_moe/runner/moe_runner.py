@@ -190,6 +190,24 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _moe_forward_shared_donate(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    assert isinstance(layer, MoERunner)
+    return layer._forward_impl_donate_shared_input(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+    )
+
+
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
@@ -224,6 +242,24 @@ direct_register_custom_op(
     op_func=_moe_forward_shared,
     mutates_args=["hidden_states"],
     fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_donate",
+    op_func=_moe_forward_shared_donate,
+    mutates_args=["hidden_states", "shared_experts_input"],
+    fake_impl=_moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="b12x_moe_forward_shared_donate",
+    op_func=_moe_forward_shared_donate,
+    mutates_args=["hidden_states", "shared_experts_input"],
+    fake_impl=_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -307,6 +343,11 @@ class MoERunner(MoERunnerInterface):
         self.layer_name = layer_name
 
         self._forward_entry = self._select_forward()
+        self._forward_entry_donate = (
+            torch.ops.vllm.b12x_moe_forward_shared_donate
+            if self._uses_b12x_moe_kernel
+            else torch.ops.vllm.moe_forward_shared_donate
+        )
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
@@ -689,6 +730,12 @@ class MoERunner(MoERunnerInterface):
             assert shared_experts_input is not None
             self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
 
+    def prelaunch_shared_experts(self, shared_experts_input: torch.Tensor) -> bool:
+        """Start an eligible shared-expert branch before routed preparation."""
+        if self._shared_experts is None:
+            return False
+        return self._shared_experts.prelaunch(shared_experts_input)
+
     def _maybe_add_zero_expert_output(
         self,
         result: torch.Tensor,
@@ -926,6 +973,33 @@ class MoERunner(MoERunnerInterface):
                 shared_output,
                 hidden_states,
             )
+
+    def _forward_impl_donate_shared_input(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return routed output while writing shared output into its input."""
+        if self._shared_experts is None or shared_experts_input is None:
+            raise ValueError("Shared-input donation requires shared experts")
+        self._shared_experts.set_donate_input(True)
+        try:
+            result = self._forward_impl(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+        finally:
+            self._shared_experts.set_donate_input(False)
+        shared_output, fused_output = _unpack(result)
+        if shared_output is None:
+            raise RuntimeError("Donated shared-expert output is missing")
+        if shared_output.data_ptr() != shared_experts_input.data_ptr():
+            raise RuntimeError("Shared expert did not reuse its donated input")
+        return fused_output
 
     #########################################################
     #

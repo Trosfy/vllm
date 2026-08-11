@@ -83,7 +83,7 @@ def test_sharded_router_gathers_rank_ordered_fp32_logits(monkeypatch) -> None:
     expected_local = torch.nn.functional.linear(x, gate.weight).float()
     monkeypatch.setattr(
         kimi_model,
-        "tensor_model_parallel_all_gather",
+        "gather_kimi_sharded_projection",
         lambda local: torch.cat((local, local + 10), dim=-1),
     )
 

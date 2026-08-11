@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Full stock Kimi-K3 MXFP4 target with an Inferact DSpark7 draft, TP16/DCP16,
+# and a physical 1M-token target KV cache.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+export DCP_SIZE="${DCP_SIZE:-16}"
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
+export MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+
+# Exact model-free lower bound for one 1M request with DCP16 target MLA,
+# current+7 replicated KDA rollback states, and a replicated 32,768-token
+# DSpark tail is 1,297,907,712 bytes/rank. Round up slightly. This is
+# 860.625 MiB/rank smaller than the equivalent DCP8 cache.
+export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-1299000000}"
+export DSPARK_DRAFT_KV_WINDOW="${DSPARK_DRAFT_KV_WINDOW:-32768}"
+export DSPARK_DRAFT_WEIGHT_FORMAT="${DSPARK_DRAFT_WEIGHT_FORMAT:-bf16}"
+export DSPARK_SHARD_MARKOV_HEAD="${DSPARK_SHARD_MARKOV_HEAD:-1}"
+
+# DCP16 recovers enough memory to retain the target shared experts in their
+# source BF16 format. DCP8 needs the online shared-expert MXFP8 overlay.
+export KIMI_TARGET_MXFP8_PROFILE="${KIMI_TARGET_MXFP8_PROFILE:-none}"
+
+# Validated DCP16 performance stack (same-window A/B/A brackets, all gates
+# green — capacity 1,057,049 unchanged, Sieve coherent, KLD at the repeat
+# floor for the f_a layout, bit-exact routing kernel):
+#   - replicated f_a (no per-KDA-layer TP16 all-gather in the M8 verify):
+#     +3.4% target cycles/s
+#   - fused sigmoid+top-16 routing kernel: +4.0%
+#   - FULL_AND_PIECEWISE cudagraphs (below): +1.3%
+export KIMI_SHARD_F_A="${KIMI_SHARD_F_A:-0}"
+export VLLM_KIMI_CX_TOPK16="${VLLM_KIMI_CX_TOPK16:-1}"
+export VLLM_DSPARK_COMPACT_ROPE="${VLLM_DSPARK_COMPACT_ROPE:-1}"
+export VLLM_K3_KV_GROUP_SIZE="${VLLM_K3_KV_GROUP_SIZE:-6}"
+# The production world-16 sweep selected 512 threads / eight CTAs. The exact
+# vLLM graph pair falls from 117.88 to 98.30 us/layer; both the eight- and
+# sixteen-rank settings pass B12X's eager and CUDA-graph oracle.
+# Validated hierarchical all-reduce runtime (handover S8: previously supplied
+# only by the operator's container environment; the self-contained image must
+# carry it so vanilla composition reproduces production behavior).
+export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-1}"
+export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
+export B12X_PCIE_HIERARCHICAL_THREADS="${B12X_PCIE_HIERARCHICAL_THREADS:-256}"
+export B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES="${B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES:-24}"
+export B12X_PCIE_HIERARCHICAL_BF16X2="${B12X_PCIE_HIERARCHICAL_BF16X2:-1}"
+export B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS="${B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS:-7168}"
+export B12X_PCIE_DCP_THREADS="${B12X_PCIE_DCP_THREADS:-512}"
+export B12X_PCIE_DCP_BLOCK_LIMIT="${B12X_PCIE_DCP_BLOCK_LIMIT:-8}"
+export KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-triton}"
+export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE:-2048}"
+if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
+  # FULL decode graphs collapse the ~28 ms/cycle piecewise launch overhead
+  # (+107% on the linked 5L harness, +1.3% full model where the GPU paces).
+  export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[8],"pass_config":{"fuse_allreduce_rms":true}}'
+fi
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Kimi-K3-MXFP4-HH-DSpark7-BF16-DCP16-1M-W32K}"
+
+exec "${SCRIPT_DIR}/serve-kimi-k3-full-mxfp4-dspark7.sh" "$@"

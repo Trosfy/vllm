@@ -3,16 +3,21 @@
 
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 
 import torch
 from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
-from vllm.distributed import divide, get_tensor_model_parallel_rank
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -43,10 +48,16 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
+    reduce_kimi_full_width_output,
+    should_reuse_kimi_full_width_output,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 logger = init_logger(__name__)
 
@@ -300,6 +311,13 @@ def _make_decode_norm_weight_loader(
 
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        # ``self.num_spec`` is the target verifier width. It can intentionally
+        # be smaller than DSpark's checkpoint-native proposal block.
+        return replace(spec, num_speculative_blocks=self.num_spec)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
 
@@ -331,12 +349,55 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
+        max_verification_tokens = envs.VLLM_DSPARK_MAX_VERIFICATION_TOKENS
+        if max_verification_tokens:
+            speculative_config = vllm_config.speculative_config
+            if speculative_config is None or speculative_config.method != "dspark":
+                raise ValueError(
+                    "VLLM_DSPARK_MAX_VERIFICATION_TOKENS requires DSpark "
+                    "speculative decoding."
+                )
+            if not 1 <= max_verification_tokens <= self.num_spec:
+                raise ValueError(
+                    "VLLM_DSPARK_MAX_VERIFICATION_TOKENS must be between 1 and "
+                    f"the configured DSpark width ({self.num_spec}), got "
+                    f"{max_verification_tokens}."
+                )
+            if max_verification_tokens < self.num_spec:
+                logger.info_once(
+                    "Kimi-K3 KDA reserves %d target verification state slots "
+                    "instead of DSpark's native %d-token proposal width.",
+                    max_verification_tokens,
+                    self.num_spec,
+                )
+                self.num_spec = max_verification_tokens
+
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
         self.head_dim = kda_config["head_dim"]
         self.num_heads = kda_config["num_heads"]
         assert self.num_heads % self.tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.tp_size)
+        additional_config = vllm_config.additional_config
+        self.shard_f_a = bool(
+            additional_config.get("kda_shard_f_a", False)
+            if isinstance(additional_config, dict)
+            else False
+        )
+        if self.shard_f_a:
+            assert self.head_dim % self.tp_size == 0, (
+                "KDA f_a output sharding requires head_dim to be divisible "
+                f"by TP size, got head_dim={self.head_dim}, TP={self.tp_size}."
+            )
+        self.local_fa_size = (
+            divide(self.head_dim, self.tp_size) if self.shard_f_a else self.head_dim
+        )
+        if self.shard_f_a:
+            logger.info_once(
+                "TP-sharding the KDA f_a projection output (%d -> %d rows/rank).",
+                self.head_dim,
+                self.local_fa_size,
+            )
         self.projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
@@ -352,21 +413,33 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.num_heads,
         ]
         local_output_size = (
-            4 * self.local_projection_size + self.head_dim + self.local_num_heads
+            4 * self.local_projection_size + self.local_fa_size + self.local_num_heads
         )
         self.in_proj_padding = -local_output_size % 16
         if self.in_proj_padding:
             in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
-        self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
-            self.hidden_size,
-            in_proj_output_sizes,
-            replicated_shard_id=4,
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvgfab",
-        )
+        if self.shard_f_a:
+            self.in_proj_qkvgfab = MergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
+        else:
+            self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                replicated_shard_id=4,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
         if self.in_proj_padding:
+            self.in_proj_qkvgfab._vllm_online_processing_unloaded = {
+                "weight": self.in_proj_padding * self.hidden_size,
+            }
             self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
         self.f_b_proj = ColumnParallelLinear(
@@ -440,7 +513,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 f"Got {self.gate_lower_bound}."
             )
 
-        additional_config = vllm_config.additional_config
         backend = (
             additional_config.get("kda_prefill_backend", "auto")
             if isinstance(additional_config, dict)
@@ -490,11 +562,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
+        output_buffer = hidden_states
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
         split_sizes = [
             3 * self.local_projection_size,
             self.local_projection_size,
-            self.head_dim,
+            self.local_fa_size,
             self.local_num_heads,
         ]
         if self.in_proj_padding:
@@ -502,6 +575,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         projected = projected_qkvgfab.split(split_sizes, dim=-1)
         mixed_qkv, g_proj_states, f_a, beta = projected[:4]
 
+        if self.shard_f_a:
+            f_a = gather_kimi_sharded_projection(f_a)
         g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
@@ -519,7 +594,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        return self.o_proj(core_attn_out)[0]
+        if should_reuse_kimi_full_width_output(output_buffer):
+            output = self.o_proj.forward_local_with_output_buffer(
+                core_attn_out,
+                output_buffer,
+            )[0]
+            return reduce_kimi_full_width_output(output, self.tp_size)
+        else:
+            return self.o_proj(core_attn_out)[0]
 
     @eager_break_during_capture
     def _forward(

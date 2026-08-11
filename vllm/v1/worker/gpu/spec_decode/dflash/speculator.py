@@ -9,6 +9,7 @@ states, which are fc-combined, normed, projected to K/V by every draft
 layer, and written into the draft KV cache.
 """
 
+import copy
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
@@ -17,14 +18,20 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_sliding_window,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -35,11 +42,28 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     load_dflash_model,
     maybe_load_mask_embedding,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import _create_draft_vllm_config
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _bounded_draft_kv_shift(
+    seq_len: int, block_size: int, draft_kv_window: int
+) -> tuple[int, int]:
+    """Return whole leading blocks to drop and the compacted sequence length."""
+    if seq_len < 0 or block_size <= 0 or draft_kv_window < 0:
+        raise ValueError(
+            "Expected seq_len/window >= 0 and block_size > 0, got "
+            f"seq_len={seq_len}, block_size={block_size}, "
+            f"draft_kv_window={draft_kv_window}."
+        )
+    if draft_kv_window == 0:
+        return 0, seq_len
+    shift = max(seq_len - draft_kv_window, 0) // block_size
+    return shift, seq_len - shift * block_size
 
 
 class _DFlashInputBatch(NamedTuple):
@@ -138,6 +162,13 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        # K3 DSpark can keep only a bounded tail of its replicated DCP1 cache.
+        # The dense MLA kernel still sees a contiguous full-attention table;
+        # propose() compacts the resident tail and shortens seq_lens before
+        # metadata construction. Other DFlash/DSpark architectures keep their
+        # existing backend-native sliding-window behavior.
+        self.draft_kv_window: int | None = None
+        self.draft_kv_window_block_size: int | None = None
         # Manual CUDA graphs keep raw addresses for model intermediates. Retain
         # each captured backbone output so its storage cannot be recycled while
         # a graph still reads it during sampling.
@@ -158,14 +189,29 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
-        return replace(
-            self.vllm_config,
-            attention_config=replace(
-                self.vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
-        )
+        # Metadata must use the external draft's parallel geometry.  In
+        # particular, DFlash/DSpark defaults to a complete DCP1 draft cache
+        # even when the target cache is DCP-sharded.
+        # This is an ephemeral metadata-builder view of an already validated
+        # runtime config. Do not reconstruct VllmConfig through its Pydantic
+        # constructor: cache planning has populated derived fields such as
+        # mamba_block_size, and re-running CLI validation on that internal
+        # state can reject an otherwise valid running configuration.
+        draft_vllm_config = copy.copy(_create_draft_vllm_config(self.vllm_config))
+        if self.draft_kv_window is not None:
+            # This config is used only to size/build the draft attention plan;
+            # token positions and the target's admitted context remain global.
+            # Retain one partial leading page beyond the requested window.
+            assert self.draft_kv_window_block_size is not None
+            draft_model_config = copy.copy(draft_vllm_config.model_config)
+            draft_model_config.max_model_len = (
+                self.draft_kv_window + self.draft_kv_window_block_size - 1
+            )
+            draft_vllm_config.model_config = draft_model_config
+        draft_attention_config = copy.copy(draft_vllm_config.attention_config)
+        draft_attention_config.use_non_causal = self.requires_non_causal
+        draft_vllm_config.attention_config = draft_attention_config
+        return draft_vllm_config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -194,6 +240,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        # Target graph capture may finish at different times in independent
+        # DCP groups. The draft graph contains TP collectives spanning those
+        # groups, so starting it as soon as one DCP group returns can overlap
+        # two different collective schedules on the same ranks. Drain the
+        # target capture work and align the complete TP group first.
+        torch.accelerator.synchronize()
+        get_tp_group().barrier()
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to prevent stale values from prior dummy runs
         # from being baked into the captured graph. Mapping rows stay inert.
@@ -211,6 +264,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        # Do not let one DCP subgroup enter post-capture target warmups while
+        # another subgroup still has draft TP graph work in flight.
+        torch.accelerator.synchronize()
+        get_tp_group().barrier()
 
     def get_cudagraph_managers(self) -> tuple[DFlashCudaGraphManager, ...]:
         if self.query_cudagraph_manager is None:
@@ -226,11 +283,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
 
         target_query_lens = {
-            self.num_query_per_req + 1,
-            32,
-            128,
-            256,
-            1024,
+            query_len
+            for query_len in {
+                self.num_query_per_req + 1,
+                32,
+                128,
+                256,
+                1024,
+            }
+            if query_len <= self.max_num_tokens
         }
         draft_query_lens = (
             range(1, self.num_query_per_req + 1)
@@ -358,6 +419,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
+        self._configure_bounded_k3_draft_kv(kv_cache_config)
         super().set_attn(
             model_state,
             kv_cache_config,
@@ -442,6 +504,56 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         return last_hidden_states
 
+    def _configure_bounded_k3_draft_kv(self, kv_cache_config: KVCacheConfig) -> None:
+        """Discover the uniform K3 DSpark window before builders are created."""
+        self.draft_kv_window = None
+        self.draft_kv_window_block_size = None
+        if (
+            getattr(self.draft_model_config.hf_config, "model_type", None)
+            != "k3_dspark"
+        ):
+            return
+
+        draft_windows: set[int] = set()
+        draft_block_sizes: set[int] = set()
+        saw_non_mla_window = False
+        for group in kv_cache_config.kv_cache_groups:
+            active_names = set(group.layer_names) & self.draft_attn_layer_names
+            if not active_names:
+                continue
+            group_spec = group.kv_cache_spec
+            for layer_name in active_names:
+                layer_spec = (
+                    group_spec.kv_cache_specs[layer_name]
+                    if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                    else group_spec
+                )
+                window = get_kv_cache_spec_sliding_window(layer_spec)
+                if window is None:
+                    continue
+                if not isinstance(layer_spec, SlidingWindowMLASpec):
+                    saw_non_mla_window = True
+                    continue
+                draft_windows.add(int(window))
+                draft_block_sizes.add(int(layer_spec.block_size))
+
+        if saw_non_mla_window or not draft_windows:
+            return
+        if len(draft_windows) != 1 or len(draft_block_sizes) != 1:
+            raise ValueError(
+                "K3 DSpark bounded KV requires one uniform window and block "
+                f"size, got windows={sorted(draft_windows)}, "
+                f"block_sizes={sorted(draft_block_sizes)}."
+            )
+        self.draft_kv_window = draft_windows.pop()
+        self.draft_kv_window_block_size = draft_block_sizes.pop()
+        logger.info_once(
+            "K3 DSpark uses a bounded replicated DCP1 KV tail: window=%d, "
+            "manager_block_size=%d.",
+            self.draft_kv_window,
+            self.draft_kv_window_block_size,
+        )
+
     def _generate_draft(
         self,
         num_reqs: int,
@@ -452,6 +564,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
         num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
         if num_query_per_req is None:
             num_speculative_steps = self.num_speculative_steps
@@ -486,6 +599,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs, :num_speculative_steps] = draft_tokens.view(
             num_reqs, num_speculative_steps
         )
+
+    def _finish_captured_draft(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens_padded: int,
+        num_query_per_req: int,
+        is_profile: bool,
+    ) -> None:
+        """Run work intentionally kept outside a full draft CUDA graph."""
 
     def _build_draft_attn_metadata(
         self,
@@ -570,15 +693,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_query_tokens = num_reqs * active_query_len
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(max_seq_len + active_query_len, self.max_model_len)
+        if self.draft_kv_window is not None:
+            assert self.draft_kv_window_block_size is not None
+            self.draft_max_seq_len = min(
+                self.draft_max_seq_len,
+                self.draft_kv_window + self.draft_kv_window_block_size - 1,
+            )
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+            context_states = (
+                aux_hidden_states[0]
+                if len(aux_hidden_states) == 1
+                else torch.cat(aux_hidden_states, dim=-1)
             )
+            hidden_states = self.model.combine_hidden_states(context_states)
         else:
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
@@ -659,6 +791,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self.num_cached_tokens,
                     self.input_buffers.seq_lens,
                     self.block_tables.kernel_block_sizes[gid],
+                    self.draft_kv_window or 0,
                 )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
@@ -718,6 +851,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self._finish_captured_draft(
+                num_reqs=num_reqs,
+                num_tokens_padded=num_tokens_padded,
+                num_query_per_req=active_query_len,
+                is_profile=is_profile,
+            )
         else:
             self._generate_draft(
                 num_reqs,
@@ -1021,19 +1160,25 @@ def _shift_draft_block_tables_kernel(
     num_cached_tokens_ptr,
     seq_lens_ptr,
     block_size,
+    draft_kv_window,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
     num_cached = tl.load(num_cached_tokens_ptr + req_state_idx)
-    shift = num_cached // block_size
+    cached_shift = num_cached // block_size
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    window_shift = tl.maximum(seq_len - draft_kv_window, 0) // block_size
+    window_shift = tl.where(draft_kv_window > 0, window_shift, 0)
+    shift = cached_shift + window_shift
     if shift == 0:
         return
     row_ptr = block_table_ptr + req_idx.to(tl.int64) * block_table_stride
     # Only the blocks the shifted sequence still references need to move;
     # seq_lens holds the cache-shifted draft length (written by
     # _prepare_dflash_inputs_kernel, which must run first).
-    seq_len = tl.load(seq_lens_ptr + req_idx)
+    seq_len -= window_shift * block_size
+    tl.store(seq_lens_ptr + req_idx, seq_len)
     num_needed = (seq_len + block_size - 1) // block_size
     num_remaining = tl.minimum(block_table_stride - shift, num_needed)
     # In-place left shift is safe: iterations run in ascending order and each
@@ -1067,6 +1212,7 @@ def shift_draft_block_tables(
     # [num_reqs] cache-shifted draft sequence lengths
     seq_lens: torch.Tensor,
     block_size: int,
+    draft_kv_window: int = 0,
 ) -> None:
     """Shift each request's draft block-table row left by its cache-restored
     whole blocks, hiding slots that hold no draft context KV from the draft's
@@ -1080,5 +1226,6 @@ def shift_draft_block_tables(
         num_cached_tokens,
         seq_lens,
         block_size,
+        draft_kv_window,
         BLOCK_SIZE=1024,  # type: ignore
     )

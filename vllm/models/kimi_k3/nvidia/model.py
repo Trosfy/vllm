@@ -17,7 +17,6 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -28,6 +27,9 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    FusedTopKBiasRouter,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
@@ -106,6 +108,13 @@ from vllm.models.kimi_k3.nvidia.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
+    gather_kimi_sharded_projection_pair,
+    reduce_kimi_full_width_output,
+    should_reuse_kimi_full_width_output,
+    try_gather_kimi_sharded_projection_pair_topk,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -131,6 +140,43 @@ logger = init_logger(__name__)
 # it the GEMMs saturate the device and the cross-stream sync is pure overhead,
 # so it falls back to sequential.
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
+_AUX_ATTN_RES_PACK_MIN_TOKENS = 1024
+
+
+def _pack_aux_hidden_states_into_attn_res_workspace(
+    aux_hidden_states: list[torch.Tensor],
+    block_residual: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Pack large DSpark target features into the dead AttnRes workspace.
+
+    The allocation only matters during chunked prefill.  Keep decode-sized
+    auxiliary outputs separate: they are already the stable CUDA-graph ABI
+    consumed by DSpark, and concatenating them costs well under one MiB at
+    Kimi-K3's eight-row verify shape.
+    """
+    if not aux_hidden_states:
+        return aux_hidden_states
+    if aux_hidden_states[0].shape[0] < _AUX_ATTN_RES_PACK_MIN_TOKENS:
+        return aux_hidden_states
+    num_tokens, num_blocks, hidden_size = block_residual.shape
+    if any(state.shape != (num_tokens, hidden_size) for state in aux_hidden_states):
+        raise ValueError("K3 auxiliary hidden states must match the target chunk")
+    packed_width = len(aux_hidden_states) * hidden_size
+    if packed_width > num_blocks * hidden_size:
+        raise ValueError(
+            "K3 auxiliary states exceed the dead AttnRes workspace capacity"
+        )
+    # The target has finished consuming every residual block. Reinterpret the
+    # existing storage as a token-major contiguous matrix, then perform the
+    # same copies torch.cat would have made without allocating another 140 MiB
+    # for a 2,048-token DSpark context projection.
+    packed = block_residual.as_strided(
+        (num_tokens, packed_width),
+        (packed_width, 1),
+    )
+    for index, state in enumerate(aux_hidden_states):
+        packed.narrow(1, index * hidden_size, hidden_size).copy_(state)
+    return [packed]
 
 
 def _uses_native_b12x_mxfp4_intermediate_size(
@@ -146,9 +192,7 @@ def _uses_native_b12x_mxfp4_intermediate_size(
     if vllm_config.model_config.quantization != "mxfp4":
         return False
     moe_backend = vllm_config.kernel_config.moe_backend
-    return moe_backend == "b12x" or (
-        moe_backend == "auto" and envs.VLLM_USE_B12X_MOE
-    )
+    return moe_backend == "b12x" or (moe_backend == "auto" and envs.VLLM_USE_B12X_MOE)
 
 
 def _shard_routed_down_projection(tp_size: int) -> bool:
@@ -171,8 +215,7 @@ def _log_construction_memory(stage: str, prefix: str) -> None:
         return
     gib = 1024**3
     logger.info(
-        "Kimi-K3 construction %s %s: allocated=%.3f GiB, "
-        "reserved=%.3f GiB",
+        "Kimi-K3 construction %s %s: allocated=%.3f GiB, reserved=%.3f GiB",
         stage,
         prefix,
         torch.cuda.memory_allocated() / gib,
@@ -193,18 +236,31 @@ class KimiShardedGate(ColumnParallelLinear):
             prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward_local(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
-            output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
-        else:
-            output_parallel = torch.nn.functional.linear(
-                x.to(self.weight.dtype), self.weight
-            ).float()
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
+            return torch.mm(x, self.weight.T, out_dtype=torch.float32)
+        return torch.nn.functional.linear(x.to(self.weight.dtype), self.weight).float()
+
+    def forward(self, x: torch.Tensor):
+        output_parallel = self.forward_local(x)
+        output = gather_kimi_sharded_projection(output_parallel)
         return output, None
+
+
+class KimiShardedColumnParallelLinear(ColumnParallelLinear):
+    """Column-parallel Kimi projection with a low-latency decode gather."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs["gather_output"] = False
+        super().__init__(*args, **kwargs)
+
+    def forward_local(self, input_: torch.Tensor):
+        return super().forward(input_)
+
+    def forward(self, input_: torch.Tensor):
+        output_parallel, output_bias = self.forward_local(input_)
+        output = gather_kimi_sharded_projection(output_parallel)
+        return output, output_bias
 
 
 class KimiMLP(nn.Module):
@@ -221,6 +277,7 @@ class KimiMLP(nn.Module):
         activation_situ_linear_beta: float | None = None,
     ) -> None:
         super().__init__()
+        self.reduce_results = reduce_results
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -253,10 +310,39 @@ class KimiMLP(nn.Module):
             )
 
     def forward(self, x):
+        output_buffer = x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if self.reduce_results and should_reuse_kimi_full_width_output(output_buffer):
+            x, _ = self.down_proj.forward_local_with_output_buffer(x, output_buffer)
+            x = reduce_kimi_full_width_output(x, self.down_proj.tp_size)
+        else:
+            x, _ = self.down_proj(x)
         return x
+
+    def forward_with_output_buffer(
+        self,
+        x: torch.Tensor,
+        output_buffer: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate a shared-expert MLP into a dead full-width input."""
+        if self.reduce_results:
+            raise ValueError("A reduced Kimi MLP cannot donate its output buffer")
+        if output_buffer.shape != x.shape:
+            raise ValueError(
+                "Kimi shared-expert donation requires matching input/output "
+                f"shapes, got {x.shape=} and {output_buffer.shape=}."
+            )
+        gate_up, _ = self.gate_up_proj(x)
+        activated = self.act_fn(gate_up)
+        result = self.down_proj.forward_with_output_buffer(
+            activated,
+            output_buffer,
+        )
+        output = result[0] if isinstance(result, tuple) else result
+        if output.data_ptr() != output_buffer.data_ptr():
+            raise RuntimeError("Kimi shared-expert output buffer was not reused")
+        return output
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -463,6 +549,76 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
     return mapping
 
 
+class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
+    """Decode the explicit compact payload produced by the TP16 B12X path."""
+
+    def _compute_routing(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        indices_type: torch.dtype | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        if (
+            envs.VLLM_KIMI_CX_TOPK16
+            and self.top_k == 16
+            and self.global_num_experts == 896
+            and self.scoring_func == "sigmoid"
+            and self.renormalize
+            and indices_type in (None, torch.int32)
+            and input_ids is None
+            and self.e_score_correction_bias is not None
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens, 896)
+            and router_logits.dtype == torch.float32
+            and router_logits.is_cuda
+            and router_logits.is_contiguous()
+        ):
+            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (  # noqa: E501
+                _get_padding_mask,
+            )
+            from vllm.models.kimi_k3.nvidia.ops.topk16_cx import (
+                kimi_topk16_sigmoid,
+            )
+
+            return kimi_topk16_sigmoid(
+                router_logits,
+                self.e_score_correction_bias.data,
+                _get_padding_mask(num_tokens),
+                renormalize=self.renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens * 2, 16)
+            and router_logits.dtype == torch.float32
+        ):
+            topk_weights = router_logits[:num_tokens]
+            topk_ids = router_logits[num_tokens:].view(torch.int32)
+            return topk_weights, topk_ids
+        # Retain compatibility with the original M=1 row-interleaved payload.
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens, 32)
+            and router_logits.dtype == torch.float32
+        ):
+            topk_weights = router_logits[:, :16]
+            topk_ids = router_logits[:, 16:].view(torch.int32)
+            return topk_weights, topk_ids
+        return super()._compute_routing(
+            hidden_states,
+            router_logits,
+            indices_type,
+            input_ids=input_ids,
+        )
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -589,25 +745,23 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.routed_expert_down_proj: (
-            ColumnParallelLinear | ReplicatedLinear | None
-        )
+        self.routed_expert_down_proj: ColumnParallelLinear | ReplicatedLinear | None
         self.routed_expert_norm: RMSNorm | None
         self.routed_expert_up_proj: ReplicatedLinear | RowParallelLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
             shard_routed_down = _shard_routed_down_projection(self.tp_size)
             routed_down_cls = (
-                ColumnParallelLinear if shard_routed_down else ReplicatedLinear
+                KimiShardedColumnParallelLinear
+                if shard_routed_down
+                else ReplicatedLinear
             )
-            routed_down_kwargs = {"gather_output": True} if shard_routed_down else {}
             self.routed_expert_down_proj = routed_down_cls(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
                 quant_config=None,
                 prefix=f"{prefix}.routed_expert_down_proj",
-                **routed_down_kwargs,
             )
             if shard_routed_down:
                 logger.info_once(
@@ -693,6 +847,14 @@ class KimiMoE(nn.Module):
                 current_platform.is_cuda()
                 and current_platform.is_device_capability_family(100)
             )
+            router = KimiK3PrecomputedTopKRouter(
+                top_k=num_experts_per_token,
+                global_num_experts=num_experts,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                renormalize=moe_renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+                scoring_func=self.moe_router_activation_func,
+            )
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
                 num_experts=num_experts,
@@ -711,6 +873,7 @@ class KimiMoE(nn.Module):
                 scoring_func=config.moe_router_activation_func,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
+                router=router,
                 # Down projection runs outside MoERunner so it can overlap the
                 # router gate on the aux stream (see forward()); the original
                 # hidden states are passed to forward() as shared_experts_input
@@ -765,10 +928,9 @@ class KimiMoE(nn.Module):
             logits and ``topk_ids`` is ``None``.
         """
 
-        def _router(
-            hidden_states: torch.Tensor,
+        def _finish_router(
+            router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            router_logits, _ = self.gate(hidden_states)
             if not self.use_mega_moe:
                 return router_logits, None
             return fused_grouped_topk(
@@ -783,11 +945,47 @@ class KimiMoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
+        def _router(
+            hidden_states: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            router_logits, _ = self.gate(hidden_states)
+            return _finish_router(router_logits)
+
         down_proj = self.routed_expert_down_proj
         if down_proj is None:
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        if (
+            0 < num_tokens <= 8
+            and envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
+            and isinstance(self.gate, KimiShardedGate)
+            and isinstance(down_proj, KimiShardedColumnParallelLinear)
+        ):
+            router_local, (down_local, _) = maybe_execute_in_parallel(
+                lambda: self.gate.forward_local(hidden_states),
+                lambda: down_proj.forward_local(hidden_states),
+                self._down_proj_events[0],
+                self._down_proj_events[1],
+                self._down_proj_stream,
+            )
+            fused_pair_topk = (
+                try_gather_kimi_sharded_projection_pair_topk(
+                    down_local,
+                    router_local,
+                    self.gate.e_score_correction_bias.data,
+                )
+                if num_tokens == 1 or envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
+                else None
+            )
+            if fused_pair_topk is not None:
+                routed_hidden_states, routing_payload = fused_pair_topk
+                return routed_hidden_states, routing_payload, None
+            routed_hidden_states, router_logits = gather_kimi_sharded_projection_pair(
+                down_local, router_local
+            )
+            router_output, topk_ids = _finish_router(router_logits)
+            return routed_hidden_states, router_output, topk_ids
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),
@@ -810,6 +1008,8 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if not self.use_mega_moe and envs.VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS:
+            self.experts.prelaunch_shared_experts(hidden_states)
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
@@ -1013,6 +1213,26 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         assert residual is not None
+        output_buffer = None
+        if hidden_states is not None and should_reuse_kimi_full_width_output(
+            hidden_states
+        ):
+            # The previous MLP delta is dead after AttnRes consumes it.
+            output_buffer = hidden_states
+        elif (
+            hidden_states is None
+            and self.is_block_write_layer
+            and self.block_write_idx != residual.size(1) - 1
+            and should_reuse_kimi_full_width_output(prefix_sum)
+        ):
+            # The first layer has no previous MLP delta to donate. The
+            # block-major workspace makes every block slice contiguous, so an
+            # as-yet-unused final block can carry the normalized attention
+            # input until that block is written much later in the model.
+            scratch = residual[:, -1, :]
+            if not scratch.is_contiguous():
+                raise RuntimeError("AttnRes scratch block must be contiguous")
+            output_buffer = scratch
         hidden_states = attn_res(
             prefix_sum,
             hidden_states,
@@ -1024,6 +1244,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
+            output_buffer=output_buffer,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1040,11 +1261,22 @@ class KimiDecoderLayer(nn.Module):
             return hidden_states, prefix_sum, residual
 
         assert prefix_sum is not None
+        previous_prefix = prefix_sum
         if self.is_block_write_layer:
             prefix_sum = hidden_states
             prefix_delta = None
+            output_buffer = (
+                previous_prefix
+                if should_reuse_kimi_full_width_output(previous_prefix)
+                else None
+            )
         else:
             prefix_delta = hidden_states
+            output_buffer = (
+                hidden_states
+                if should_reuse_kimi_full_width_output(hidden_states)
+                else None
+            )
         mlp_valid_blocks = self.prev_valid_blocks + self.is_block_write_layer
         hidden_states = attn_res(
             prefix_sum,
@@ -1057,6 +1289,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=-1,
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            output_buffer=output_buffer,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1151,6 +1384,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if self.attn_res_block_size is not None
             else 0
         )
+        self._max_num_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._model_dtype = vllm_config.model_config.dtype
+        self.register_buffer("_attn_res_workspace", None, persistent=False)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1202,6 +1440,71 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _get_attn_res_workspace(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shape = (
+            hidden_states.size(0),
+            self.num_attn_res_blocks,
+            hidden_states.size(1),
+        )
+        workspace = self._attn_res_workspace
+        if (
+            workspace is None
+            or workspace.device != hidden_states.device
+            or workspace.dtype != hidden_states.dtype
+            or workspace.size(0) < shape[0]
+            or workspace.size(1) != shape[1]
+            or workspace.size(2) != shape[2]
+        ):
+            # Store blocks first physically, then expose the model's
+            # [tokens, blocks, hidden] API. Each block slice is now a
+            # contiguous full-width prefill scratch without adding memory.
+            workspace = hidden_states.new_empty(
+                shape[1],
+                shape[0],
+                shape[2],
+            ).permute(1, 0, 2)
+            self._attn_res_workspace = workspace
+        return workspace[: shape[0]]
+
+    def reserve_attn_res_workspace(self) -> None:
+        """Reserve the largest attn-res tensor before KV cache allocation.
+
+        Chunked prefill otherwise first asks the caching allocator for this
+        224 MiB tensor after the physical 1M cache has consumed nearly all
+        device memory.  Keeping one stable buffer also prevents the allocator
+        from fragmenting a same-sized transient between prompt chunks.
+        """
+        if not self.use_attn_res or self.num_attn_res_blocks == 0:
+            return
+        shape = (
+            self._max_num_batched_tokens,
+            self.num_attn_res_blocks,
+            self.config.hidden_size,
+        )
+        workspace = self._attn_res_workspace
+        if (
+            workspace is None
+            or workspace.device != next(self.parameters()).device
+            or workspace.dtype != self._model_dtype
+            or tuple(workspace.shape) != shape
+        ):
+            device = next(self.parameters()).device
+            self._attn_res_workspace = torch.empty(
+                shape[1],
+                shape[0],
+                shape[2],
+                dtype=self._model_dtype,
+                device=device,
+            ).permute(1, 0, 2)
+            logger.info_once(
+                "K3 retained %.2f MiB/rank for the %d-token attn-res "
+                "prefill workspace.",
+                self._attn_res_workspace.numel()
+                * self._attn_res_workspace.element_size()
+                / (1024**2),
+                self._max_num_batched_tokens,
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1241,11 +1544,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         prefix_sum = None
         if self.use_attn_res:
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.num_attn_res_blocks,
-                hidden_states.size(1),
-            )
+            block_residual = self._get_attn_res_workspace(hidden_states)
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
             prefix_sum = hidden_states
@@ -1291,6 +1590,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         if self.use_attn_res:
             assert prefix_sum is not None
+            output_buffer = (
+                hidden_states
+                if should_reuse_kimi_full_width_output(hidden_states)
+                else None
+            )
             hidden_states = attn_res(
                 prefix_sum,
                 hidden_states,
@@ -1302,7 +1606,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
+                output_buffer=output_buffer,
             )
+            if not self.use_sequence_parallel:
+                aux_hidden_states = _pack_aux_hidden_states_into_attn_res_workspace(
+                    aux_hidden_states,
+                    residual,
+                )
         else:
             hidden_states = hidden_states + residual
 
@@ -1621,6 +1931,9 @@ class KimiLinearForCausalLM(
         # (W_UK_T / W_UV absorption) is driven by the loader's generic post-load
         # hook for any AttentionLayerBase, so no manual trigger is needed here.
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        self.model.reserve_attn_res_workspace()
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -2064,3 +2377,6 @@ class KimiK3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()

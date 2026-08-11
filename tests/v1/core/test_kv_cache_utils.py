@@ -2738,6 +2738,215 @@ def test_group_and_unify_kv_cache_specs_uniform_page_size_returns_none():
     assert group_and_unify_kv_cache_specs(specs) is None
 
 
+def test_k3_dspark_window_group_preserves_target_and_kda_layers(monkeypatch):
+    """K3 + bounded DSpark uses the compact generic hybrid-cache layout."""
+    target = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+    )
+    draft = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=65536,
+        dcp_replicated=True,
+        non_causal_multi_token_decode=True,
+    )
+    # The real K3 recurrent state page is 48 FP8 MLA pages.  Its seven
+    # speculative state slots cover an eight-token target verification step.
+    kda = MambaSpec(
+        block_size=1,
+        shapes=((target.page_size_bytes * 48,),),
+        dtypes=(torch.uint8,),
+        dcp_replicated=True,
+        num_speculative_blocks=7,
+    )
+    specs = {
+        **{f"target.mla.{i}": target for i in range(24)},
+        **{f"target.kda.{i}": kda for i in range(69)},
+        **{f"draft.mla.{i}": draft for i in range(5)},
+    }
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=1_048_576,
+            hf_config=SimpleNamespace(model_type="kimi_k3"),
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_batched_tokens=2048,
+            max_num_seqs=1,
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            prefill_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="none", num_gpu_blocks_override=None
+        ),
+        kv_transfer_config=None,
+        # V1 async scheduling can overlap two 2,048-token batches. Sliding
+        # windows must retain both until the processed-token frontier settles.
+        max_in_flight_tokens=4096,
+    )
+
+    groups = get_kv_cache_groups(config, specs)
+
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+    assert len(groups) == 20
+    assert max(len(group.layer_names) for group in groups) == 5
+    assert all(
+        not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+    )
+    assert {group.kv_cache_spec.page_size_bytes for group in groups} == {
+        target.page_size_bytes * 48
+    }
+
+    target_groups = [
+        group
+        for group in groups
+        if any(name.startswith("target.mla") for name in group.layer_names)
+    ]
+    kda_groups = [
+        group
+        for group in groups
+        if any(name.startswith("target.kda") for name in group.layer_names)
+    ]
+    draft_groups = [
+        group
+        for group in groups
+        if any(name.startswith("draft.mla") for name in group.layer_names)
+    ]
+    assert len(target_groups) == 5
+    assert len(kda_groups) == 14
+    assert len(draft_groups) == 1
+    assert len(draft_groups[0].layer_names) == 5
+    assert all(group.kv_cache_spec.block_size == 768 for group in target_groups)
+    assert all(group.kv_cache_spec.block_size == 1 for group in kda_groups)
+    draft_group_spec = draft_groups[0].kv_cache_spec
+    assert isinstance(draft_group_spec, SlidingWindowMLASpec)
+    assert draft_group_spec.block_size == 768
+    assert draft_group_spec.sliding_window == 65536
+    assert draft_group_spec.dcp_replicated
+    assert draft_group_spec.non_causal_multi_token_decode
+
+    page_size = target.page_size_bytes * 48
+    expected_blocks = (
+        # Five target groups, each storing 1M / DCP8 tokens.
+        5 * kv_cache_utils.cdiv(kv_cache_utils.cdiv(1_048_576, 8), 768)
+        # Fourteen recurrent groups, each keeping current + seven rollback
+        # states for speculative verification.
+        + 14 * 8
+        # One replicated bounded-draft group.  SlidingWindowMLASpec includes
+        # scheduler lookahead and the partial leading page.
+        + kv_cache_utils.cdiv(
+            draft_group_spec.max_memory_usage_bytes(config), page_size
+        )
+    )
+    required_bytes = 5 * page_size * expected_blocks
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+        == required_bytes
+        == 2_342_338_560
+    )
+
+    cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, available_memory=required_bytes
+    )
+    assert cache_config.num_blocks == expected_blocks == 1059
+    capacity, concurrency = get_kv_cache_capacity(config, cache_config)
+    assert capacity == 1_048_576
+    assert concurrency == pytest.approx(1.0)
+
+    monkeypatch.setenv("VLLM_K3_KV_GROUP_SIZE", "6")
+    optimized_groups = get_kv_cache_groups(config, specs)
+    assert len(optimized_groups) == 17
+    assert max(len(group.layer_names) for group in optimized_groups) == 6
+    assert {group.kv_cache_spec.page_size_bytes for group in optimized_groups} == {
+        page_size
+    }
+
+    # Group size six has no target padding, three padded KDA states, and one
+    # padded draft layer. At a 64K draft tail this saves 27,869,184 bytes/rank
+    # while also creating three fewer block tables than the default layout.
+    optimized_required_blocks = 6 * (
+        4 * kv_cache_utils.cdiv(kv_cache_utils.cdiv(1_048_576, 8), 768)
+        + 12 * 8
+        + kv_cache_utils.cdiv(
+            draft_group_spec.max_memory_usage_bytes(config), page_size
+        )
+    )
+    optimized_required_bytes = page_size * optimized_required_blocks
+    assert optimized_required_bytes == 2_314_469_376
+    assert required_bytes - optimized_required_bytes == 27_869_184
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, optimized_groups)
+        == optimized_required_bytes
+    )
+    optimized_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, optimized_groups, available_memory=optimized_required_bytes
+    )
+    optimized_capacity, optimized_concurrency = get_kv_cache_capacity(
+        config, optimized_cache_config
+    )
+    assert optimized_capacity == 1_048_576
+    assert optimized_concurrency == pytest.approx(1.0)
+
+    # The production 1M profile uses a 32K draft tail. Keep its launcher
+    # lower bound pinned here so changing scheduler lookahead or grouping
+    # cannot silently turn the next full-model start into an OOM.
+    draft_32k = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=32768,
+        dcp_replicated=True,
+        non_causal_multi_token_decode=True,
+    )
+    specs_32k = {
+        name: draft_32k if name.startswith("draft.mla") else spec
+        for name, spec in specs.items()
+    }
+    optimized_groups_32k = get_kv_cache_groups(config, specs_32k)
+    required_bytes_32k = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        config, optimized_groups_32k
+    )
+    assert required_bytes_32k == 2_200_338_432
+    cache_config_32k = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, optimized_groups_32k, available_memory=required_bytes_32k
+    )
+    capacity_32k, concurrency_32k = get_kv_cache_capacity(
+        config, cache_config_32k
+    )
+    assert capacity_32k == 1_048_576
+    assert concurrency_32k == pytest.approx(1.0)
+
+    # DCP16 halves each target MLA shard. Recurrent KDA state and the bounded
+    # replicated DSpark tail are unchanged, so the exact 1M lower bound drops
+    # by 860.625 MiB/rank relative to DCP8.
+    config.parallel_config.decode_context_parallel_size = 16
+    optimized_groups_dcp16 = get_kv_cache_groups(config, specs_32k)
+    required_bytes_dcp16 = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        config, optimized_groups_dcp16
+    )
+    assert required_bytes_dcp16 == 1_297_907_712
+    assert required_bytes_32k - required_bytes_dcp16 == 902_430_720
+    cache_config_dcp16 = kv_cache_utils.get_kv_cache_config_from_groups(
+        config,
+        optimized_groups_dcp16,
+        available_memory=required_bytes_dcp16,
+    )
+    capacity_dcp16, concurrency_dcp16 = get_kv_cache_capacity(
+        config, cache_config_dcp16
+    )
+    assert capacity_dcp16 == 1_048_576
+    assert concurrency_dcp16 == pytest.approx(1.0)
+
+
 def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
     # layers do require tuple packing, so grouping must still be produced.

@@ -103,11 +103,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
 
-        if self.speculative_config:
-            assert self.speculative_config.num_speculative_tokens is not None
-            self.num_spec: int = self.speculative_config.num_speculative_tokens
-        else:
-            self.num_spec = 0
+        # The cache spec is authoritative for the target verifier width. A
+        # semi-autoregressive drafter can produce a wider native block while a
+        # recurrent target deliberately verifies only a prefix of that block.
+        self.num_spec = kv_cache_spec.num_speculative_blocks
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 

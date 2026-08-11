@@ -105,13 +105,33 @@ class KVCacheCoordinator(ABC):
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
+        # Groups with a private, admission-cap-sized pool (DFlash window
+        # drafts) allocate from their own BlockPool: by construction it can
+        # never run out, so shared-pool admission accounting skips them.
+        self.private_pool_group_ids: set[int] = set()
+
+        def _pool_for_group(i: int, group) -> BlockPool:
+            if group.private_pool_num_blocks is None:
+                return self.block_pool
+            self.private_pool_group_ids.add(i)
+            return BlockPool(
+                num_gpu_blocks=group.private_pool_num_blocks,
+                enable_caching=False,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=False,
+                metrics_collector=None,
+            )
+
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
-                enable_caching=enable_caching,
+                block_pool=_pool_for_group(i, kv_cache_group),
+                enable_caching=(
+                    enable_caching
+                    and kv_cache_group.private_pool_num_blocks is None
+                ),
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
@@ -144,6 +164,7 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        num_speculative_tokens: int | None = None,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -172,6 +193,11 @@ class KVCacheCoordinator(ABC):
         """
         blocks_by_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
+            if i in self.private_pool_group_ids:
+                # Private admission-cap-sized pool: exhaustion-free by
+                # construction, draws nothing from the shared pool.
+                blocks_by_group.append(0)
+                continue
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
@@ -184,6 +210,7 @@ class KVCacheCoordinator(ABC):
                         0,
                         num_encoder_tokens,
                         apply_admission_cap=apply_admission_cap,
+                        num_speculative_tokens=None,
                     )
                 )
             else:
@@ -196,6 +223,7 @@ class KVCacheCoordinator(ABC):
                         num_local_computed_tokens,
                         num_tokens_main_model,
                         apply_admission_cap=apply_admission_cap,
+                        num_speculative_tokens=num_speculative_tokens,
                     )
                 )
         if self.lockstep_mla_allocations:
@@ -291,6 +319,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        num_speculative_tokens: int | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -317,6 +346,7 @@ class KVCacheCoordinator(ABC):
                     if isinstance(manager, CrossAttentionManager)
                     else num_tokens,
                     num_tokens_main_model,
+                    num_speculative_tokens=num_speculative_tokens,
                 )
                 for manager in self.single_type_managers
             )
@@ -336,6 +366,7 @@ class KVCacheCoordinator(ABC):
             request_id,
             num_tokens,
             num_tokens_main_model,
+            num_speculative_tokens=num_speculative_tokens,
         )
         blocks_to_append = new_blocks
         cow_block = None
@@ -360,6 +391,12 @@ class KVCacheCoordinator(ABC):
             for manager in managers[1:]
         )
         return tuple(list(new_blocks) for _ in managers)
+
+    def take_block_table_overwrite(self, request_id: str) -> bool:
+        overwrite = False
+        for manager in self.single_type_managers:
+            overwrite |= manager.take_block_table_overwrite(request_id)
+        return overwrite
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

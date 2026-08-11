@@ -1011,16 +1011,18 @@ def get_max_concurrency_for_kv_cache_config(
             vllm_config, groups
         )
         memory_per_block = _pool_bytes_per_block(vllm_config, groups)
-        num_blocks_per_request = cdiv(
-            max_memory_usage_per_request, memory_per_block
-        )
+        num_blocks_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     else:
+        # Private-pool groups (DFlash window drafts) do not draw from the
+        # shared pool; their pools are admission-cap-sized so they never
+        # bound concurrency.
         num_blocks_per_request = sum(
             cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 group.kv_cache_spec.page_size_bytes,
             )
             for group in groups
+            if group.private_pool_num_blocks is None
         )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
@@ -1220,6 +1222,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    group_size_override: int | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1335,6 +1338,13 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    if group_size_override is not None:
+        if group_size_override <= 0:
+            raise ValueError(
+                f"KV cache group size override must be positive, got "
+                f"{group_size_override}."
+            )
+        group_size = group_size_override
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -1538,6 +1548,48 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _private_window_pool_num_blocks(
+    vllm_config: VllmConfig, group: KVCacheGroupSpec
+) -> int | None:
+    """Blocks for a group that should allocate from a private pool.
+
+    Applies only to DCP-replicated sliding-window groups (the DFlash GQA
+    draft). Their per-request block usage plateaus at the window admission
+    cap, so in the shared pool every block would carry a page for them that
+    they can never use: the group's page taxes ``block_stride`` (shrinking
+    the reported token capacity ~2.5x for Kimi-K3 DFlash) and its tensor is
+    sized to the full shared ``num_blocks``. A private pool sized
+    ``max_num_seqs * admission_cap`` is exhaustion-free by construction
+    (the cap already includes in-flight tokens), so admission accounting
+    can stay entirely on the shared pool.
+
+    Returns None when the group must stay in the shared pool.
+    """
+    if os.environ.get("VLLM_DFLASH_PRIVATE_WINDOW_POOL", "1") == "0":
+        return None
+    if vllm_config.cache_config.enable_prefix_caching:
+        # Window-block recycling with prefix caching keeps blocks alive past
+        # the window; keep the well-tested shared-pool path there.
+        return None
+    spec: KVCacheSpec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        inner = list(spec.kv_cache_specs.values())
+        if not inner or not all(
+            type(s) is SlidingWindowSpec and s.dcp_replicated for s in inner
+        ):
+            return None
+        spec = inner[0]
+    elif not (type(spec) is SlidingWindowSpec and spec.dcp_replicated):
+        return None
+    admission_blocks = spec.max_admission_blocks_per_request(
+        max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+        max_model_len=vllm_config.model_config.max_model_len,
+    )
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    # +1 for the pool's null block, +3 slack for block-boundary rounding.
+    return admission_blocks * max_num_seqs + 4
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1560,6 +1612,75 @@ def get_kv_cache_config_from_groups(
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    for _i, _g in enumerate(kv_cache_groups):
+        _spec = _g.kv_cache_spec
+        logger.info_once(
+            "KV group %d: %s x%d layers, block_size=%s, page=%d B, "
+            "per-request=%d B",
+            _i,
+            type(_spec).__name__,
+            len(_g.layer_names),
+            getattr(_spec, "block_size", "?"),
+            _spec.page_size_bytes,
+            _spec.max_memory_usage_bytes(vllm_config),
+        )
+
+    # Carve DCP-replicated sliding-window groups (DFlash draft) out into
+    # private, admission-cap-sized pools before shared-slab planning; see
+    # _private_window_pool_num_blocks. Group order (and thus group ids) is
+    # preserved: only the planner below sees the reduced list.
+    private_tensors: list[KVCacheTensor] = []
+    shared_groups = kv_cache_groups
+    if len(kv_cache_groups) > 1 and not _use_lockstep_mla_allocation(
+        kv_cache_groups,
+        vllm_config.parallel_config.decode_context_parallel_size,
+        vllm_config.parallel_config.prefill_context_parallel_size,
+    ):
+        shared_groups = []
+        for group in kv_cache_groups:
+            pool_blocks = _private_window_pool_num_blocks(vllm_config, group)
+            if pool_blocks is None:
+                shared_groups.append(group)
+                continue
+            group.private_pool_num_blocks = pool_blocks
+            spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    page_size = spec.kv_cache_specs[layer_name].page_size_bytes
+                else:
+                    page_size = spec.page_size_bytes
+                tensor_size = page_size * pool_blocks
+                private_tensors.append(
+                    KVCacheTensor(
+                        size=tensor_size,
+                        shared_by=[layer_name],
+                        private_pool=True,
+                    )
+                )
+                available_memory -= tensor_size
+            logger.info_once(
+                "KV cache group of %d window-draft layers uses a private pool "
+                "of %d blocks (%.1f MiB); it no longer taxes shared-pool "
+                "capacity.",
+                len(group.layer_names),
+                pool_blocks,
+                sum(t.size for t in private_tensors) / (1 << 20),
+            )
+        if not shared_groups:
+            shared_groups = kv_cache_groups
+            private_tensors = []
+            for group in kv_cache_groups:
+                group.private_pool_num_blocks = None
+    if private_tensors:
+        result = get_kv_cache_config_from_groups(
+            vllm_config, shared_groups, available_memory
+        )
+        return KVCacheConfig(
+            num_blocks=result.num_blocks,
+            kv_cache_tensors=result.kv_cache_tensors + private_tensors,
             kv_cache_groups=kv_cache_groups,
         )
 
@@ -1781,6 +1902,15 @@ def group_and_unify_kv_cache_specs(
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
+    # Recurrent state pages (for example Kimi K3's KDA layers) must go through
+    # the generic hybrid-cache planner.  Packing them into the DeepSeek-V4
+    # tuple layout makes the much larger Mamba state page part of every packed
+    # block and can reduce MLA capacity by orders of magnitude.  The generic
+    # path instead unifies physical page sizes and shares pools across the
+    # 24 MLA, 69 KDA, and optional draft-MLA layer buckets.
+    if any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.values()):
+        return None
+
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )
@@ -2081,7 +2211,38 @@ def get_kv_cache_groups(
         if fallback_groups is None:
             raise
         return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    k3_group_size = envs.VLLM_K3_KV_GROUP_SIZE
+    use_k3_group_size_override = (
+        k3_group_size > 0
+        and model_type == "kimi_k3"
+        and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+        and any(
+            isinstance(spec, SlidingWindowMLASpec)
+            and spec.non_causal_multi_token_decode
+            for spec in filtered_spec.values()
+        )
+    )
+    if use_k3_group_size_override:
+        # K3's default group size of five pads its 24 target MLA layers and 69
+        # KDA states. A singleton layout removes all padding but creates 98 GPU
+        # block tables, which costs substantially more memory than it saves.
+        # Six is the useful compromise for target+KDA+five-layer DSpark: it
+        # produces only 17 groups (three fewer than the default) and, with a
+        # 32K draft tail, also removes about 44.7 MiB/rank of cache padding.
+        groups = _get_kv_cache_groups_uniform_page_size(
+            filtered_spec, group_size_override=k3_group_size
+        )
+        logger.info_once(
+            "Kimi-K3 is using hybrid KV group size %d (%d groups) to reduce "
+            "cache padding and block-table overhead.",
+            k3_group_size,
+            len(groups),
+        )
+    else:
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
@@ -2475,8 +2636,11 @@ def get_kv_cache_configs(
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
+        # Shrink tensor size proportionally. Private-pool tensors are sized
+        # by their own group's pool, not by num_blocks, so they are exempt.
         for tensor in kv_cache_config.kv_cache_tensors:
+            if tensor.private_pool:
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

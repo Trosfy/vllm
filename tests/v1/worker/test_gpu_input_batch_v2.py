@@ -7,6 +7,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 DEVICE = current_platform.device_type
 
@@ -51,3 +52,23 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+def test_dummy_batch_populates_dcp_local_seq_lens():
+    buffers = InputBuffers(
+        max_num_reqs=2,
+        max_num_tokens=7,
+        device=torch.device(DEVICE),
+    )
+    batch = InputBatch.make_dummy(1, 7, buffers)
+    runner = object.__new__(GPUModelRunner)
+    runner.input_buffers = buffers
+    runner.use_dcp = True
+    runner.dcp_size = 16
+    runner.dcp_rank = 3
+    runner.cp_interleave = 1
+
+    runner._prepare_dummy_dcp_seq_lens(batch)
+
+    assert batch.dcp_local_seq_lens is not None
+    assert batch.dcp_local_seq_lens.tolist() == [1]

@@ -27,7 +27,54 @@ from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     fused_recurrent_kda_fwd,
     fused_recurrent_kda_packed_decode,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    reduce_kimi_full_width_output,
+)
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+
+
+def test_reduce_kimi_output_selects_in_place_only_for_large_prefill(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, torch.Tensor]] = []
+
+    def functional(value: torch.Tensor) -> torch.Tensor:
+        calls.append(("functional", value))
+        return value + 1
+
+    def in_place(value: torch.Tensor) -> torch.Tensor:
+        calls.append(("in_place", value))
+        value.add_(2)
+        return value
+
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.tp_projection."
+        "tensor_model_parallel_all_reduce",
+        functional,
+    )
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.tp_projection."
+        "tensor_model_parallel_all_reduce_in_place",
+        in_place,
+    )
+    monkeypatch.setattr(
+        "vllm.models.kimi_k3.nvidia.tp_projection."
+        "_KIMI_OUTPUT_BUFFER_REUSE_MIN_TOKENS",
+        4,
+    )
+
+    small = torch.zeros(1, 2)
+    large = torch.zeros(4, 2)
+    assert reduce_kimi_full_width_output(small, tp_size=1) is small
+    torch.testing.assert_close(
+        reduce_kimi_full_width_output(small, tp_size=16), small + 1
+    )
+    large_ptr = large.data_ptr()
+    actual = reduce_kimi_full_width_output(large, tp_size=16)
+    assert actual.data_ptr() == large_ptr
+    torch.testing.assert_close(actual, torch.full((4, 2), 2.0))
+    assert [name for name, _ in calls] == ["functional", "in_place"]
+
 
 DEVICE = "cuda"
 

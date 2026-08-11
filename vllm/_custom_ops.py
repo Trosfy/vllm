@@ -2799,8 +2799,9 @@ def kimi_k3_attn_res(
     num_blocks: int,
     eps: float,
     output_norm_eps: float,
+    output_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    output = torch.empty_like(prefix)
+    output = torch.empty_like(prefix) if output_buffer is None else output_buffer
     torch.ops._C.kimi_k3_attn_res(
         prefix,
         delta,

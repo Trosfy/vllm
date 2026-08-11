@@ -29,6 +29,38 @@ def _make_speculator() -> SimpleNamespace:
     )
 
 
+def _make_input_warmup_speculator(max_num_tokens: int = 2048) -> SimpleNamespace:
+    temperature = torch.ones(2)
+    seeds = torch.zeros(2, dtype=torch.int64)
+    return SimpleNamespace(
+        draft_kv_cache_group_id=0,
+        draft_kv_cache_group_ids=[0],
+        num_query_per_req=2,
+        dynamic_physical_depth=False,
+        max_num_reqs=2,
+        max_num_tokens=max_num_tokens,
+        max_model_len=4096,
+        device=torch.device("cpu"),
+        input_buffers=object(),
+        block_tables=SimpleNamespace(
+            slot_mappings=[object()],
+            input_block_tables=[object()],
+            kernel_block_sizes=[16],
+        ),
+        context_positions=object(),
+        _context_slot_mappings=[object()],
+        sample_indices=object(),
+        sample_pos=object(),
+        sample_idx_mapping=object(),
+        temperature=temperature,
+        seeds=seeds,
+        num_cached_tokens=object(),
+        parallel_drafting_token_id=1,
+        sample_from_anchor=False,
+        _speculative_steps_for_query_len=lambda query_len: query_len - 1,
+    )
+
+
 def test_dflash_retains_backbone_output_during_cudagraph_capture(monkeypatch):
     speculator = _make_speculator()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -67,35 +99,7 @@ def test_dflash_does_not_retain_eager_backbone_output(monkeypatch):
 
 
 def test_dflash_input_warmup_copies_sampling_state(monkeypatch):
-    temperature = torch.ones(2)
-    seeds = torch.zeros(2, dtype=torch.int64)
-    speculator = SimpleNamespace(
-        draft_kv_cache_group_id=0,
-        draft_kv_cache_group_ids=[0],
-        num_query_per_req=2,
-        dynamic_physical_depth=False,
-        max_num_reqs=2,
-        max_num_tokens=2048,
-        max_model_len=4096,
-        device=torch.device("cpu"),
-        input_buffers=object(),
-        block_tables=SimpleNamespace(
-            slot_mappings=[object()],
-            input_block_tables=[object()],
-            kernel_block_sizes=[16],
-        ),
-        context_positions=object(),
-        _context_slot_mappings=[object()],
-        sample_indices=object(),
-        sample_pos=object(),
-        sample_idx_mapping=object(),
-        temperature=temperature,
-        seeds=seeds,
-        num_cached_tokens=object(),
-        parallel_drafting_token_id=1,
-        sample_from_anchor=False,
-        _speculative_steps_for_query_len=lambda query_len: query_len - 1,
-    )
+    speculator = _make_input_warmup_speculator()
     prepare_inputs = Mock()
     monkeypatch.setattr(dflash_module, "prepare_dflash_inputs", prepare_inputs)
 
@@ -103,7 +107,19 @@ def test_dflash_input_warmup_copies_sampling_state(monkeypatch):
 
     assert prepare_inputs.call_count == 5
     for call in prepare_inputs.call_args_list:
-        assert call.args[7] is temperature
-        assert call.args[8] is seeds
-        assert call.args[14] is temperature
-        assert call.args[15] is seeds
+        assert call.args[7] is speculator.temperature
+        assert call.args[8] is speculator.seeds
+        assert call.args[14] is speculator.temperature
+        assert call.args[15] is speculator.seeds
+
+
+def test_dflash_input_warmup_stays_within_context_buffers(monkeypatch):
+    speculator = _make_input_warmup_speculator(max_num_tokens=512)
+    prepare_inputs = Mock()
+    monkeypatch.setattr(dflash_module, "prepare_dflash_inputs", prepare_inputs)
+
+    DFlashSpeculator._warmup_prepare_inputs_kernel(speculator)
+
+    assert prepare_inputs.call_count == 4
+    for call in prepare_inputs.call_args_list:
+        assert call.args[9].positions.numel() <= speculator.max_num_tokens

@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
@@ -409,8 +410,12 @@ def warmup_kernels(
             assert model_runner.speculator is not None
             with use_workspace_lane(1):
                 model_runner.speculator.warmup_capacity_kernels()
+        if model_runner.speculator is not None:
             if model_runner.speculator.wants_auto_sps_curve:
-                _profile_sps_curve(model_runner)
+                _profile_sps_curve(model_runner, apply_curve=True)
+                model_runner.kv_connector.set_disabled(True)
+            elif model_runner.speculator.wants_sps_profile_only:
+                _profile_sps_curve(model_runner, apply_curve=False)
                 model_runner.kv_connector.set_disabled(True)
 
     # Clean up - process finish_req_ids.
@@ -455,6 +460,8 @@ def _profile_sps_curve(
     warmup_iters: int = 5,
     timed_iters: int = 10,
     timed_rounds: int = 5,
+    *,
+    apply_curve: bool = True,
 ) -> None:
     """Profile the engine step-rate curve for ``dspark_sps_curve="auto"``.
 
@@ -491,14 +498,13 @@ def _profile_sps_curve(
     # never prunes. Measure one request at each varlen bucket below full
     # depth; a full step at (1 req, t tokens) is exactly the cost of a gated
     # step with capacity t-1 (the draft always runs full width).
-    sweep_points = [(t, t) for t in range(1, decode_query_len)]
+    first_query_len = 1 if apply_curve else 2
+    sweep_points = [(t, t) for t in range(first_query_len, decode_query_len)]
     sweep_points.extend(
         (num_reqs * decode_query_len, decode_query_len) for num_reqs in req_counts
     )
 
-    import os
-
-    sps_debug_level = int(os.environ.get("VLLM_DSPARK_SPS_DEBUG", "0") or "0")
+    sps_debug_level = envs.VLLM_DSPARK_SPS_DEBUG
     sps_debug = sps_debug_level >= 1
     # Spread dummy MoE routing during profiling: real verify tokens route to
     # ~topk distinct experts each, and the curve must price that weight
@@ -512,11 +518,13 @@ def _profile_sps_curve(
         if sps_debug:
             model_runner._sps_debug_events = []
         uniform_query_len = query_len if query_len != decode_query_len else None
+        uniform_num_speculative_tokens = query_len - 1 if not apply_curve else None
         for _ in range(warmup_iters):
             model_runner._dummy_run(
                 num_tokens,
                 uniform_decode=True,
                 uniform_query_len=uniform_query_len,
+                uniform_num_speculative_tokens=uniform_num_speculative_tokens,
             )
         torch.accelerator.synchronize()
         samples = []
@@ -527,6 +535,7 @@ def _profile_sps_curve(
                     num_tokens,
                     uniform_decode=True,
                     uniform_query_len=uniform_query_len,
+                    uniform_num_speculative_tokens=uniform_num_speculative_tokens,
                 )
             torch.accelerator.synchronize()
             samples.append((time.perf_counter() - start) * 1000.0 / timed_iters)
@@ -561,6 +570,7 @@ def _profile_sps_curve(
                     num_tokens,
                     uniform_decode=True,
                     uniform_query_len=uniform_query_len,
+                    uniform_num_speculative_tokens=uniform_num_speculative_tokens,
                 )
             torch.accelerator.synchronize()
             rows = sorted(
@@ -584,24 +594,34 @@ def _profile_sps_curve(
     step_ms = timings.cpu().tolist()
 
     assert model_runner.speculative_config is not None
-    overhead_ms = model_runner.speculative_config.dspark_sps_overhead_ms
+    overhead_ms = (
+        model_runner.speculative_config.dspark_sps_overhead_ms if apply_curve else 0.0
+    )
     sps_curve = [
         (num_tokens, 1000.0 / (ms + overhead_ms))
         for (num_tokens, _), ms in zip(sweep_points, step_ms)
     ]
-    assert model_runner.speculator is not None
-    model_runner.speculator.set_sps_curve(sps_curve)
-    capacity_manager = model_runner.verification_capacity_manager
-    if capacity_manager is not None:
-        draft_token_budget = _derive_dspark_draft_token_budget(
-            sps_curve,
-            model_runner.num_speculative_steps,
-        )
-        capacity_manager.set_dynamic_draft_token_budget(draft_token_budget)
-        logger.info(
-            "DSpark auto-profiled dynamic draft-token budget: %d",
-            draft_token_budget,
-        )
+    if apply_curve:
+        assert model_runner.speculator is not None
+        model_runner.speculator.set_sps_curve(sps_curve)
+        capacity_manager = model_runner.verification_capacity_manager
+        if capacity_manager is not None:
+            draft_token_budget = _derive_dspark_draft_token_budget(
+                sps_curve,
+                model_runner.num_speculative_steps,
+            )
+            capacity_manager.set_dynamic_draft_token_budget(draft_token_budget)
+            # Keep proposal-side confidence work aligned with verifier-side
+            # capacity readback.  With an auto-derived activation threshold,
+            # the manager used to bypass low-load readback while the DSpark
+            # graph still computed confidence logits on every proposal.
+            model_runner.speculator.capacity_activation_batch_size = (
+                capacity_manager.capacity_activation_batch_size
+            )
+            logger.info(
+                "DSpark auto-profiled dynamic draft-token budget: %d",
+                draft_token_budget,
+            )
     logger.info(
         "DSpark SPS profile windows (tokens, ms/step samples): %s",
         [
@@ -610,6 +630,7 @@ def _profile_sps_curve(
         ],
     )
     logger.info(
-        "DSpark auto-profiled SPS curve (tokens, steps/s): %s",
+        "DSpark %s SPS curve (tokens, steps/s): %s",
+        "auto-profiled" if apply_curve else "profile-only",
         [(b, round(s, 2)) for b, s in sps_curve],
     )

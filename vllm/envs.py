@@ -65,6 +65,14 @@ if TYPE_CHECKING:
     VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
+    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
+    VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
+    VLLM_DSPARK_CAPTURE_SHARDED_MARKOV: bool = False
+    VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS: bool = False
+    VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -195,7 +203,10 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
+    VLLM_DSPARK_PROFILE_SPS_ONLY: bool = False
+    VLLM_DSPARK_SPS_DEBUG: int = 0
     VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: int = 0
+    VLLM_DSPARK_MAX_VERIFICATION_TOKENS: int = 0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -342,6 +353,12 @@ if TYPE_CHECKING:
     VLLM_KIMI_SHARD_ROUTED_DOWN_PROJ: bool = False
     VLLM_KIMI_SHARD_ROUTED_UP_PROJ: bool = False
     VLLM_KIMI_SHARD_ROUTER: bool = False
+    VLLM_KIMI_CX_TOPK16: bool = False
+    VLLM_KIMI_USE_B12X_PROJECTION_GATHER: bool = False
+    VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER: bool = False
+    VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK: bool = False
+    VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK: bool = False
+    VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS: bool = False
     VLLM_KIMI_LOG_CONSTRUCTION_MEMORY: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
@@ -1124,6 +1141,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
     ),
+    # Bound the external DSpark draft's replicated MLA KV cache while the
+    # target retains its complete context. Zero preserves full-context draft
+    # attention. The target still verifies every proposal, so windowing can
+    # change acceptance/performance but not the target distribution.
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
+    ),
+    # Keep the Markov vocabulary projection TP-sharded while replicating its
+    # much cheaper embedding. This removes one tiny all-reduce per draft step
+    # at half the memory cost of replicating the complete Markov head.
+    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
+    ),
+    # Fuse the seven TP-sharded Kimi-K3 DSpark Markov BF16 additions and
+    # greedy global argmax operations without gathering the full vocabulary.
+    "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
+    ),
+    # Capture a TP-sharded deterministic Markov tail only after replacing its
+    # historical NCCL collectives with graph-safe B12X operations.
+    "VLLM_DSPARK_CAPTURE_SHARDED_MARKOV": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CAPTURE_SHARDED_MARKOV", "0"))
+    ),
+    # Prefer the bounded-peer B12X reduction followed by vLLM's fused
+    # residual-add RMSNorm for the external Kimi-K3 DSpark draft. The target
+    # keeps the independently tuned generic all-reduce dispatch policy.
+    "VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_PREFER_B12X_ALLREDUCE_RMS", "0"))
+    ),
+    "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
@@ -1590,11 +1643,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW", "8")
     ),
+    "VLLM_DSPARK_PROFILE_SPS_ONLY": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_PROFILE_SPS_ONLY", "0"))
+    ),
+    "VLLM_DSPARK_SPS_DEBUG": lambda: int(os.getenv("VLLM_DSPARK_SPS_DEBUG", "0")),
     # Capture low-load DSpark draft graphs without confidence/capacity kernels.
     # 0 keeps capacity active at every batch size; a positive value must match
     # the profiled saturation knee used by the verification manager.
     "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE": lambda: int(
         os.getenv("VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE", "0")
+    ),
+    # Cap the number of DSpark proposals sent through the target verifier while
+    # preserving the checkpoint's native draft-block width. Zero disables the
+    # cap. This is useful for recurrent targets, where every possible verified
+    # token otherwise reserves another per-request recurrent-state page.
+    "VLLM_DSPARK_MAX_VERIFICATION_TOKENS": lambda: int(
+        os.getenv("VLLM_DSPARK_MAX_VERIFICATION_TOKENS", "0")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
@@ -2291,6 +2355,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_KIMI_SHARD_ROUTER": lambda: bool(
         int(os.getenv("VLLM_KIMI_SHARD_ROUTER", "0"))
+    ),
+    # Transport Kimi-K3's decode-sized TP projection shards over the existing
+    # low-latency B12X DCP channel. The path is byte-exact and falls back to
+    # the normal TP all-gather unless TP and DCP cover the same ranks.
+    # Use the fused sigmoid+top-16 routing kernel for Kimi-K3 (bit-exact
+    # replacement for the moeSigmoid+moeTopK pair; 896 experts, top-16).
+    "VLLM_KIMI_CX_TOPK16": lambda: bool(
+        int(os.getenv("VLLM_KIMI_CX_TOPK16", "0"))
+    ),
+    "VLLM_KIMI_USE_B12X_PROJECTION_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "0"))
+    ),
+    # Fuse Kimi-K3's routed-down BF16 and router FP32 decode gathers behind one
+    # byte-exact SparkInfer IPC barrier. Requires the projection gather path.
+    "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "0"))
+    ),
+    # Kimi-K3 TP16 decode specialization: gather the routed-down BF16 row and
+    # compute its one-group sigmoid+bias top-16 directly from IPC router shards.
+    # The ordinary paired gather remains the exact fallback.
+    "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "0"))
+    ),
+    # Keep the exact M=2..8 specialization opt-in. It wins in isolation but
+    # can reduce target-model overlap during speculative verification.
+    "VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK", "0"))
+    ),
+    # Start Kimi-K3's read-only shared-expert branch before the independent
+    # routed-down/router projections. The normal MoE stream join still owns
+    # the output and orders it before the routed/shared combine.
+    "VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_KIMI_PRELAUNCH_SHARED_EXPERTS", "0"))
     ),
     # Log per-layer CUDA allocation while constructing Kimi-K3. This is a
     # model-free diagnostic: it runs before any checkpoint weight is read.

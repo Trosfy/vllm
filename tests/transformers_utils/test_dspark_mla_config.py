@@ -4,10 +4,21 @@
 import json
 
 import pytest
+import torch
 
-from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config import LoadConfig, ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekScalingRotaryEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import get_quant_config
+from vllm.models.kimi_k3.nvidia.dspark_mla import _fill_compact_rope_cache
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 def _write_dspark_config(path, **overrides):
@@ -76,6 +87,42 @@ def test_dspark_mla_config_loads_from_local_json(tmp_path):
     assert config.draft_vocab_size == config.vocab_size
 
 
+def test_dspark_compact_rope_matches_full_fp32_table(default_vllm_config):
+    rotary = DeepseekScalingRotaryEmbedding(
+        head_size=64,
+        rotary_dim=64,
+        max_position_embeddings=32,
+        base=50000.0,
+        is_neox_style=False,
+        scaling_factor=2.0,
+        dtype=torch.float32,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1.0,
+        mscale_all_dim=1.0,
+    )
+    positions = torch.tensor([0, 1, 17, 31, 63], dtype=torch.int64)
+    inv_freq = rotary._compute_inv_freq(rotary.scaling_factor)
+    freqs = torch.empty((positions.numel(), inv_freq.numel()), dtype=torch.float32)
+    cache = torch.empty((positions.numel(), 2 * inv_freq.numel()), dtype=torch.float32)
+
+    compact = _fill_compact_rope_cache(
+        positions,
+        inv_freq,
+        freqs,
+        cache,
+        mscale=rotary.mscale,
+    )
+
+    torch.testing.assert_close(
+        compact,
+        rotary.cos_sin_cache.index_select(0, positions),
+        rtol=0,
+        atol=0,
+    )
+    assert compact.data_ptr() == cache.data_ptr()
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -142,7 +189,7 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     assert speculative_config.draft_model_config.use_mla
 
 
-def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
+def test_dspark_mla_accepts_draft_online_quantization(tmp_path):
     target_path = tmp_path / "target"
     draft_path = tmp_path / "draft"
     _write_target_config(target_path)
@@ -151,7 +198,47 @@ def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
         model=str(target_path), tokenizer_mode="skip", max_model_len=32768
     )
 
-    with pytest.raises(ValueError, match="does not currently support decode context"):
+    speculative_config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=7,
+        quantization="mxfp8",
+        quantization_config={
+            "linear": "mxfp8",
+            "ignore": ["re:.*fused_qkv_a_proj$", "model.markov_head.markov_w2"],
+        },
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    draft = speculative_config.draft_model_config
+    assert draft.quantization == "mxfp8"
+    assert isinstance(draft.quantization_config, QuantizationConfigArgs)
+    assert draft.quantization_config.linear == QuantSpec(weight="mxfp8")
+    assert draft.quantization_config.ignore == [
+        "re:.*fused_qkv_a_proj$",
+        "model.markov_head.markov_w2",
+    ]
+
+    # The target can supply hf_overrides as a callable.  The draft inherits it,
+    # and online quantization must not require that callable to be a dict because
+    # its complete configuration already lives on the draft ModelConfig.
+    draft.hf_overrides = lambda hf_config: hf_config
+    quant_config = get_quant_config(draft, LoadConfig())
+    assert isinstance(quant_config, OnlineQuantizationConfig)
+    assert quant_config.args == draft.quantization_config
+
+
+def test_dspark_mla_dcp_requires_b12x_backend(tmp_path):
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_target_config(target_path)
+    _write_dspark_config(draft_path)
+    target_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
+    )
+
+    with pytest.raises(ValueError, match="requires attention_backend=B12X_MLA"):
         SpeculativeConfig(
             model=str(draft_path),
             method="dspark",
@@ -163,3 +250,29 @@ def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
                 distributed_executor_backend="external_launcher",
             ),
         )
+
+
+def test_dspark_mla_allows_dcp_with_b12x_backend(tmp_path):
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_target_config(target_path)
+    _write_dspark_config(draft_path)
+    target_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
+    )
+
+    config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=7,
+        attention_backend=AttentionBackendEnum.B12X_MLA,
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=8,
+            distributed_executor_backend="external_launcher",
+        ),
+    )
+
+    assert config.attention_backend is AttentionBackendEnum.B12X_MLA
+    assert config.target_parallel_config.decode_context_parallel_size == 8

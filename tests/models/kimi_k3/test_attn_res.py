@@ -194,6 +194,100 @@ def test_attn_res_without_output_norm():
     torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
 
 
+def test_attn_res_reuses_dead_delta_as_output() -> None:
+    num_tokens = 17
+    prefix = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(
+        num_tokens,
+        MAX_BLOCKS,
+        HIDDEN_SIZE,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    norm_weight = torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.randn_like(norm_weight)
+    expected, expected_prefix = _reference(
+        prefix.clone(),
+        delta.clone(),
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        MAX_BLOCKS,
+    )
+    output_ptr = delta.data_ptr()
+
+    actual = attn_res(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        MAX_BLOCKS,
+        -1,
+        EPS,
+        EPS,
+        output_buffer=delta,
+    )
+
+    assert actual.data_ptr() == output_ptr
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+    torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+
+
+def test_attn_res_uses_unused_block_major_scratch() -> None:
+    num_tokens = 17
+    prefix = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    block_storage = torch.randn(
+        MAX_BLOCKS,
+        num_tokens,
+        HIDDEN_SIZE,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    blocks = block_storage.permute(1, 0, 2)
+    scratch = blocks[:, -1, :]
+    assert scratch.is_contiguous()
+    norm_weight = torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.randn_like(norm_weight)
+    expected, expected_prefix = _reference(
+        prefix.clone(),
+        None,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        0,
+    )
+    output_ptr = scratch.data_ptr()
+
+    actual = attn_res(
+        prefix,
+        None,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        0,
+        0,
+        EPS,
+        EPS,
+        output_buffer=scratch,
+    )
+
+    assert actual.data_ptr() == output_ptr
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+    torch.testing.assert_close(blocks[:, 0], expected_prefix, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("num_tokens", [0, 1, 17])
 def test_fused_mtp_input(num_tokens: int):
     positions = torch.arange(num_tokens, device="cuda")

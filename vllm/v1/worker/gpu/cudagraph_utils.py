@@ -3,6 +3,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, NamedTuple, Protocol
@@ -113,6 +114,29 @@ def get_uniform_token_count(
     ):
         return max_query_len
     return None
+
+
+@contextmanager
+def _b12x_dcp_a2a_capture_scope():
+    """Bind B12X's PCIe DCP a2a channels for the duration of a capture pass.
+
+    The a2a pool refuses to record kernels into a CUDA graph unless the graph
+    owns a channel: replaying an eager-channel launch from inside a graph would
+    reuse IPC slots another stream may already be draining. `CUDAGraphWrapper`
+    enters this scope for the graphs it owns; the runner captures its own
+    graphs here and needs the same binding.
+    """
+    try:
+        from vllm.distributed import get_dcp_group
+        from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
+
+        dcp_group = get_dcp_group()
+    except (AssertionError, ImportError):
+        # No DCP group in this configuration.
+        yield
+        return
+    with capture_b12x_dcp_a2a(dcp_group, stream=torch.cuda.current_stream()):
+        yield
 
 
 class CudaGraphManager:
@@ -462,7 +486,11 @@ class CudaGraphManager:
         # the graph artifacts captured below. Some multi-stream custom ops run
         # on joined auxiliary streams where CUDA's per-current-stream capture
         # query is false even though later graph nodes retain those handles.
-        with graph_capture(device=self.device), vllm_cudagraph_capture_scope():
+        with (
+            graph_capture(device=self.device),
+            vllm_cudagraph_capture_scope(),
+            _b12x_dcp_a2a_capture_scope(),
+        ):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.

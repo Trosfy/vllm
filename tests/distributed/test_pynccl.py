@@ -11,7 +11,10 @@ import torch.distributed
 
 import vllm.envs as envs
 from tests.utils import ensure_current_vllm_config
-from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
+from vllm.distributed.communication_op import (  # noqa
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_in_place,
+)
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
 from vllm.distributed.parallel_state import (
@@ -79,6 +82,31 @@ def worker_fn():
 )
 def test_pynccl():
     distributed_run(worker_fn, 2)
+
+
+@worker_fn_wrapper
+def inplace_allreduce_worker_fn():
+    with ensure_current_vllm_config():
+        ensure_model_parallel_initialized(2, 1)
+    rank = torch.distributed.get_rank()
+    tensor = torch.full(
+        (4096,),
+        rank + 1,
+        dtype=torch.float32,
+        device=f"cuda:{rank}",
+    )
+    input_ptr = tensor.data_ptr()
+    output = tensor_model_parallel_all_reduce_in_place(tensor)
+    torch.accelerator.synchronize()
+    assert output.data_ptr() == input_ptr
+    assert torch.all(output == 3).cpu().item()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+)
+def test_pynccl_inplace_allreduce():
+    distributed_run(inplace_allreduce_worker_fn, 2)
 
 
 @worker_fn_wrapper

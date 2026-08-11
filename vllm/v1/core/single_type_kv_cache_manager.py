@@ -159,6 +159,7 @@ class SingleTypeKVCacheManager(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        num_speculative_tokens: int | None = None,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -337,7 +338,11 @@ class SingleTypeKVCacheManager(ABC):
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        num_speculative_tokens: int | None = None,
     ) -> list[KVCacheBlock]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -530,6 +535,10 @@ class SingleTypeKVCacheManager(ABC):
         retained; the base (dense) policy ignores them.
         """
         return None
+
+    def take_block_table_overwrite(self, request_id: str) -> bool:
+        """Consume a request's one-shot full worker block-table update."""
+        return False
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
@@ -1304,6 +1313,13 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        # Physical recurrent scratch width can follow the scheduler's runtime
+        # speculative width in cache mode "none". The KV-cache spec remains at
+        # the checkpoint maximum so metadata and graph buffers keep a stable
+        # shape; missing tail slots are represented by the worker's cleared
+        # block-table tail.
+        self._runtime_num_speculative_blocks: dict[str, int] = {}
+        self._block_table_overwrite_reqs: set[str] = set()
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1499,6 +1515,7 @@ class MambaManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        num_speculative_tokens: int | None = None,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
@@ -1513,10 +1530,16 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
-                num_tokens += (
-                    self.kv_cache_spec.block_size * self.num_speculative_blocks
-                )
+            scratch_blocks = self.num_speculative_blocks
+            if self.mamba_cache_mode == "none" and num_speculative_tokens is not None:
+                if not 0 <= num_speculative_tokens <= self.num_speculative_blocks:
+                    raise ValueError(
+                        "Runtime speculative width must be between 0 and "
+                        f"{self.num_speculative_blocks}, got {num_speculative_tokens}."
+                    )
+                scratch_blocks = num_speculative_tokens
+            if scratch_blocks > 0:
+                num_tokens += self.kv_cache_spec.block_size * scratch_blocks
             return super().get_num_blocks_to_allocate(
                 request_id,
                 num_tokens,
@@ -1525,6 +1548,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_local_computed_tokens,
                 num_tokens_main_model,
                 apply_admission_cap=apply_admission_cap,
+                num_speculative_tokens=None,
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
@@ -1571,17 +1595,53 @@ class MambaManager(SingleTypeKVCacheManager):
             return num_new_blocks + num_evictable_computed_blocks
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        num_speculative_tokens: int | None = None,
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
-                num_tokens += self.block_size * self.num_speculative_blocks
-            return super().allocate_new_blocks(
-                request_id, num_tokens, num_tokens_main_model
+            scratch_blocks = self.num_speculative_blocks
+            if self.mamba_cache_mode == "none" and num_speculative_tokens is not None:
+                if not 0 <= num_speculative_tokens <= self.num_speculative_blocks:
+                    raise ValueError(
+                        "Runtime speculative width must be between 0 and "
+                        f"{self.num_speculative_blocks}, got {num_speculative_tokens}."
+                    )
+                scratch_blocks = num_speculative_tokens
+
+                # In mode "none" the recurrent row is one running-state page
+                # followed by speculative scratch pages. Release an obsolete
+                # tail before growing the row again. The scheduler will send a
+                # one-off full-row replacement to invalidate worker-side IDs
+                # for the returned pages.
+                num_required_blocks = cdiv(num_tokens, self.block_size) + scratch_blocks
+                req_blocks = self.req_to_blocks[request_id]
+                if num_required_blocks < len(req_blocks):
+                    released = [
+                        block
+                        for block in req_blocks[num_required_blocks:]
+                        if not block.is_null
+                    ]
+                    if released:
+                        self.block_pool.free_blocks(released)
+                    del req_blocks[num_required_blocks:]
+                    self._block_table_overwrite_reqs.add(request_id)
+
+            if scratch_blocks > 0:
+                num_tokens += self.block_size * scratch_blocks
+            new_blocks = super().allocate_new_blocks(
+                request_id,
+                num_tokens,
+                num_tokens_main_model,
+                num_speculative_tokens=None,
             )
+            self._runtime_num_speculative_blocks[request_id] = scratch_blocks
+            return new_blocks
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
             # x * block_size tokens are scheduled, num_tokens is
@@ -1692,6 +1752,8 @@ class MambaManager(SingleTypeKVCacheManager):
                 return returned_blocks
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._runtime_num_speculative_blocks.pop(request_id, None)
+        self._block_table_overwrite_reqs.discard(request_id)
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
@@ -1704,6 +1766,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 if entry[0] != request_id
             ]
         return super().pop_blocks_for_free(request_id)
+
+    def take_block_table_overwrite(self, request_id: str) -> bool:
+        if request_id not in self._block_table_overwrite_reqs:
+            return False
+        self._block_table_overwrite_reqs.remove(request_id)
+        return True
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

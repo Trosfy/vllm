@@ -52,13 +52,22 @@ class KVCacheBlocks:
       (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
     """
 
+    overwrite: bool = False
+    """Replace, rather than append to, the worker-side block-table row.
+
+    Recurrent caches can release speculative scratch pages when the runtime
+    draft width shrinks. That changes an existing row's tail and cannot be
+    represented by the normal append-only scheduler delta.
+    """
+
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
         """Adds two KVCacheBlocks instances."""
         return KVCacheBlocks(
             tuple(
                 list(itertools.chain(blk1, blk2))
                 for blk1, blk2 in zip(self.blocks, other.blocks)
-            )
+            ),
+            overwrite=self.overwrite or other.overwrite,
         )
 
     @overload
@@ -354,6 +363,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        num_speculative_tokens: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -482,6 +492,7 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
+                num_speculative_tokens=None,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
@@ -516,6 +527,7 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
+            num_speculative_tokens=num_speculative_tokens,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
@@ -544,12 +556,20 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            num_speculative_tokens=num_speculative_tokens,
         )
+        if self.coordinator.take_block_table_overwrite(request.request_id):
+            allocation_result = KVCacheBlocks(
+                self.coordinator.get_blocks(request.request_id),
+                overwrite=True,
+            )
+        else:
+            allocation_result = self.create_kv_cache_blocks(new_blocks)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
-            return self.create_kv_cache_blocks(new_blocks)
+            return allocation_result
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
         # + num_external_computed_tokens + num_new_tokens, but must exclude
@@ -562,7 +582,7 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_blocks(new_blocks)
+        return allocation_result
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

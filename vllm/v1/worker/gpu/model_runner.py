@@ -464,6 +464,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
+                vocab_size=self.vocab_size,
             )
             self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
@@ -585,6 +586,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.max_num_tokens,
                     self.req_states,
                     self.device,
+                    cudagraphs_enabled=(
+                        self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                    ),
                 )
             )
         self.block_tables = BlockTables(
@@ -685,6 +689,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn: bool = False,
         uniform_decode: bool = False,
         uniform_query_len: int | None = None,
+        uniform_num_speculative_tokens: int | None = None,
         skip_eplb: bool = False,
         is_profile: bool = False,
         **kwargs,
@@ -727,6 +732,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output = SchedulerOutput.make_empty()
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+        if uniform_num_speculative_tokens is not None:
+            if not 1 <= uniform_num_speculative_tokens <= self.num_speculative_steps:
+                raise ValueError(
+                    "uniform_num_speculative_tokens must be in [1, "
+                    f"{self.num_speculative_steps}], got "
+                    f"{uniform_num_speculative_tokens}."
+                )
+            dummy_scheduler_output.num_spec_tokens_to_schedule = (
+                uniform_num_speculative_tokens
+            )
 
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
@@ -1246,7 +1261,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
-                    req_index, req_new_block_ids, overwrite=False
+                    req_index,
+                    req_new_block_ids,
+                    overwrite=req_id in reqs.block_ids_to_overwrite,
                 )
 
         # Update CPU num_computed_prefill_tokens.
@@ -1529,6 +1546,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _prepare_dummy_dcp_seq_lens(self, input_batch: InputBatch) -> None:
+        """Populate DCP-local lengths omitted by ``InputBatch.make_dummy``."""
+        if not self.use_dcp:
+            return
+        prepare_dcp_local_seq_lens(
+            self.input_buffers.dcp_local_seq_lens,
+            input_batch.seq_lens,
+            input_batch.num_reqs,
+            self.dcp_size,
+            self.dcp_rank,
+            self.cp_interleave,
+        )
+        input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+            : input_batch.num_reqs_after_padding
+        ]
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1667,11 +1700,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             skip_compiled = True
 
         apply_verification_capacity = True
-        if (
-            verification_capacity_manager is not None
-            and verification_capacity_manager.varlen_spec_decode
-            and not dummy_run
-        ):
+        if verification_capacity_manager is not None and not dummy_run:
             capacity_was_bypassed = verification_capacity_manager.capacity_bypassed
             apply_verification_capacity = (
                 verification_capacity_manager.should_apply_capacity(
@@ -1769,6 +1798,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_req_tokens=batch_desc.max_req_tokens,
             )
+            self._prepare_dummy_dcp_seq_lens(input_batch)
             phase = _profile_batch_phase(input_batch, dummy_run=True)
             if not skip_attn_for_dummy_run:
                 with record_function_or_nullcontext(
