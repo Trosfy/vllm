@@ -257,6 +257,60 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
             assert desc.num_active_loras == 0
 
 
+def test_compile_only_breakable_capture_covers_no_draft_decode(monkeypatch):
+    """B12X compile-only prewarm must capture the one-token verifier shape."""
+
+    import vllm.envs as envs
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    monkeypatch.setenv("VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM", "1")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: object(),
+    )
+
+    max_spec_tokens = 7
+    max_decode_query_len = max_spec_tokens + 1
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=1,
+        max_spec_tokens=max_spec_tokens,
+        cudagraph_mode="FULL_AND_PIECEWISE",
+        use_dynamic_sd=False,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=max_decode_query_len,
+    )
+    manager._graphs_captured = True
+
+    no_draft_desc = manager.dispatch(
+        num_reqs=1,
+        num_tokens=1,
+        uniform_token_count=1,
+        num_active_loras=0,
+    )
+    partial_draft_desc = manager.dispatch(
+        num_reqs=1,
+        num_tokens=4,
+        uniform_token_count=4,
+        num_active_loras=0,
+    )
+
+    assert no_draft_desc.cg_mode == CUDAGraphMode.FULL
+    assert no_draft_desc.uniform_token_count == 1
+    assert no_draft_desc.num_tokens == 1
+    assert partial_draft_desc.cg_mode == CUDAGraphMode.PIECEWISE
+
+
 def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
     """DSD should only capture FULL graphs for query lengths in the schedule.
 
