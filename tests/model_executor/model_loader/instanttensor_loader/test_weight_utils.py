@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import glob
+import inspect
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm.model_executor.model_loader.reload.layerwise import (
+    _own_deferred_accelerator_tensors,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     instanttensor_weights_iterator,
@@ -84,9 +88,7 @@ def test_instanttensor_honors_tensor_to_shard_index(tmp_path):
     not current_platform.is_cuda(),
     reason="InstantTensor requires NVIDIA GPUs",
 )
-def test_instanttensor_falls_back_for_tensor_larger_than_ring(
-    tmp_path, monkeypatch
-):
+def test_instanttensor_falls_back_for_tensor_larger_than_ring(tmp_path, monkeypatch):
     shard = tmp_path / "model.safetensors"
     small = torch.arange(256 * 1024, dtype=torch.float32)
     large = torch.arange(9 * 256 * 1024, dtype=torch.float32)
@@ -108,11 +110,9 @@ def test_instanttensor_falls_back_for_tensor_larger_than_ring(
     not current_platform.is_cuda(),
     reason="InstantTensor requires NVIDIA GPUs",
 )
-def test_instanttensor_owning_tensors_survive_ring_reuse(tmp_path, monkeypatch):
+def test_instanttensor_deferred_tensors_survive_ring_reuse(tmp_path, monkeypatch):
     shard = tmp_path / "model.safetensors"
-    # Five 4 MiB tensors force an 8 MiB ring to wrap more than once.  Keep the
-    # yielded CUDA tensors alive, exactly as online layerwise quantization does
-    # while waiting for a layer's remaining checkpoint shards.
+    # Five 4 MiB tensors force an 8 MiB ring to wrap more than once.
     source = {
         f"model.weight_{index}": torch.full(
             (2 * 1024 * 1024,), index, dtype=torch.bfloat16
@@ -122,13 +122,18 @@ def test_instanttensor_owning_tensors_survive_ring_reuse(tmp_path, monkeypatch):
     save_file(source, shard)
     monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(8 * 1024 * 1024))
 
-    retained = dict(
-        instanttensor_weights_iterator(
-            [str(shard)],
-            use_tqdm_on_load=False,
-            owning_tensors=True,
-        )
-    )
+    def deferred_loader(param, loaded_weight):
+        raise AssertionError("The loader must not run while arguments are queued")
+
+    signature = inspect.signature(deferred_loader)
+    retained = {}
+    for name, tensor in instanttensor_weights_iterator(
+        [str(shard)],
+        use_tqdm_on_load=False,
+    ):
+        bound_args = signature.bind(None, tensor)
+        _own_deferred_accelerator_tensors(bound_args)
+        retained[name] = bound_args.arguments["loaded_weight"]
     torch.cuda.synchronize()
 
     for name, expected in source.items():

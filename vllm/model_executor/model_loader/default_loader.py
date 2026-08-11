@@ -255,7 +255,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source", *, instanttensor_owning_tensors: bool = False
+        self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -300,7 +300,6 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
                     indexed_tensor_files=indexed_tensor_files,
-                    owning_tensors=instanttensor_owning_tensors,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
@@ -353,17 +352,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        instanttensor_owning_tensors = self.load_config.load_format == (
-            "instanttensor"
-        ) and any(
-            getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
-            for module in model.modules()
-        )
-        if instanttensor_owning_tensors:
-            logger.info_once(
-                "InstantTensor is using owning views for the online-quantized "
-                "model; the target model remains on the zero-copy path."
-            )
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -374,20 +362,14 @@ class DefaultModelLoader(BaseModelLoader):
                 model, "checkpoint_weight_name_prefixes", None
             ),
         )
-        yield from self._get_weights_iterator(
-            primary_weights,
-            instanttensor_owning_tensors=instanttensor_owning_tensors,
-        )
+        yield from self._get_weights_iterator(primary_weights)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(
-                source,
-                instanttensor_owning_tensors=instanttensor_owning_tensors,
-            )
+            yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
