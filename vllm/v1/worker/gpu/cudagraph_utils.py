@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.compilation.b12x_capture import (
+    b12x_compile_only_warmup,
     b12x_cuda_graph_prewarm_enabled,
     guard_b12x_kernel_resolution,
 )
@@ -301,6 +302,18 @@ class CudaGraphManager:
         else:
             decode_query_lens = [self.decode_query_len]
 
+        if (
+            speculative_config is not None
+            and self.use_breakable_cg
+            and envs.VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM
+            and not self.varlen_spec_decode
+        ):
+            # A request can receive no draft tokens even when speculative
+            # decoding is enabled. Compile-only B12X prewarm must give that
+            # one-token verifier step its own executable FULL graph instead of
+            # making its first execution a breakable PIECEWISE replay.
+            decode_query_lens = sorted({1, *decode_query_lens})
+
         def decode_descs(
             num_tokens: int,
             num_active_loras: int,
@@ -539,7 +552,14 @@ class CudaGraphManager:
                             # the CuTe launcher contract. Re-warm the exact
                             # fresh state that FULL capture will use, so CUDA
                             # graph capture only records resolved launches.
-                            forward_fn(CUDAGraphMode.NONE)
+                            if envs.VLLM_B12X_CUDAGRAPH_COMPILE_ONLY_PREWARM:
+                                # Kernel resolution must see every B12X call,
+                                # but memory-constrained captures cannot afford
+                                # a second eager model execution here.
+                                with b12x_compile_only_warmup():
+                                    forward_fn(CUDAGraphMode.NONE)
+                            else:
+                                forward_fn(CUDAGraphMode.NONE)
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
