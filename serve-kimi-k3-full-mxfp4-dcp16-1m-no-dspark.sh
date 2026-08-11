@@ -89,21 +89,16 @@ case "${KIMI_SHARD_F_A}" in
 esac
 
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
-# The base image exports backend=cpp, whose legacy custom-allreduce runtime is
-# limited to world size <= 8.  Do not inherit that image-wide default for this
-# TP16 profile; select the validated hierarchical B12X implementation unless
-# the profile-specific override explicitly requests otherwise.
+# The base image exports backend=cpp, whose custom all-reduce implementation is
+# limited to world size <= 8. This TP16 profile therefore selects the validated
+# hierarchical b12x implementation unless its profile-specific override is set.
 export VLLM_PCIE_ALLREDUCE_BACKEND="${KIMI_NO_DSPARK_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_SINGLE_CHANNEL="${VLLM_PCIE_ONESHOT_SINGLE_CHANNEL:-1}"
-# Sync-mode default, re-measured 2026-08-09 on FULL cudagraphs: double-buffer
-# 55.663 vs deferred 54.531 vs plain 51.913 tok/s (no-spec decode, A/B/A'd,
-# healthy machine), DSpark target cycles/s neutral, all three modes bitwise
-# identical at M=1/2/4/8. The earlier "1.2% slower" double-buffer reading
-# predates FULL graphs, whose removal of the per-collective launch changed the
-# economics: deferred pays a separate 3.4us preamble kernel 3x per layer,
-# double-buffer needs neither that nor the in-kernel end-waits. Both knobs
-# stay env-overridable; the guard keeps an explicit DEFERRED=1 from colliding
-# with the double-buffer default (b12x rejects the 1+1 combination).
+# FULL-graph decode defaults to double buffering because deferred consumption
+# adds a separate 3.4-us preamble kernel to each of three per-layer collectives.
+# Double buffering avoids those launches and the in-kernel end waits. Both
+# settings are operator-overridable and bit-identical at M=1, 2, 4, and 8. The
+# guard prevents the unsupported combination in which both modes are enabled.
 export B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION="${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION:-0}"
 if [[ "${B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION}" == "1" ]]; then
   export B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER="${B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER:-0}"
@@ -146,11 +141,10 @@ export VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE="${VLLM_MLA_CHUNKED_PREFILL_WORKS
 export VLLM_MEMORY_PROFILE_INCLUDE_ATTN="${VLLM_MEMORY_PROFILE_INCLUDE_ATTN:-0}"
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}"
 if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
-  # FULL decode graphs are worth +3.8% here (52.558 -> 54.536 tok/s, no-spec
-  # DCP16 1M, prefill TTFT unchanged) and need the DCP a2a capture-scope fix to
-  # capture at all -- without it startup fails with "PCIe DCP A2A channels are
-  # stream-affine".  The DSpark launcher has requested FULL_AND_PIECEWISE for a
-  # while; this brings the no-speculation profile in line.
+  # FULL_AND_PIECEWISE captures the complete single-sequence decode step. DCP
+  # all-to-all channels bind their pools to the active capture scope, preserving
+  # stream affinity during graph capture. COMPILATION_CONFIG remains an explicit
+  # operator override.
   export COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1],"pass_config":{"fuse_allreduce_rms":true}}'
 fi
 

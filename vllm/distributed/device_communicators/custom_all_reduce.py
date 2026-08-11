@@ -81,12 +81,11 @@ def _parse_byte_size(value: str) -> int:
 
 
 def _b12x_pcie_allreduce_default_max_size(world_size: int) -> str:
-    """Ask b12x how large an all-reduce it expects to win at, for this world.
+    """Resolve the PCIe all-reduce limit from configuration and b12x policy.
 
-    The 84KB default predates the TP16 equal-quarter runtime, which stays ahead
-    of NCCL well past it; hard-coding a single number here would keep that
-    unreachable on every world size at once. An explicit environment setting
-    always wins, so the previous behaviour remains one variable away.
+    ``VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE`` has highest priority. Otherwise,
+    b12x supplies a world-size-specific threshold when it is installed, and
+    environments without b12x use the vLLM configuration default.
     """
 
     configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
