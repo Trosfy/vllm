@@ -203,3 +203,17 @@ def test_kimi_aux_hidden_states_pack_for_large_prefill():
         result[0].untyped_storage().data_ptr()
         == block_residual.untyped_storage().data_ptr()
     )
+
+
+def test_kimi_aux_hidden_states_remain_separate_when_workspace_is_too_narrow():
+    aux_hidden_states = [
+        torch.randn(1024, 512, dtype=torch.bfloat16) for _ in range(5)
+    ]
+    block_residual = torch.empty(3, 1024, 512, dtype=torch.bfloat16).permute(1, 0, 2)
+
+    result = kimi_model._pack_aux_hidden_states_into_attn_res_workspace(
+        aux_hidden_states,
+        block_residual,
+    )
+
+    assert result is aux_hidden_states
