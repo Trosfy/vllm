@@ -41,11 +41,14 @@ logger = init_logger(__name__)
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
+# DCP likewise has one stable eager scheduler owner.  Graph target/draft/encoder
+# identities are supplied separately by their GraphCaptureContext.
+_B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
+_B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
-_B12X_DCP_A2A_EAGER_CHANNEL_ID = "eager:vllm-dcp-a2a"
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -54,9 +57,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = (
-        stride_batch == heads * head_dim and stride_head == head_dim
-    )
+    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
     capacity_strided_head_major = (
         stride_batch == head_dim and stride_head >= batch * head_dim
     )
@@ -131,9 +132,10 @@ def _get_b12x_dcp_a2a_pool(
             head_dim=head_dim,
             query_head_dim=query_head_dim,
             single_channel=False,
+            max_concurrent_channels=_B12X_DCP_MAX_CONCURRENT_CHANNELS,
         )
-        pool.prepare_channels((_B12X_DCP_A2A_EAGER_CHANNEL_ID,))
-        pool.for_stream(channel_id=_B12X_DCP_A2A_EAGER_CHANNEL_ID)
+        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+        pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
     except Exception as exc:
         init_error = exc
 
@@ -195,6 +197,11 @@ def capture_b12x_dcp_a2a(
         ),
         key=lambda item: item[0][1:],
     )
+    if matching_pools and channel_id is None:
+        raise RuntimeError(
+            "distributed PCIe DCP graph capture requires an explicit semantic "
+            "channel_id"
+        )
     with ExitStack() as stack:
         for _, pool in matching_pools:
             stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
@@ -318,7 +325,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
-        channel_id=_B12X_DCP_A2A_EAGER_CHANNEL_ID,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
     )
 
 
@@ -371,7 +378,7 @@ def _try_b12x_dcp_all_gather_heads(
         return None
     return pool.all_gather_heads(
         local_input,
-        channel_id=_B12X_DCP_A2A_EAGER_CHANNEL_ID,
+        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
     )
 
 
