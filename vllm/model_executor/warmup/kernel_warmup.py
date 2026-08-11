@@ -442,6 +442,28 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
+def _flashinfer_autotune_dummy_run_kwargs(
+    runner: "GPUModelRunner",
+) -> dict[str, object]:
+    kwargs = dict(
+        num_tokens=runner.scheduler_config.max_num_batched_tokens,
+        skip_eplb=True,
+        is_profile=True,
+    )
+
+    # V2 initializes attention backends and block tables only after the initial
+    # memory profile.  Kernel autotuning runs during that profile, so execute
+    # the model kernels without attention until those tables exist.  Attention
+    # backends have their own warmup after KV-cache initialization.
+    if (
+        getattr(runner.vllm_config, "use_v2_model_runner", False)
+        and not hasattr(runner, "block_tables")
+    ):
+        kwargs["skip_attn"] = True
+
+    return kwargs
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -475,11 +497,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
 
     if not use_persistent_cache:
         with torch.inference_mode(), fi_utils.autotune(**autotune_kwargs):
-            runner._dummy_run(
-                num_tokens=runner.scheduler_config.max_num_batched_tokens,
-                skip_eplb=True,
-                is_profile=True,
-            )
+            runner._dummy_run(**_flashinfer_autotune_dummy_run_kwargs(runner))
         get_world_group().barrier()
         return
 
@@ -494,11 +512,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # When autotuning with number of tokens m, flashinfer will autotune
     # operations for all number of tokens up to m, so we only need to
     # run with the max number of tokens.
-    dummy_run_kwargs = dict(
-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
-        skip_eplb=True,
-        is_profile=True,
-    )
+    dummy_run_kwargs = _flashinfer_autotune_dummy_run_kwargs(runner)
 
     with torch.inference_mode():
         if is_leader:
