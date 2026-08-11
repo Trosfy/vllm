@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.b12x_moe as b12x_moe
+import vllm.model_executor.layers.fused_moe.modular_kernel as modular_kernel
 import vllm.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
 import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 as ct_mxfp4  # noqa: E501
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -102,6 +103,73 @@ def _make_fake_moe_runner(fused_experts: object) -> MoERunner:
         )
     )
     return runner
+
+
+class _FakeWorkspaceManager:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def get_simultaneous(self, *specs):
+        self.calls.append(specs)
+        return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+
+
+class _FakeModularExperts:
+    @staticmethod
+    def workspace_dtype(out_dtype: torch.dtype) -> torch.dtype:
+        return out_dtype
+
+    @staticmethod
+    def workspace_shapes(
+        M,
+        N,
+        K,
+        top_k,
+        global_num_experts,
+        local_num_experts,
+        expert_tokens_meta,
+        activation,
+    ):
+        return (7,), (11,), (M, K)
+
+
+def test_modular_moe_uses_compatible_output_as_workspace_destination(
+    monkeypatch,
+) -> None:
+    manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        modular_kernel, "current_workspace_manager", lambda: manager
+    )
+    monkeypatch.setattr(
+        modular_kernel,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: False),
+    )
+    kernel = object.__new__(modular_kernel.FusedMoEKernelModularImpl)
+    kernel.fused_experts = _FakeModularExperts()
+    output = torch.empty(5, 64, dtype=torch.bfloat16)
+
+    workspace13, workspace2, fused_out = kernel._allocate_buffers(
+        out_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        M_chunk=2,
+        M_full=5,
+        N=32,
+        K=64,
+        top_k=4,
+        global_num_experts=8,
+        local_num_experts=8,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        output_alias=output,
+    )
+
+    assert manager.calls == [
+        (((7,), torch.bfloat16), ((11,), torch.bfloat16))
+    ]
+    assert workspace13.shape == (7,)
+    assert workspace2.shape == (11,)
+    assert fused_out is output
 
 
 def test_b12x_moe_runner_uses_functional_custom_op(monkeypatch) -> None:
@@ -420,6 +488,50 @@ def test_b12x_moe_warmup_runs_one_launch_per_planner_regime(monkeypatch) -> None
     assert run_tokens == [3, 8]
 
 
+def test_b12x_moe_warmup_uses_workspace_token_limit(monkeypatch) -> None:
+    planned_tokens = []
+    run_tokens = []
+
+    monkeypatch.setenv("B12X_MOE_WORKSPACE_TOKEN_LIMIT", "4")
+    monkeypatch.setattr(
+        b12x_moe,
+        "_dynamic_moe_warmup_tokens",
+        lambda *, topk, quant_mode, requested_tokens: requested_tokens,
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_execution",
+        lambda **kwargs: (
+            planned_tokens.append(kwargs["tokens"])
+            or _FakePlan().launch_plan
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_fp4_scratch",
+        lambda **kwargs: _FakePlan(),
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_run_b12x_moe_fp4",
+        lambda **kwargs: run_tokens.append(kwargs["a"].shape[0]),
+    )
+
+    experts = _make_fake_b12x_experts()
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(8, 32, 32, dtype=torch.uint8),
+        w2_weight=torch.empty(8, 64, 8, dtype=torch.uint8),
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        apply_router_weight_on_input=False,
+    )
+
+    warmed = experts.warmup_dynamic_launches(layer, token_counts=(8,))
+
+    assert warmed == 1
+    assert planned_tokens == [4]
+    assert run_tokens == [4]
+
+
 def test_b12x_moe_warmup_preserves_exact_graph_decode_shape(monkeypatch) -> None:
     planned_tokens = []
     run_tokens = []
@@ -515,6 +627,81 @@ def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
     experts = _make_fake_b12x_experts()
 
     assert experts._quant_mode() == "w4a16"
+
+
+def test_b12x_moe_workspace_limit_bounds_scratch_not_output(monkeypatch) -> None:
+    planned_tokens = []
+
+    def fake_plan(**kwargs):
+        planned_tokens.append(kwargs["tokens"])
+        return _FakePlan()
+
+    monkeypatch.setenv("B12X_MOE_WORKSPACE_TOKEN_LIMIT", "2")
+    monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_fp4_scratch", fake_plan)
+
+    experts = _make_fake_b12x_experts()
+    workspace13, workspace2, output = experts.workspace_shapes(
+        M=5,
+        N=32,
+        K=64,
+        topk=4,
+        global_num_experts=8,
+        local_num_experts=8,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    )
+
+    assert planned_tokens == [2]
+    assert workspace13 == (0,)
+    assert workspace2 == (32,)
+    assert output == (5, 64)
+
+
+def test_b12x_moe_workspace_limit_chunks_token_independent_launches(
+    monkeypatch,
+) -> None:
+    planned_tokens = []
+    launch_sizes = []
+
+    def fake_plan(**kwargs):
+        planned_tokens.append(kwargs["tokens"])
+        return _FakePlan()
+
+    def fake_run(**kwargs):
+        launch_sizes.append(kwargs["a"].shape[0])
+        kwargs["output"].copy_(kwargs["a"])
+
+    monkeypatch.setenv("B12X_MOE_WORKSPACE_TOKEN_LIMIT", "2")
+    monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_fp4_scratch", fake_plan)
+    monkeypatch.setattr(b12x_moe, "_run_b12x_moe_fp4", fake_run)
+
+    experts = _make_fake_b12x_experts()
+    hidden_states = torch.arange(5 * 64, dtype=torch.bfloat16).view(5, 64)
+    output = torch.empty_like(hidden_states)
+    topk_ids = torch.zeros(5, 4, dtype=torch.int32)
+    topk_weights = torch.full((5, 4), 0.25, dtype=torch.float32)
+
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=torch.empty(0, dtype=torch.uint8),
+        w2=torch.empty(0, dtype=torch.uint8),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        global_num_experts=8,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=torch.empty(64, dtype=torch.uint8),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert planned_tokens == [2, 2, 1]
+    assert launch_sizes == [2, 2, 1]
+    assert torch.equal(output, hidden_states)
 
 
 def test_b12x_activation_amax_registers_stable_vllm_owned_tensor(
