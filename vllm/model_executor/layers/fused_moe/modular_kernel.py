@@ -1123,6 +1123,7 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
+        output_alias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Allocate temporary and output buffers for the fused experts op.
@@ -1160,9 +1161,26 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
+        use_output_alias = (
+            not current_platform.is_rocm()
+            and output_alias is not None
+            and output_alias.shape == fused_out_shape
+            and output_alias.dtype == workspace_dtype
+            and output_alias.device == device
+            and output_alias.is_contiguous()
+        )
+        if use_output_alias:
+            workspace13, workspace2 = (
+                current_workspace_manager().get_simultaneous(
+                    (workspace13_shape, workspace_dtype),
+                    (workspace2_shape, workspace_dtype),
+                )
+            )
+            return workspace13, workspace2, output_alias
+
+        # Workspace 1 and workspace 3 have disjoint lifetimes. The reusable
+        # allocation also stores the fused output when the caller cannot
+        # provide a compatible destination tensor.
         max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
             ((max_shape_size,), workspace_dtype),
@@ -1317,6 +1335,7 @@ class FusedMoEKernelModularImpl:
             local_num_experts,
             expert_tokens_meta,
             activation,
+            output_alias,
         )
 
         use_output_alias = (
@@ -1356,7 +1375,6 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
-
         return fused_out
 
     def _finalize(
