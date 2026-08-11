@@ -45,4 +45,3 @@ def test_speculative_kda_warmup_before_kv_cache_binding(monkeypatch) -> None:
     assert call["initial_state"].dtype == torch.float32
     assert call["q"].shape == (1, 16, 2, 4)
     assert call["ssm_state_indices"].shape == (2, 8)
-
