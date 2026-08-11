@@ -1229,9 +1229,17 @@ def instanttensor_weights_iterator(
         process_group = world_group.device_group if world_group.world_size > 1 else None
 
     device = current_platform.current_device()
+    copy_setting = os.getenv("INSTANTTENSOR_COPY", "1")
+    if copy_setting not in {"0", "1"}:
+        raise ValueError(f"INSTANTTENSOR_COPY must be 0 or 1, got {copy_setting!r}")
+    copy_tensors = copy_setting == "1"
 
     with instanttensor.safe_open(
-        hf_weights_files, framework="pt", device=device, process_group=process_group
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        copy=copy_tensors,
     ) as f:
         for name, tensor in tqdm(
             f.tensors(),
@@ -1242,6 +1250,11 @@ def instanttensor_weights_iterator(
             total=len(f.keys()),
             mininterval=1.0,
         ):
+            if not copy_tensors:
+                # Parameter loaders consume borrowed tensors synchronously.
+                # Loaders retaining a tensor past this yield must materialize
+                # owned storage before InstantTensor advances its ring buffer.
+                tensor._vllm_instanttensor_borrowed = True
             if weight_name_prefixes and not _matches_weight_name_prefixes(
                 name, weight_name_prefixes
             ):
