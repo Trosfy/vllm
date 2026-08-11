@@ -136,6 +136,9 @@ class _FakeModularExperts:
 def test_modular_moe_uses_compatible_output_as_workspace_destination(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        modular_kernel.envs, "VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS", False
+    )
     manager = _FakeWorkspaceManager()
     monkeypatch.setattr(
         modular_kernel, "current_workspace_manager", lambda: manager
@@ -170,6 +173,47 @@ def test_modular_moe_uses_compatible_output_as_workspace_destination(
     assert workspace13.shape == (7,)
     assert workspace2.shape == (11,)
     assert fused_out is output
+
+
+def test_modular_moe_output_alias_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        modular_kernel.envs, "VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS", True
+    )
+    manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        modular_kernel, "current_workspace_manager", lambda: manager
+    )
+    monkeypatch.setattr(
+        modular_kernel,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: False),
+    )
+    kernel = object.__new__(modular_kernel.FusedMoEKernelModularImpl)
+    kernel.fused_experts = _FakeModularExperts()
+    output = torch.empty(5, 64, dtype=torch.bfloat16)
+
+    workspace13, workspace2, fused_out = kernel._allocate_buffers(
+        out_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        M_chunk=2,
+        M_full=5,
+        N=32,
+        K=64,
+        top_k=4,
+        global_num_experts=8,
+        local_num_experts=8,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        output_alias=output,
+    )
+
+    assert manager.calls == [
+        (((320,), torch.bfloat16), ((11,), torch.bfloat16))
+    ]
+    assert workspace13.shape == (7,)
+    assert workspace2.shape == (11,)
+    assert fused_out.shape == output.shape
+    assert fused_out is not output
 
 
 def test_b12x_moe_runner_uses_functional_custom_op(monkeypatch) -> None:

@@ -3,8 +3,7 @@
 # TP16, DCP16, physical one-million-token cache.
 #
 # The draft is a six-layer qwen3-style GQA model with a 4096 sliding window and
-# dflash_config.target_layer_ids [19,37,54,66,78,90]. Three of the defaults
-# below are load-bearing and were each found the hard way:
+# dflash_config.target_layer_ids [19,37,54,66,78,90]. The runtime requires:
 #
 #   * FULL decode graphs. DFlashSpeculator supports only full graphs and
 #     silently runs the draft eagerly otherwise, which costs 5.3x
@@ -20,7 +19,8 @@
 #
 # KV budget: 1.20 GB yields 1,039,043 tokens. DSpark's 1.325 GB budget reports
 # more (1,151,050) but leaves so little device memory that CUDA module loads
-# spin in the driver during startup warmup, so do not raise it blindly.
+# spin in the driver during startup warmup. A larger budget requires a full
+# startup and decode-replay qualification.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,8 +44,11 @@ export KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-1200000000}"
 export KIMI_TARGET_MXFP8_PROFILE="${KIMI_TARGET_MXFP8_PROFILE:-kda_in_proj}"
 export VLLM_USE_B12X_FP8_GEMM="${VLLM_USE_B12X_FP8_GEMM:-1}"
 export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}"
-# Draft graph capture runs long enough for gloo's TCP rendezvous to pick a
-# routable-but-unreachable global address on this box and abort the barrier.
+# The target MoE output alias is unsafe across the target and DFlash graph
+# capture sequence. It can corrupt CUDA state before the post-capture warmup.
+export VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS="${VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS:-1}"
+# All 16 ranks share one network namespace. Bind rendezvous traffic to loopback
+# so Gloo cannot select a routable address that is unreachable between ranks.
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
 export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-lo}"
 
