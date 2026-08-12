@@ -2488,6 +2488,7 @@ class MLACommonPrefillMetadata:
         context_lens_list: list[int]
         empty_token_slices: list[slice]
         dcp_manager: MLADCPManager | None = None
+        direct_dcp_kv_gather: bool = False
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -2777,6 +2778,7 @@ def build_mla_chunked_context_metadata(
     dcp_local_block_size: int,
     dcp_virtual_block_size: int,
     dcp_manager: MLADCPManager | None = None,
+    direct_dcp_kv_gather: bool = False,
 ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
     """Build chunked-context metadata for an MLA prefill.
 
@@ -2796,6 +2798,9 @@ def build_mla_chunked_context_metadata(
         dcp_local_block_size: Per-rank interleave block size for DCP.
         dcp_virtual_block_size: ``dcp_local_block_size * dcp_world_size``.
         dcp_manager: Shared MLA DCP collective manager.
+        direct_dcp_kv_gather: Use the process DCP group for the context-cache
+            all-gather when the attention backend implements decode DCP without
+            a shared ``MLADCPManager``.
 
     Returns:
         The chunked-context metadata, or None when no prefill has any context.
@@ -2985,6 +2990,7 @@ def build_mla_chunked_context_metadata(
         context_lens_list=context_lens,
         empty_token_slices=empty_token_slices,
         dcp_manager=dcp_manager,
+        direct_dcp_kv_gather=direct_dcp_kv_gather,
     )
 
 
@@ -3006,6 +3012,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
     # Whether this builder can flatten a non-causal query block into decode rows.
     supports_non_causal_multi_token_decode: ClassVar[bool] = False
+
+    # A backend with native decode-DCP collectives may omit MLADCPManager. Its
+    # chunked-prefill path gathers context KV through the process DCP group.
+    supports_direct_dcp_kv_gather: ClassVar[bool] = False
 
     # The threshold for reordering the batch into decode and prefill requests.
     # If > 1, the batch will be reordered such that requests with
@@ -3121,11 +3131,14 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         )
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
 
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
+        # A model-specific cache group may be replicated even when the target
+        # model uses DCP. The cache specification is the source of truth for
+        # the metadata geometry of that group.
+        self.dcp_world_size = (
+            1
+            if getattr(kv_cache_spec, "dcp_replicated", False)
+            else int(parallel_config.decode_context_parallel_size)
+        )
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -3156,11 +3169,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 device=device,
             )
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
-            assert isinstance(self.dcp_manager, MLADCPManager)
-            self.dcp_manager.init_kv_gather(
-                self.chunked_prefill_workspace,
-                self.chunked_prefill_workspace_size,
-            )
+            if self.dcp_manager is not None:
+                if not isinstance(self.dcp_manager, MLADCPManager):
+                    raise TypeError(
+                        "MLA attention layer dcp_manager must be an "
+                        f"MLADCPManager, got {type(self.dcp_manager).__name__}."
+                    )
+                self.dcp_manager.init_kv_gather(
+                    self.chunked_prefill_workspace,
+                    self.chunked_prefill_workspace_size,
+                )
+            elif not self.supports_direct_dcp_kv_gather:
+                raise RuntimeError(
+                    f"{type(self).__name__} requires MLADCPManager when DCP is enabled."
+                )
         else:
             self.chunked_prefill_workspace = torch.empty(
                 (
@@ -3316,6 +3338,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 dcp_local_block_size=self.dcp_local_block_size,
                 dcp_virtual_block_size=self.dcp_virtual_block_size,
                 dcp_manager=self.dcp_manager,
+                direct_dcp_kv_gather=(
+                    self.dcp_world_size > 1
+                    and self.dcp_manager is None
+                    and self.supports_direct_dcp_kv_gather
+                ),
             )
 
             prefill_metadata = MLACommonPrefillMetadata(
@@ -3755,8 +3782,18 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             ]
             assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
             cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
-            dcp_manager = cast(MLADCPManager, chunked_context.dcp_manager)
-            dcp_manager.kv_gather(cur_allgather_kvcache, local_gathered_kvcache)
+            if chunked_context.dcp_manager is not None:
+                chunked_context.dcp_manager.kv_gather(
+                    cur_allgather_kvcache, local_gathered_kvcache
+                )
+            elif chunked_context.direct_dcp_kv_gather:
+                cur_allgather_kvcache.copy_(
+                    get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
+                )
+            else:
+                raise RuntimeError(
+                    "MLA DCP chunked prefill has no configured KV gather path."
+                )
             assert (
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim

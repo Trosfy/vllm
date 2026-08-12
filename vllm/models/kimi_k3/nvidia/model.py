@@ -17,7 +17,6 @@ from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -29,6 +28,9 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    FusedTopKBiasRouter,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
@@ -107,6 +109,11 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
+    gather_kimi_sharded_projection_pair,
+    try_gather_kimi_sharded_projection_pair_topk,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -132,6 +139,22 @@ logger = init_logger(__name__)
 # it the GEMMs saturate the device and the cross-stream sync is pure overhead,
 # so it falls back to sequential.
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
+
+
+def _uses_native_b12x_mxfp4_intermediate_size(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Return whether B12X consumes the checkpoint's logical MoE shard.
+
+    The B12X W4A16 kernel accepts intermediate tails such as Kimi-K3's
+    3072 / TP16 = 192 shard. Generic model-level padding to 256 channels per
+    rank would expand every routed-expert layer without changing its logical
+    shape.
+    """
+    if vllm_config.model_config.quantization != "mxfp4":
+        return False
+    moe_backend = vllm_config.kernel_config.moe_backend
+    return moe_backend == "b12x" or (moe_backend == "auto" and envs.VLLM_USE_B12X_MOE)
 
 
 def shard_sequence_parallel_mlp(
@@ -343,19 +366,24 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
     ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         self.logical_output_size = output_size
+        self.kimi_gather_output = gather_output
         padded_output_size = cdiv(output_size, tp_size) * tp_size
         super().__init__(
             input_size,
             padded_output_size,
             bias=False,
-            gather_output=gather_output,
+            gather_output=False,
             quant_config=None,
             prefix=prefix,
         )
 
+    def forward_local(self, x: torch.Tensor):
+        return super().forward(x)
+
     def forward(self, x: torch.Tensor):
-        output, bias = super().forward(x)
-        if self.gather_output:
+        output, bias = self.forward_local(x)
+        if self.kimi_gather_output:
+            output = gather_kimi_sharded_projection(output)
             output = output[..., : self.logical_output_size].contiguous()
         return output, bias
 
@@ -371,17 +399,14 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
             gather_output=False,
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward_local(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
-            output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
-        else:
-            output_parallel = torch.nn.functional.linear(
-                x.to(self.weight.dtype), self.weight
-            ).float()
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
+            return torch.mm(x, self.weight.T, out_dtype=torch.float32)
+        return torch.nn.functional.linear(x.to(self.weight.dtype), self.weight).float()
+
+    def forward(self, x: torch.Tensor):
+        output_parallel = self.forward_local(x)
+        output = gather_kimi_sharded_projection(output_parallel)
         return output[..., : self.logical_output_size].contiguous(), None
 
 
@@ -602,6 +627,75 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
     return mapping
 
 
+class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
+    """Decode the compact routing payload produced by B12X TP16 collectives."""
+
+    def _compute_routing(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        indices_type: torch.dtype | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        if (
+            envs.VLLM_KIMI_FUSED_TOPK16
+            and self.top_k == 16
+            and self.global_num_experts == 896
+            and self.scoring_func == "sigmoid"
+            and self.renormalize
+            and indices_type in (None, torch.int32)
+            and input_ids is None
+            and self.e_score_correction_bias is not None
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens, 896)
+            and router_logits.dtype == torch.float32
+            and router_logits.is_cuda
+            and router_logits.is_contiguous()
+        ):
+            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (  # noqa: E501
+                _get_padding_mask,
+            )
+            from vllm.models.kimi_k3.nvidia.ops.topk16 import (
+                kimi_topk16_sigmoid,
+            )
+
+            return kimi_topk16_sigmoid(
+                router_logits,
+                self.e_score_correction_bias.data,
+                _get_padding_mask(num_tokens),
+                renormalize=self.renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens * 2, 16)
+            and router_logits.dtype == torch.float32
+        ):
+            topk_weights = router_logits[:num_tokens]
+            topk_ids = router_logits[num_tokens:].view(torch.int32)
+            return topk_weights, topk_ids
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and router_logits.ndim == 2
+            and router_logits.shape == (num_tokens, 32)
+            and router_logits.dtype == torch.float32
+        ):
+            topk_weights = router_logits[:, :16]
+            topk_ids = router_logits[:, 16:].view(torch.int32)
+            return topk_weights, topk_ids
+        return super()._compute_routing(
+            hidden_states,
+            router_logits,
+            indices_type,
+            input_ids=input_ids,
+        )
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -666,12 +760,28 @@ class KimiMoE(nn.Module):
         min_moe_intermediate_per_partition = getattr(
             config, "min_moe_intermediate_per_partition", 256
         )
-        if self.tp_size > 1 and not vllm_config.parallel_config.enable_expert_parallel:
+        use_native_b12x_intermediate = (
+            not self.use_mega_moe
+            and _uses_native_b12x_mxfp4_intermediate_size(vllm_config)
+        )
+        if (
+            self.tp_size > 1
+            and not vllm_config.parallel_config.enable_expert_parallel
+            and not use_native_b12x_intermediate
+        ):
             moe_intermediate_per_partition = moe_intermediate_size // self.tp_size
             if moe_intermediate_per_partition < min_moe_intermediate_per_partition:
                 self.padded_moe_intermediate_size = (
                     min_moe_intermediate_per_partition * self.tp_size
                 )
+        elif use_native_b12x_intermediate:
+            logger.info_once(
+                "Kimi-K3 B12X MXFP4 keeps the checkpoint MoE intermediate "
+                "shard (%d / TP%d = %d).",
+                moe_intermediate_size,
+                self.tp_size,
+                moe_intermediate_size // self.tp_size,
+            )
         activation_situ_beta = (
             config.activation_situ_beta if config.hidden_act == "situ" else None
         )
@@ -794,6 +904,14 @@ class KimiMoE(nn.Module):
                 activation_linear_beta=activation_situ_linear_beta,
             )
         else:
+            router = KimiK3PrecomputedTopKRouter(
+                top_k=num_experts_per_token,
+                global_num_experts=num_experts,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                renormalize=moe_renormalize,
+                routed_scaling_factor=self.routed_scaling_factor,
+                scoring_func=self.moe_router_activation_func,
+            )
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
                 num_experts=num_experts,
@@ -812,6 +930,7 @@ class KimiMoE(nn.Module):
                 scoring_func=config.moe_router_activation_func,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
+                router=router,
                 # Down projection runs outside MoERunner so it can overlap the
                 # router gate on the aux stream (see forward()); the original
                 # hidden states are passed to forward() as shared_experts_input
@@ -857,10 +976,9 @@ class KimiMoE(nn.Module):
             logits and ``topk_ids`` is ``None``.
         """
 
-        def _router(
-            hidden_states: torch.Tensor,
+        def _finish_router(
+            router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            router_logits, _ = self.gate(hidden_states)
             if not self.use_mega_moe:
                 return router_logits, None
             return fused_grouped_topk(
@@ -875,11 +993,48 @@ class KimiMoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
+        def _router(
+            hidden_states: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            router_logits, _ = self.gate(hidden_states)
+            return _finish_router(router_logits)
+
         down_proj = self.routed_expert_down_proj
         if down_proj is None:
             router_output, topk_ids = _router(hidden_states)
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
+        if (
+            0 < num_tokens <= 8
+            and envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
+            and isinstance(self.gate, KimiColumnParallelGate)
+            and isinstance(down_proj, KimiPaddedColumnParallelLinear)
+        ):
+            router_local, (down_local, _) = maybe_execute_in_parallel(
+                lambda: self.gate.forward_local(hidden_states),
+                lambda: down_proj.forward_local(hidden_states),
+                self._down_proj_events[0],
+                self._down_proj_events[1],
+                self._down_proj_stream,
+            )
+            fused_pair_topk = (
+                try_gather_kimi_sharded_projection_pair_topk(
+                    down_local,
+                    router_local,
+                    self.gate.e_score_correction_bias.data,
+                )
+                if num_tokens == 1 or envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
+                else None
+            )
+            if fused_pair_topk is not None:
+                routed_hidden_states, routing_payload = fused_pair_topk
+                return routed_hidden_states, routing_payload, None
+            routed_hidden_states, router_logits = gather_kimi_sharded_projection_pair(
+                down_local,
+                router_local,
+            )
+            router_output, topk_ids = _finish_router(router_logits)
+            return routed_hidden_states, router_output, topk_ids
         (router_output, topk_ids), (routed_hidden_states, _) = (
             maybe_execute_in_parallel(
                 lambda: _router(hidden_states),

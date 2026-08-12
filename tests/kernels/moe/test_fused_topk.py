@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.models.kimi_k3.nvidia.ops.topk16 import kimi_topk16_sigmoid
 from vllm.platforms import current_platform
 
 
@@ -135,6 +136,30 @@ def test_fused_topk_bias(
         topk_weights_ref.to(torch.float32), topk_weights, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(topk_ids_ref.to(torch.int32), topk_ids, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
+@pytest.mark.parametrize("num_tokens", [1, 2, 8])
+def test_kimi_k3_fused_sigmoid_topk16_matches_reference(num_tokens: int):
+    torch.manual_seed(20260812)
+    logits = torch.randn((num_tokens, 896), dtype=torch.float32, device="cuda")
+    correction_bias = torch.randn((896,), dtype=torch.float32, device="cuda")
+    hidden_states = torch.empty((num_tokens, 1), dtype=torch.float32, device="cuda")
+
+    expected_weights, expected_indices = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=logits,
+        scoring_func="sigmoid",
+        e_score_correction_bias=correction_bias,
+        topk=16,
+        renormalize=True,
+    )
+    actual_weights, actual_indices = kimi_topk16_sigmoid(logits, correction_bias)
+
+    torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
+    torch.testing.assert_close(actual_indices, expected_indices, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(

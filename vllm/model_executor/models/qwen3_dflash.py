@@ -866,6 +866,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
+            if loaded_weight.is_cuda:
+                # The draft loader retains every checkpoint tensor until name
+                # mapping is complete. Streaming loaders can return views into
+                # a recycled device buffer, so retained tensors need stable
+                # storage across iterator advancement.
+                loaded_weight = loaded_weight.to("cpu", copy=True)
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 

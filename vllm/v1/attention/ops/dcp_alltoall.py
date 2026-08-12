@@ -31,7 +31,6 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
-from vllm.v1.attention.ops.common import mask_dcp_empty_shards_
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -42,10 +41,26 @@ logger = init_logger(__name__)
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
-# DCP likewise has one stable eager scheduler owner.  Graph target/draft/encoder
-# identities are supplied separately by their GraphCaptureContext.
 _B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
 _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
+# Each entry records the semantic channel, stream, and cleanup stack owned by
+# an in-flight graph capture. A pool created after the capture context opens
+# must join this context before its first graph launch.
+_B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
+
+
+def _b12x_dcp_channel_id(cp_group: GroupCoordinator | None = None) -> str:
+    """Return the channel a DCP a2a call should use right now."""
+    if cp_group is not None:
+        active = _B12X_DCP_ACTIVE_CAPTURE.get(id(cp_group.device_group))
+        if active is not None:
+            return active[0]
+    elif len(_B12X_DCP_ACTIVE_CAPTURE) == 1:
+        return next(iter(_B12X_DCP_ACTIVE_CAPTURE.values()))[0]
+    return _B12X_DCP_EAGER_CHANNEL_ID
+
+
+_B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -135,8 +150,28 @@ def _get_b12x_dcp_a2a_pool(
             single_channel=False,
             max_concurrent_channels=_B12X_DCP_MAX_CONCURRENT_CHANNELS,
         )
-        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
-        pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
+        # B12X identifies independently replayable channels by a stable
+        # semantic name. Stream handles are process-local and can be recycled,
+        # so they are not a valid distributed identity.
+        # A pool can be created lazily inside a graph capture (the first
+        # projection gather of the first captured shape). The capture scope
+        # bound the pools that existed when it opened, so a pool born here
+        # must join the graph's channel itself or its first launch is rejected
+        # for using the eager channel while a graph owns capture.
+        active = _B12X_DCP_ACTIVE_CAPTURE.get(id(cp_group.device_group))
+        if active is None:
+            pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+            pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
+        else:
+            # Join the capture already in flight, through its own ExitStack so
+            # the scope releases the channel when it closes. Binding the eager
+            # channel here instead would pin this stream to a channel the graph
+            # does not own.
+            active_channel, active_stream, active_stack = active
+            pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID, active_channel))
+            active_stack.enter_context(
+                pool.capture(stream=active_stream, channel_id=active_channel)
+            )
     except Exception as exc:
         init_error = exc
 
@@ -198,15 +233,27 @@ def capture_b12x_dcp_a2a(
         ),
         key=lambda item: item[0][1:],
     )
-    if matching_pools and channel_id is None:
-        raise RuntimeError(
-            "distributed PCIe DCP graph capture requires an explicit semantic "
-            "channel_id"
-        )
-    with ExitStack() as stack:
-        for _, pool in matching_pools:
-            stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
+    if channel_id is None:
+        if matching_pools:
+            raise RuntimeError(
+                "distributed PCIe DCP graph capture requires an explicit "
+                "semantic channel_id"
+            )
         yield
+        return
+
+    previous_active = _B12X_DCP_ACTIVE_CAPTURE.get(group_id)
+    try:
+        with ExitStack() as stack:
+            _B12X_DCP_ACTIVE_CAPTURE[group_id] = (channel_id, stream, stack)
+            for _, pool in matching_pools:
+                stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
+            yield
+    finally:
+        if previous_active is None:
+            _B12X_DCP_ACTIVE_CAPTURE.pop(group_id, None)
+        else:
+            _B12X_DCP_ACTIVE_CAPTURE[group_id] = previous_active
 
 
 def checkpoint_b12x_dcp_a2a_channels(
@@ -259,7 +306,7 @@ def _try_b12x_dcp_lse_reduce(
         or not cp_attn_out.is_cuda
         or cp_attn_out.dtype not in (torch.float16, torch.bfloat16)
         or cp_attn_lse.dtype != torch.float32
-        or world_size not in (2, 4, 8)
+        or world_size not in _B12X_DCP_WORLD_SIZES
         or cp_attn_out.ndim != 3
         or cp_attn_lse.shape != cp_attn_out.shape[:2]
     ):
@@ -326,7 +373,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(cp_group),
     )
 
 
@@ -336,20 +383,22 @@ def _try_b12x_dcp_all_gather_heads(
     *,
     max_batch_size: int | None,
     output_head_dim: int | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Gather rank-local query heads with the B12X PCIe channel."""
     world_size = cp_group.world_size
     if (
         not local_input.is_cuda
-        or local_input.dtype not in (torch.float16, torch.bfloat16)
-        or world_size not in (2, 4, 8)
+        or local_input.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        or world_size not in _B12X_DCP_WORLD_SIZES
         or local_input.ndim != 3
         or not local_input.is_contiguous()
     ):
         return None
 
     batch, local_heads, head_dim = local_input.shape
-    if local_heads <= 0 or head_dim % 8 != 0:
+    gather_alignment = 16 if local_input.dtype == torch.float8_e4m3fn else 8
+    if local_heads <= 0 or head_dim % gather_alignment != 0:
         return None
     if max_batch_size is None:
         max_batch_size = batch
@@ -377,9 +426,15 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
+    if out is None:
+        return pool.all_gather_heads(
+            local_input,
+            channel_id=_b12x_dcp_channel_id(cp_group),
+        )
     return pool.all_gather_heads(
         local_input,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        out=out,
+        channel_id=_b12x_dcp_channel_id(cp_group),
     )
 
 
@@ -389,19 +444,269 @@ def dcp_b12x_all_gather_heads(
     *,
     max_batch_size: int | None = None,
     output_head_dim: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather query heads with B12X, falling back to the group backend."""
     local_input = local_input.contiguous()
     if envs.VLLM_USE_B12X_DCP_A2A:
-        result = _try_b12x_dcp_all_gather_heads(
-            local_input,
+        if out is None:
+            result = _try_b12x_dcp_all_gather_heads(
+                local_input,
+                cp_group,
+                max_batch_size=max_batch_size,
+                output_head_dim=output_head_dim,
+            )
+        else:
+            result = _try_b12x_dcp_all_gather_heads(
+                local_input,
+                cp_group,
+                max_batch_size=max_batch_size,
+                output_head_dim=output_head_dim,
+                out=out,
+            )
+        if result is not None:
+            return result
+    result = cp_group.all_gather(local_input, dim=1)
+    if out is None:
+        return result
+    out.copy_(result)
+    return out
+
+
+def _try_b12x_dcp_all_gather_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Gather two decode projections behind one B12X IPC barrier."""
+    world_size = cp_group.world_size
+    supported_dtypes = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+    )
+    if (
+        world_size not in _B12X_DCP_WORLD_SIZES
+        or local_first.dtype not in supported_dtypes
+        or local_second.dtype not in supported_dtypes
+        or not local_first.is_cuda
+        or not local_second.is_cuda
+        or local_first.device != local_second.device
+        or local_first.ndim != 2
+        or local_second.ndim != 2
+        or local_first.shape[0] != local_second.shape[0]
+        or not local_first.is_contiguous()
+        or not local_second.is_contiguous()
+    ):
+        return None
+    batch = int(local_first.shape[0])
+    first_row_bytes = int(local_first.shape[1]) * local_first.element_size()
+    second_row_bytes = int(local_second.shape[1]) * local_second.element_size()
+    if batch < 1 or first_row_bytes % 16 != 0 or second_row_bytes % 16 != 0:
+        return None
+    if max_batch_size is None:
+        max_batch_size = batch
+    max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
+    if max_batch_size < batch:
+        return None
+
+    combined_row_bytes = first_row_bytes + second_row_bytes
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_first.device,
+        total_heads=world_size,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=max_batch_size,
+    )
+    if pool is None or not hasattr(pool, "all_gather_pair"):
+        return None
+    return pool.all_gather_pair(
+        local_first,
+        local_second,
+        channel_id=_b12x_dcp_channel_id(cp_group),
+    )
+
+
+def dcp_b12x_all_gather_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather two rank-local rows together, with exact separate fallbacks."""
+    if envs.VLLM_USE_B12X_DCP_A2A:
+        result = _try_b12x_dcp_all_gather_pair(
+            local_first,
+            local_second,
             cp_group,
             max_batch_size=max_batch_size,
-            output_head_dim=output_head_dim,
         )
         if result is not None:
             return result
-    return cp_group.all_gather(local_input, dim=1)
+    return (
+        cp_group.all_gather(local_first, dim=-1),
+        cp_group.all_gather(local_second, dim=-1),
+    )
+
+
+def try_dcp_b12x_all_gather_pair_kimi_topk(
+    local_down: torch.Tensor,
+    local_router: torch.Tensor,
+    correction_bias: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return Kimi's gathered latent and compact routing payload on TP16.
+
+    The payload is one FP32 tensor with contiguous ``[M, 16]`` weight and ID
+    planes; the ID plane is viewed as int32 by the K3 router. This function
+    deliberately has no semantic NCCL fallback; its caller retains the
+    ordinary paired gather plus router implementation when the exact K3
+    contract is unavailable.
+    """
+    batch = int(local_down.shape[0]) if local_down.ndim == 2 else 0
+    if (
+        not envs.VLLM_USE_B12X_DCP_A2A
+        or cp_group.world_size != 16
+        or not 1 <= batch <= 8
+        or local_down.shape != (batch, 224)
+        or local_down.dtype != torch.bfloat16
+        or local_router.shape != (batch, 56)
+        or local_router.dtype != torch.float32
+        or correction_bias.shape != (896,)
+        or correction_bias.dtype != torch.float32
+        or not local_down.is_cuda
+        or not local_router.is_cuda
+        or not correction_bias.is_cuda
+        or local_down.device != local_router.device
+        or local_down.device != correction_bias.device
+        or not local_down.is_contiguous()
+        or not local_router.is_contiguous()
+        or not correction_bias.is_contiguous()
+    ):
+        return None
+    if max_batch_size is None:
+        max_batch_size = 1 if batch == 1 else 8
+    if int(max_batch_size) < batch:
+        return None
+
+    combined_row_bytes = 224 * 2 + 56 * 4
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_down.device,
+        total_heads=16,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=int(max_batch_size),
+    )
+    if pool is None or not hasattr(pool, "all_gather_pair_kimi_topk"):
+        return None
+
+    routed_hidden_states = torch.empty(
+        (batch, 3584), device=local_down.device, dtype=torch.bfloat16
+    )
+    routing_payload = torch.empty(
+        (batch * 2, 16), device=local_down.device, dtype=torch.float32
+    )
+    topk_weights = routing_payload[:batch]
+    topk_ids = routing_payload[batch:].view(torch.int32)
+    pool.all_gather_pair_kimi_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        routed_hidden_states,
+        topk_weights,
+        topk_ids,
+        channel_id=_b12x_dcp_channel_id(cp_group),
+    )
+    return routed_hidden_states, routing_payload
+
+
+def warmup_b12x_kimi_projection_gathers(
+    projection_group: GroupCoordinator,
+    *,
+    device: torch.device,
+) -> int:
+    """Create Kimi's paired TP channels before CUDA graph capture.
+
+    The M=8 paired projection is first reached by DSpark verification, while
+    the M=1 gather+top-k channel is first reached by ordinary decode. Neither
+    geometry is guaranteed to run during the large-token memory-profile
+    forward. Creating either pool from inside ``graph_capture()`` is too late:
+    it misses the graph-specific channel binding established on context entry
+    and leaves captured nodes sharing the eager channel.
+    """
+    if (
+        not envs.VLLM_USE_B12X_DCP_A2A
+        or not envs.VLLM_KIMI_USE_B12X_PROJECTION_GATHER
+        or not envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
+        or projection_group.world_size != 16
+    ):
+        return 0
+
+    # A target-only max-num-seqs=1 profile deliberately caps the B12X DCP
+    # path at one token and routes larger batches through its exact NCCL
+    # fallback.  Do not make that profile initialize an M=8 channel it can
+    # never dispatch; DSpark profiles set the cap to at least eight and still
+    # precreate this graph channel before verification capture.
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    warmed = 0
+    if token_cap <= 0 or token_cap >= 8:
+        local_down = torch.zeros((8, 224), device=device, dtype=torch.bfloat16)
+        local_router = torch.zeros((8, 56), device=device, dtype=torch.float32)
+        if (
+            envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK
+            and envs.VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK
+        ):
+            correction_bias = torch.zeros((896,), device=device, dtype=torch.float32)
+            paired = try_dcp_b12x_all_gather_pair_kimi_topk(
+                local_down,
+                local_router,
+                correction_bias,
+                projection_group,
+                max_batch_size=8,
+            )
+        else:
+            paired = _try_b12x_dcp_all_gather_pair(
+                local_down,
+                local_router,
+                projection_group,
+                max_batch_size=8,
+            )
+        if paired is None:
+            raise RuntimeError(
+                "B12X Kimi M=8 paired projection gather path is unavailable"
+            )
+        warmed += 1
+
+    if envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK:
+        local_down = torch.zeros((1, 224), device=device, dtype=torch.bfloat16)
+        local_router = torch.zeros((1, 56), device=device, dtype=torch.float32)
+        correction_bias = torch.zeros((896,), device=device, dtype=torch.float32)
+        fused = try_dcp_b12x_all_gather_pair_kimi_topk(
+            local_down,
+            local_router,
+            correction_bias,
+            projection_group,
+            max_batch_size=1,
+        )
+        if fused is None:
+            raise RuntimeError(
+                "B12X Kimi M=1 paired projection gather+top-k is unavailable"
+            )
+        warmed += 1
+    return warmed
 
 
 def warmup_b12x_dcp_a2a(
@@ -417,12 +722,12 @@ def warmup_b12x_dcp_a2a(
     """Create and exercise the B12X DCP channel before CUDA graph capture."""
     if not envs.VLLM_USE_B12X_DCP_A2A:
         return
-    if cp_group.world_size not in (2, 4, 8):
+    if cp_group.world_size not in _B12X_DCP_WORLD_SIZES:
         # The PCIe channel only exists for these world sizes. The runtime
         # dispatchers already fall back to NCCL collectives per call, so an
         # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
         logger.warning_once(
-            "B12X PCIe DCP collectives support world sizes 2/4/8; "
+            "B12X PCIe DCP collectives support world sizes 2/4/8/16; "
             "DCP world size %d uses NCCL collectives instead.",
             cp_group.world_size,
         )
@@ -526,9 +831,7 @@ def _lse_weighted_combine(
     weights = weights / weight_sum.clamp(min=1e-10)  # [N, B, H]
 
     # Weighted combination: sum over N dimension
-    weights = weights.unsqueeze(-1)
-    outputs = torch.where(weights == 0, torch.zeros_like(outputs), outputs)
-    result = (outputs * weights).sum(dim=0)  # [B, H, D]
+    result = (outputs * weights.unsqueeze(-1)).sum(dim=0)  # [B, H, D]
 
     if return_lse:
         if is_lse_base_on_e:
@@ -709,7 +1012,7 @@ def _dcp_a2a_pack_send_kernel(
 
         lse_val = tl.load(
             lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
-        ).to(tl.float32)
+        )
         if LSE_PACK_DIM == 1:
             tl.store(
                 send_ptr + send_base + HEAD_DIM * send_stride_D,
@@ -838,11 +1141,10 @@ def _dcp_a2a_unpack_combine_kernel(
         else:
             weight = tl.exp2(lse_val - global_lse)
         weight = tl.where(weight != weight, 0.0, weight)
-        partial = tl.load(recv_ptr + recv_base + d_offsets * recv_stride_D).to(
-            tl.float32
+        acc += (
+            tl.load(recv_ptr + recv_base + d_offsets * recv_stride_D).to(tl.float32)
+            * weight
         )
-        partial = tl.where(weight == 0.0, 0.0, partial)
-        acc += partial * weight
 
     final_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -862,10 +1164,7 @@ def _dcp_a2a_pack_send(
     h_per_rank: int,
     head_dim: int,
     lse_pack_dim: int,
-    seq_lens: torch.Tensor | None = None,
-    query_start_loc: torch.Tensor | None = None,
 ) -> None:
-    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
     grid = (cp_attn_out.shape[0], h_per_rank, 1)
     _dcp_a2a_pack_send_kernel[grid](
         cp_attn_out,
@@ -938,8 +1237,6 @@ def dcp_a2a_lse_reduce(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
-    seq_lens: torch.Tensor | None = None,
-    query_start_loc: torch.Tensor | None = None,
     use_b12x: bool = False,
     b12x_max_batch_size: int | None = None,
     b12x_query_head_dim: int | None = None,
@@ -947,18 +1244,16 @@ def dcp_a2a_lse_reduce(
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
 
-    The output and LSE are packed into a single output-dtype buffer, sent
+    The output and fp32 LSE are packed into a single output-dtype buffer, sent
     with one All-to-All, then unpacked and combined with exact LSE weighting.
 
     Args:
         cp_attn_out: [B, H, D] where B=num_tokens, H=total_heads, D=head_dim
-        cp_attn_lse: [B, H] floating-point log-sum-exp values
+        cp_attn_lse: [B, H] log-sum-exp values (fp32)
         cp_group: GroupCoordinator for DCP communication
         ctx: CPTritonContext (unused, for signature compatibility)
         return_lse: If True, also return the combined global LSE
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
-        seq_lens: Local KV lengths. Empty shards contribute zero weight.
-        query_start_loc: Cumulative query-token offsets for each request.
         use_b12x: Try the low-latency B12X PCIe path before NCCL A2A
         b12x_max_batch_size: Configured token capacity for B12X staging
         b12x_query_head_dim: Query width when it differs from output width
@@ -975,7 +1270,6 @@ def dcp_a2a_lse_reduce(
         return cp_attn_out
 
     if use_b12x and envs.VLLM_USE_B12X_DCP_A2A:
-        mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
         b12x_result = _try_b12x_dcp_lse_reduce(
             cp_attn_out,
             cp_attn_lse,
@@ -987,11 +1281,37 @@ def dcp_a2a_lse_reduce(
         )
         if b12x_result is not None:
             return b12x_result
+        token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+        if (
+            token_cap > 0
+            and cp_attn_out.shape[0] > token_cap
+            and envs.VLLM_DCP_A2A_LARGE_BACKEND == "ag_rs"
+        ):
+            # ProcessGroupNCCL lazily reserves a sizable transport workspace
+            # on its first all-to-all.  That hidden allocation can fail after
+            # an explicitly sized, near-capacity KV cache has been created.
+            # PyNccl AG+RS uses the already-warmed DCP communicator and keeps
+            # the low-latency B12X path unchanged for decode-sized batches.
+            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+            return cp_lse_ag_out_rs(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                ctx=ctx,
+                return_lse=return_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+                head_major_output=True,
+            )
 
     B, H, D = cp_attn_out.shape
     if H % world_size != 0:
         raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
     H_per_rank = H // world_size
+    # The pack kernel bit-casts the LSE as fp32; some MLA backends return it in
+    # the activation dtype (bf16/fp16), so enforce the documented fp32 contract.
+    if cp_attn_lse.dtype != torch.float32:
+        cp_attn_lse = cp_attn_lse.to(torch.float32)
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
     send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
@@ -1008,8 +1328,6 @@ def dcp_a2a_lse_reduce(
         H_per_rank,
         D,
         lse_pack_dim,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
     )
 
     work = dist.all_to_all_single(

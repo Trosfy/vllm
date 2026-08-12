@@ -64,6 +64,13 @@ if TYPE_CHECKING:
     VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
+    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
+    VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
+    VLLM_DSPARK_CAPTURE_SHARDED_MARKOV: bool = False
+    VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -330,6 +337,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -351,6 +359,12 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_MEMORY_PROFILE_INCLUDE_ATTN: bool = False
+    VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_KIMI_FUSED_TOPK16: bool = False
+    VLLM_KIMI_USE_B12X_PROJECTION_GATHER: bool = False
+    VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER: bool = False
+    VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK: bool = False
+    VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -1138,6 +1152,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
     ),
+    # Limit an external DSpark draft to a replicated rolling MLA KV tail while
+    # the target model retains its complete context. The target verifies every
+    # proposal, so this can alter acceptance but not target-model semantics.
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    # Replace the persistent 1M-position K3 draft RoPE table with stable
+    # workspaces that materialize only rows consumed by each draft forward.
+    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
+    ),
+    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
+    ),
+    "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
+    ),
+    # Capture TP-sharded deterministic Markov sampling only when every
+    # collective in the tail uses a CUDA-graph-safe B12X implementation.
+    "VLLM_DSPARK_CAPTURE_SHARDED_MARKOV": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CAPTURE_SHARDED_MARKOV", "0"))
+    ),
+    "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
@@ -2244,6 +2284,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
     ),
+    "VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS": lambda: bool(
+        int(os.getenv("VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS", "0"))
+    ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)
@@ -2342,6 +2385,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Include backend-declared transient attention buffers in the profile peak.
     "VLLM_MEMORY_PROFILE_INCLUDE_ATTN": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILE_INCLUDE_ATTN", "0"))
+    ),
+    # TP-shard Kimi-K3's merged MLA q_a/kv_a projection. The rank-major
+    # result is reconstructed losslessly before the two logical outputs are
+    # consumed.
+    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    # Use B12X copy collectives for decode-sized Kimi-K3 projection shards.
+    # The path is byte-exact and falls back to the ordinary TP collective when
+    # its shape or topology contract is not satisfied.
+    "VLLM_KIMI_USE_B12X_PROJECTION_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PROJECTION_GATHER", "0"))
+    ),
+    # Use the bit-exact fused sigmoid and top-16 router for Kimi-K3's
+    # 896-expert decode shape.
+    "VLLM_KIMI_FUSED_TOPK16": lambda: bool(
+        int(os.getenv("VLLM_KIMI_FUSED_TOPK16", "0"))
+    ),
+    "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER", "0"))
+    ),
+    "VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_TOPK", "0"))
+    ),
+    "VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK": lambda: bool(
+        int(os.getenv("VLLM_KIMI_USE_B12X_BATCHED_PROJECTION_TOPK", "0"))
     ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(

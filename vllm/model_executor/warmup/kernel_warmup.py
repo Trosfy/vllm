@@ -205,15 +205,25 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     if dcp_world_size <= 1 or parallel_config.dcp_comm_backend != "a2a":
         return 0
 
-    from vllm.distributed.parallel_state import get_dcp_group
+    from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
     from vllm.models.deepseek_v4.nvidia.b12x import (
         DeepseekV4B12xMLAAttention,
     )
-    from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
+    from vllm.models.kimi_k3.nvidia.mla import (
+        MultiHeadLatentAttention as KimiK3MLAAttention,
+    )
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        warmup_b12x_dcp_a2a,
+        warmup_b12x_kimi_projection_gathers,
+    )
 
     model = worker.get_model()
     candidates = list(model.modules())
+    speculator = getattr(worker.model_runner, "speculator", None)
+    draft_model = getattr(speculator, "model", None)
+    if isinstance(draft_model, nn.Module):
+        candidates.extend(draft_model.modules())
     candidates.extend(
         worker.vllm_config.compilation_config.static_forward_context.values()
     )
@@ -234,6 +244,17 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
             device = next(module.parameters()).device
             total_heads = int(module.num_heads) * dcp_world_size
             query_head_dim = int(module.kv_lora_rank + module.qk_rope_head_dim)
+            output_head_dim = int(module.kv_lora_rank)
+        elif (
+            isinstance(module, KimiK3MLAAttention)
+            and module.attn_backend.get_name() == "B12X_MLA"
+        ):
+            module_dcp_world_size = int(module.impl.dcp_world_size)
+            if module_dcp_world_size <= 1:
+                continue
+            device = next(module.parameters()).device
+            total_heads = int(module.num_local_heads) * module_dcp_world_size
+            query_head_dim = int(module.head_size)
             output_head_dim = int(module.kv_lora_rank)
         else:
             continue
@@ -259,7 +280,21 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
         )
         warmed_signatures.add(signature)
 
-    return len(warmed_signatures)
+    warmed_projection_signatures = 0
+    if (
+        envs.VLLM_KIMI_USE_B12X_PROJECTION_GATHER
+        and envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
+    ):
+        dcp_group = get_dcp_group()
+        tp_group = get_tp_group()
+        projection_group = (
+            dcp_group if dcp_group.world_size == tp_group.world_size else tp_group
+        )
+        warmed_projection_signatures = warmup_b12x_kimi_projection_gathers(
+            projection_group,
+            device=next(model.parameters()).device,
+        )
+    return len(warmed_signatures) + warmed_projection_signatures
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool:

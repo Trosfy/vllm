@@ -16,6 +16,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.quantization import QuantizationConfigArgs, resolve_quantization_config
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -116,6 +117,8 @@ class SpeculativeConfig:
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
+    quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None
+    """Optional per-layer online quantization settings for the draft model."""
     moe_backend: MoEBackend | None = None
     """MoE backend to use for the draft model. When `None`, the draft model
     inherits the target model's `--moe-backend` setting. Useful when the
@@ -1019,6 +1022,9 @@ class SpeculativeConfig:
                     max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
+                    quantization_config=resolve_quantization_config(
+                        self.quantization, self.quantization_config
+                    ),
                     enforce_eager=self.target_model_config.enforce_eager,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
@@ -1150,10 +1156,12 @@ class SpeculativeConfig:
                     self.method == "dspark"
                     and "K3DSparkModel" in self.draft_model_config.architectures
                     and self.target_parallel_config.decode_context_parallel_size > 1
+                    and self.attention_backend != AttentionBackendEnum.B12X_MLA
                 ):
                     raise ValueError(
-                        "MLA DSpark does not currently support decode context "
-                        "parallelism; set decode_context_parallel_size=1."
+                        "K3 DSpark decode context parallelism requires "
+                        "attention_backend=B12X_MLA; otherwise set "
+                        "decode_context_parallel_size=1."
                     )
 
                 if self.num_speculative_tokens is not None and hasattr(
