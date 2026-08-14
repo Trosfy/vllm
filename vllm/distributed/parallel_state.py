@@ -1614,18 +1614,30 @@ def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any],
         if checkpoint is not None:
             checkpoints.append((rollback_fn, checkpoint))
 
-    if _DCP is not None and _DCP.world_size > 1:
+    b12x_pool_groups: list[GroupCoordinator] = []
+    seen_device_groups: set[int] = set()
+    for group in (_TP, _DCP):
+        if group is None or group.world_size <= 1:
+            continue
+        group_id = id(group.device_group)
+        if group_id in seen_device_groups:
+            continue
+        seen_device_groups.add(group_id)
+        b12x_pool_groups.append(group)
+
+    if b12x_pool_groups:
         from vllm.v1.attention.ops.dcp_alltoall import (
             checkpoint_b12x_dcp_a2a_channels,
             rollback_b12x_dcp_a2a_channels,
         )
 
-        checkpoints.append(
-            (
-                rollback_b12x_dcp_a2a_channels,
-                checkpoint_b12x_dcp_a2a_channels(_DCP),
+        for group in b12x_pool_groups:
+            checkpoints.append(
+                (
+                    rollback_b12x_dcp_a2a_channels,
+                    checkpoint_b12x_dcp_a2a_channels(group),
+                )
             )
-        )
     return tuple(checkpoints)
 
 
@@ -1729,24 +1741,39 @@ def graph_capture(
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
-    maybe_b12x_dcp_capture: contextlib.AbstractContextManager[Any]
-    if _DCP is not None and get_dcp_group().world_size > 1:
-        # Import locally to avoid making distributed initialization depend on
-        # attention modules. The helper is a no-op until DCP warmup creates a
-        # B12X pool for this process group.
-        from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
+    from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
 
-        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(
-            get_dcp_group(),
+    maybe_b12x_tp_capture: contextlib.AbstractContextManager[Any]
+    if get_tp_group().world_size > 1:
+        # Kimi-K3 projection gathers use the generic B12X PCIe pool with the
+        # tensor-parallel process group. Bind that pool to the graph owner in
+        # the same way as attention's DCP pool.
+        maybe_b12x_tp_capture = capture_b12x_dcp_a2a(
+            get_tp_group(),
             context.stream,
             channel_id=context.channel_id,
         )
+    else:
+        maybe_b12x_tp_capture = nullcontext()
+
+    maybe_b12x_dcp_capture: contextlib.AbstractContextManager[Any]
+    if _DCP is not None and get_dcp_group().world_size > 1:
+        dcp_group = get_dcp_group()
+        if dcp_group.device_group is get_tp_group().device_group:
+            maybe_b12x_dcp_capture = nullcontext()
+        else:
+            maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(
+                dcp_group,
+                context.stream,
+                channel_id=context.channel_id,
+            )
     else:
         maybe_b12x_dcp_capture = nullcontext()
     with (
         get_tp_group().graph_capture(context),
         get_pp_group().graph_capture(context),
         maybe_dcp_capture,
+        maybe_b12x_tp_capture,
         maybe_b12x_dcp_capture,
     ):
         yield context
