@@ -643,6 +643,25 @@ class DFlashSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
+        capture_inputs = getattr(self, "_capture_numeric_inputs", None)
+        if capture_inputs is not None:
+            capture_inputs(
+                input_batch=input_batch,
+                last_hidden_states=last_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                combined_hidden_states=hidden_states,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                num_target_tokens=num_target_tokens,
+                num_reqs=num_reqs,
+                active_query_len=active_query_len,
+                active_num_speculative_steps=active_num_speculative_steps,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
+            )
+
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
@@ -732,6 +751,18 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self.input_buffers.seq_lens,
                     self.block_tables.kernel_block_sizes[gid],
                 )
+
+        capture_prepared = getattr(self, "_capture_numeric_prepared_inputs", None)
+        if capture_prepared is not None:
+            capture_prepared(
+                input_batch=input_batch,
+                num_target_tokens=num_target_tokens,
+                num_reqs=num_reqs,
+                active_query_len=active_query_len,
+                active_num_speculative_steps=active_num_speculative_steps,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
+            )
 
         # Pre-insert context K/V into the cache. Decode replays a row-bucketed
         # FULL graph; profiling, dummy, and out-of-envelope shapes remain eager.

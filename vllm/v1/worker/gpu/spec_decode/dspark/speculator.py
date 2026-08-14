@@ -23,6 +23,8 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -113,6 +115,11 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         self._last_num_speculative_steps = self.num_speculative_steps
         self._last_proposal_confidence_valid = False
+        self._numeric_capture_dir = os.environ.get(
+            "VLLM_DSPARK_NUMERIC_CAPTURE_DIR"
+        )
+        self._numeric_capture_pending = False
+        self._numeric_capture_done = False
         self.min_survival_probability = (
             self.speculative_config.dspark_confidence_threshold
         )
@@ -157,6 +164,140 @@ class DSparkSpeculator(DFlashSpeculator):
             self.calibrated_confidence_logits = torch.zeros_like(
                 self.draft_token_confidence_logits
             )
+
+    @staticmethod
+    def _capture_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().to(device="cpu", copy=True).contiguous()
+
+    def _numeric_capture_is_rank_zero(self) -> bool:
+        return bool(
+            self._numeric_capture_dir
+            and not self._numeric_capture_done
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+        )
+
+    def _capture_numeric_inputs(
+        self,
+        *,
+        input_batch: InputBatch,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        combined_hidden_states: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        num_target_tokens: int,
+        num_reqs: int,
+        active_query_len: int,
+        active_num_speculative_steps: int,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> None:
+        if (
+            dummy_run
+            or is_profile
+            or not self._numeric_capture_is_rank_zero()
+            or self._numeric_capture_pending
+        ):
+            return
+
+        capture_dir = Path(self._numeric_capture_dir)
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        req_state_indices = input_batch.idx_mapping[:num_reqs]
+        payload: dict[str, Any] = {
+            "schema": "vllm.dspark.numeric-inputs.v1",
+            "num_target_tokens": num_target_tokens,
+            "num_reqs": num_reqs,
+            "active_query_len": active_query_len,
+            "active_num_speculative_steps": active_num_speculative_steps,
+            "target_positions": self._capture_cpu(
+                input_batch.positions[:num_target_tokens]
+            ),
+            "target_query_start_loc": self._capture_cpu(
+                input_batch.query_start_loc[: num_reqs + 1]
+            ),
+            "request_state_indices": self._capture_cpu(req_state_indices),
+            "num_scheduled_tokens": torch.from_numpy(
+                input_batch.num_scheduled_tokens[:num_reqs].copy()
+            ),
+            "num_sampled": self._capture_cpu(num_sampled[:num_reqs]),
+            "num_rejected": self._capture_cpu(num_rejected[:num_reqs]),
+            "last_sampled": self._capture_cpu(last_sampled[req_state_indices]),
+            "next_prefill_tokens": self._capture_cpu(
+                next_prefill_tokens[req_state_indices]
+            ),
+            "last_hidden_states": self._capture_cpu(
+                last_hidden_states[:num_target_tokens]
+            ),
+            "combined_hidden_states": self._capture_cpu(
+                combined_hidden_states[:num_target_tokens]
+            ),
+        }
+        if aux_hidden_states is not None:
+            for layer_index, hidden_state in enumerate(aux_hidden_states):
+                payload[f"aux_hidden_states_{layer_index}"] = self._capture_cpu(
+                    hidden_state[:num_target_tokens]
+                )
+        torch.save(payload, capture_dir / "inputs.pt")
+        self._numeric_capture_pending = True
+
+    def _capture_numeric_prepared_inputs(
+        self,
+        *,
+        input_batch: InputBatch,
+        num_target_tokens: int,
+        num_reqs: int,
+        active_query_len: int,
+        active_num_speculative_steps: int,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> None:
+        if dummy_run or is_profile or not self._numeric_capture_pending:
+            return
+
+        capture_dir = Path(self._numeric_capture_dir)
+        num_query_tokens = num_reqs * active_query_len
+        num_sample_tokens = num_reqs * active_num_speculative_steps
+        payload: dict[str, Any] = {
+            "schema": "vllm.dspark.numeric-prepared-inputs.v1",
+            "draft_input_ids": self._capture_cpu(
+                self.input_buffers.input_ids[:num_query_tokens]
+            ),
+            "draft_positions": self._capture_cpu(
+                self.input_buffers.positions[:num_query_tokens]
+            ),
+            "draft_query_start_loc": self._capture_cpu(
+                self.input_buffers.query_start_loc[: num_reqs + 1]
+            ),
+            "draft_seq_lens": self._capture_cpu(
+                self.input_buffers.seq_lens[:num_reqs]
+            ),
+            "context_positions": self._capture_cpu(
+                self.context_positions[:num_target_tokens]
+            ),
+            "sample_indices": self._capture_cpu(
+                self.sample_indices[:num_sample_tokens]
+            ),
+            "sample_positions": self._capture_cpu(
+                self.sample_pos[:num_sample_tokens]
+            ),
+            "sample_request_state_indices": self._capture_cpu(
+                self.sample_idx_mapping[:num_sample_tokens]
+            ),
+        }
+        for group_index, group_id in enumerate(self.draft_kv_cache_group_ids):
+            payload[f"context_slot_mapping_{group_index}"] = self._capture_cpu(
+                self._context_slot_mappings[group_index][:num_target_tokens]
+            )
+            payload[f"query_slot_mapping_{group_index}"] = self._capture_cpu(
+                self.block_tables.slot_mappings[group_id][:num_query_tokens]
+            )
+            payload[f"block_table_{group_index}"] = self._capture_cpu(
+                self.block_tables.input_block_tables[group_id][:num_reqs]
+            )
+        torch.save(payload, capture_dir / "prepared.pt")
 
     def load_draft_model(
         self,
@@ -448,3 +589,23 @@ class DSparkSpeculator(DFlashSpeculator):
                 or num_reqs >= self.capacity_activation_batch_size
             ),
         )
+        if self._numeric_capture_pending:
+            num_sample_tokens = num_reqs * num_speculative_steps
+            capture_dir = Path(self._numeric_capture_dir)
+            torch.save(
+                {
+                    "schema": "vllm.dspark.numeric-outputs.v1",
+                    "head_hidden_states": self._capture_cpu(
+                        head_hidden[:num_tokens_padded]
+                    ),
+                    "sample_hidden_states": self._capture_cpu(
+                        head_hidden[self.sample_indices[:num_sample_tokens]]
+                    ),
+                    "draft_tokens": self._capture_cpu(
+                        self.draft_tokens[:num_reqs, :num_speculative_steps]
+                    ),
+                },
+                capture_dir / "outputs.pt",
+            )
+            self._numeric_capture_pending = False
+            self._numeric_capture_done = True
