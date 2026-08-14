@@ -6,11 +6,12 @@
 Rank-sliced routed-expert checkpoints use B12X's unified planned
 ``fused_moe`` API for the Trellis decode/prefill windows and the ExLlamaV3
 extension for the small eager parity window. Generic dense and non-rank-sliced
-MoE checkpoints use the
-bit-faithful ``exllamav3_ext.exl3_gemm`` parity path. Every logical checkpoint
-matrix is dispatched independently: vLLM's packed QKV and gate/up modules are
-not treated as one EXL3 matrix because each source matrix owns its Hadamard
-vectors and codebook marker.
+MoE checkpoints use the bit-faithful ``exllamav3_ext.exl3_gemm`` parity path.
+SQG-XOR-Cheb-T12 matrices use B12X's native dense and route-packed entry points.
+Every logical checkpoint matrix retains its own Hadamard vectors and codebook
+contract. A packed gate/up module may use one physical K6 launch only when both
+source matrices have the same input rotation and contiguous output extents;
+the output remains ordered as gate followed by up.
 
 Both dependencies are imported lazily. Importing this module, parsing
 checkpoint metadata, or compiling it with ``py_compile`` does not load either
@@ -23,6 +24,8 @@ import ctypes
 import dataclasses
 import gc
 import importlib
+import json
+import math
 import os
 import sys
 import zlib
@@ -37,6 +40,7 @@ from transformers import PretrainedConfig
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -90,11 +94,14 @@ logger = init_logger(__name__)
 
 _MCG_SENTINEL = 0xCBAC1FED
 _MUL1_SENTINEL = 0x83DCD12D
+_SQG_SENTINEL = 0x53514731  # ASCII "SQG1"
+_CODEBOOK_MARKERS = ("mcg", "mul1", "sqg")
 _HADAMARD_BLOCK = 128
 _EXL3_EXT: Any | None = None
 _B12X_FUSED_MOE_API: Any | None = None
 _B12X_MIXED_TRELLIS_API: Any | None = None
 _B12X_TRELLIS_LINEAR_API: Any | None = None
+_B12X_GLM_SQG_W4A8_API: Any | None = None
 _EXL3_ONLINE_QUANTIZER: Any | None = None
 _EXL3_ONLINE_WARMED_SIGNATURES: set[tuple[int, int, int, int]] = set()
 _B12X_TRELLIS_WARMED_DEVICES: set[int] = set()
@@ -111,6 +118,7 @@ _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_BUFFERS: dict[tuple[Any, ...], Any] = {}
 # The projection-wise mixed-bitrate fallback owns graph-stable runtime storage.
 _R7_GRAPH_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
+_GLM_SQG_W4A8_RUNTIMES: dict[tuple[Any, ...], Any] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
 _GLM52_MIXED_TRELLIS_PREFILL_BLOCK_SIZE = 32
@@ -121,6 +129,16 @@ _GLM52_MIXED_TRELLIS_BLOCK32_SIGNATURES = frozenset(
         ((3, 148), (4, 108)),
     }
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _SQGK6PackedGateUp:
+    """Persistent K6 storage for one gate/up projection launch."""
+
+    trellis: torch.Tensor
+    suh: torch.Tensor
+    svh: torch.Tensor
+    prepared: Any
 
 
 def _is_glm52_block32_tier_signature(
@@ -308,6 +326,66 @@ def _runtime_owner_token(quant_config: Any, layer: Any) -> tuple[int, bool]:
     return (_runtime_scope_id(quant_config), _is_draft_layer(layer))
 
 
+def _current_exl3_ubatch_id() -> int:
+    """Return the logical microbatch that owns mutable EXL3 scratch."""
+
+    from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+    return int(dbo_current_ubatch_id())
+
+
+_GLM_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_GLM_SQG_W4A8_EVIDENCE: dict[str, set[int]] = {
+    "loaded_layers": set(),
+    "executed_layers": set(),
+}
+
+
+def _record_glm_sqg_w4a8_evidence(event: str, layer_name: str) -> None:
+    """Atomically expose per-PP-rank native load/execution closure on request."""
+
+    root_value = os.environ.get("VLLM_GLM_SQG_W4A8_EVIDENCE_DIR")
+    if not root_value:
+        return
+    match = _GLM_LAYER_INDEX_RE.search(layer_name)
+    if match is None or event not in _GLM_SQG_W4A8_EVIDENCE:
+        raise ValueError(f"invalid GLM SQG W4A8 evidence event: {event}/{layer_name}")
+    layer = int(match.group(1))
+    observed = _GLM_SQG_W4A8_EVIDENCE[event]
+    if layer in observed:
+        return
+    observed.add(layer)
+    pp = get_pp_group()
+    pp_rank = int(pp.rank_in_group)
+    pp_size = int(pp.world_size)
+    root = Path(root_value).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise ValueError("GLM SQG W4A8 evidence root must not be a symlink")
+    value = {
+        "schema": "glm52-native-sqg-w4a8-rank-evidence-v1",
+        "complete": True,
+        "activation_endpoint": "full-w4a8",
+        "activation_endpoint_scope": "routed_experts",
+        "allow_a16_fallback": False,
+        "mcg_tensor_count": 0,
+        "tensor_parallel_size": int(get_tensor_model_parallel_world_size()),
+        "pipeline_parallel_size": pp_size,
+        "pipeline_parallel_rank": pp_rank,
+        "pid": os.getpid(),
+        "loaded_layers": sorted(_GLM_SQG_W4A8_EVIDENCE["loaded_layers"]),
+        "executed_layers": sorted(_GLM_SQG_W4A8_EVIDENCE["executed_layers"]),
+    }
+    destination = root / f"pp-{pp_rank:02d}-pid-{os.getpid()}.json"
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+
+
 def _runtime_scope_id(quant_config: Any) -> int:
     """Stable identity for the model that owns a rank-sliced runtime.
 
@@ -348,7 +426,7 @@ _SHARED_H_TENSOR_SCHEMA = (
 )
 _RANK_SLICED_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.+)\.rank(?P<rank>\d+)\."
-    r"(?P<field>trellis|suh|svh|mcg|mul1)$"
+    r"(?P<field>trellis|suh|svh|mcg|mul1|sqg)$"
 )
 _SHARED_H_WEIGHT_RE = re.compile(
     r"^(?P<experts_prefix>.+\.experts)\.shared_h\."
@@ -495,6 +573,39 @@ def _scratch_view(backing: torch.Tensor, spec: Any) -> torch.Tensor:
     for dim in spec.shape:
         nbytes *= int(dim)
     return backing.narrow(0, 0, nbytes).view(spec.dtype).view(tuple(spec.shape))
+
+
+def _load_b12x_trellis_linear() -> Any:
+    """Resolve the native SQG dense Trellis API lazily."""
+
+    global _B12X_TRELLIS_LINEAR_API
+    if _B12X_TRELLIS_LINEAR_API is not None:
+        return _B12X_TRELLIS_LINEAR_API
+    try:
+        from b12x.gemm import trellis_linear
+    except Exception as exc:
+        raise RuntimeError(
+            "SQG EXL3 tensors require b12x.gemm.trellis_linear from B12X "
+            "1.2.1 or newer."
+        ) from exc
+    _B12X_TRELLIS_LINEAR_API = trellis_linear
+    return trellis_linear
+
+
+def _load_b12x_glm_sqg_w4a8() -> Any:
+    """Resolve the mixed-rate route-packed GLM W4A8 API lazily."""
+
+    global _B12X_GLM_SQG_W4A8_API
+    if _B12X_GLM_SQG_W4A8_API is not None:
+        return _B12X_GLM_SQG_W4A8_API
+    try:
+        from b12x.moe import glm_sqg_w4a8
+    except Exception as exc:
+        raise RuntimeError(
+            "Mixed-rate GLM SQG tensors require the B12X atoms-v2 W4A8 API."
+        ) from exc
+    _B12X_GLM_SQG_W4A8_API = glm_sqg_w4a8
+    return glm_sqg_w4a8
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -950,8 +1061,117 @@ def _b12x_trellis_linear(
     return output
 
 
+@torch.library.custom_op(
+    "vllm::exl3_sqg_gemm",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _exl3_sqg_gemm(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+) -> torch.Tensor:
+    """Opaque torch op around B12X's native SQG-XOR-Cheb-T12 call."""
+
+    api = _load_b12x_trellis_linear()
+    weight = api.prepare_weight(
+        trellis,
+        suh,
+        svh,
+        codebook="sqg_xor_cheb_t12",
+        params_dtype=torch.float16,
+    )
+    return api.run(x, weight)
+
+
+@_exl3_sqg_gemm.register_fake
+def _exl3_sqg_gemm_fake(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+) -> torch.Tensor:
+    del suh, svh
+    return torch.empty(
+        (x.shape[0], trellis.shape[1] * 16),
+        dtype=torch.float16,
+        device=x.device,
+    )
+
+
+@torch.library.custom_op(
+    "vllm::exl3_sqg_k6_gemm_out",
+    mutates_args=("c_tmp", "output", "gemm_output", "rotated_f16"),
+    device_types="cuda",
+)
+def _exl3_sqg_k6_gemm_out(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    dummy_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    c_tmp: torch.Tensor,
+    output: torch.Tensor,
+    gemm_output: torch.Tensor,
+    rotated_f16: torch.Tensor,
+) -> None:
+    """Run the direct K6 SQG endpoint into caller-owned graph storage."""
+
+    api = _load_b12x_trellis_linear()
+    weight = api.prepare_weight(
+        trellis,
+        suh,
+        svh,
+        codebook="sqg_xor_cheb_t12",
+        params_dtype=torch.float16,
+        dummy_scale=dummy_scale,
+        global_scale=global_scale,
+        workspace=workspace,
+    )
+    api.run_sqg_k6_w6a16(
+        x,
+        weight,
+        output=output,
+        gemm_output=gemm_output,
+        c_tmp=c_tmp,
+        rotated_f16=rotated_f16,
+    )
+
+
+@_exl3_sqg_k6_gemm_out.register_fake
+def _exl3_sqg_k6_gemm_out_fake(
+    x: torch.Tensor,
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    dummy_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    c_tmp: torch.Tensor,
+    output: torch.Tensor,
+    gemm_output: torch.Tensor,
+    rotated_f16: torch.Tensor,
+) -> None:
+    del (
+        x,
+        trellis,
+        suh,
+        svh,
+        dummy_scale,
+        global_scale,
+        workspace,
+        c_tmp,
+        output,
+        gemm_output,
+        rotated_f16,
+    )
+
+
 class Exl3Config(QuantizationConfig):
-    """Configuration for modern and legacy EXL3 trellis checkpoints."""
+    """Configuration for EXL3 trellis checkpoint formats."""
 
     def __init__(
         self,
@@ -960,6 +1180,9 @@ class Exl3Config(QuantizationConfig):
         codebook: str | None = None,
         version: str | None = None,
         tensor_storage: dict[str, Any] | None = None,
+        glm_sqg_w4a8: dict[str, Any] | None = None,
+        sqg_k6_nonrouted: dict[str, Any] | None = None,
+        r7_routed_experts: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.bits = bits
@@ -967,6 +1190,9 @@ class Exl3Config(QuantizationConfig):
         self.codebook = codebook
         self.version = version
         self.tensor_storage = tensor_storage or {}
+        self.glm_sqg_w4a8 = glm_sqg_w4a8 or {}
+        self.sqg_k6_nonrouted = sqg_k6_nonrouted or {}
+        self.r7_routed_experts = r7_routed_experts or {}
         self._eager_checked = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
         self.rank_sliced_rotation_layout = _PER_EXPERT_ROTATION_LAYOUT
@@ -999,6 +1225,9 @@ class Exl3Config(QuantizationConfig):
             codebook=config.get("codebook"),
             version=config.get("version"),
             tensor_storage=config.get("tensor_storage"),
+            glm_sqg_w4a8=config.get("glm_sqg_w4a8"),
+            sqg_k6_nonrouted=config.get("sqg_k6_nonrouted"),
+            r7_routed_experts=config.get("r7_routed_experts"),
         )
         # Mixed-bitrate routed experts use the dedicated
         # `r7_routed_experts` metadata block rather than `tensor_storage`.
@@ -1006,8 +1235,12 @@ class Exl3Config(QuantizationConfig):
         if _r7 is not None:
             if not isinstance(_r7, dict):
                 raise ValueError("r7_routed_experts must be an object")
-            if _r7.get("schema") != "r7-complete-v2-checkpoint-v1":
-                raise ValueError(f"unsupported R7 EXL3 schema: {_r7.get('schema')!r}")
+            schema = _r7.get("schema")
+            if schema == "glm52-sqg-atoms-v2-routed-v1":
+                instance.r7_routed_experts = dict(_r7)
+                return instance
+            if schema != "r7-complete-v2-checkpoint-v1":
+                raise ValueError(f"unsupported R7 EXL3 schema: {schema!r}")
             if _r7.get("codebook") != "mcg" or _r7.get("bits") != "mixed_tensor":
                 raise ValueError(
                     "R7 EXL3 requires codebook='mcg' and bits='mixed_tensor'"
@@ -1057,7 +1290,10 @@ class Exl3Config(QuantizationConfig):
         if user_quant is not None and user_quant != "exl3":
             return None
         r7 = hf_quant_cfg.get("r7_routed_experts")
-        if isinstance(r7, dict) and r7.get("schema") == "r7-complete-v2-checkpoint-v1":
+        if isinstance(r7, dict) and r7.get("schema") in {
+            "r7-complete-v2-checkpoint-v1",
+            "glm52-sqg-atoms-v2-routed-v1",
+        }:
             return "exl3"
         metadata = getattr(hf_config, "hybrid_tr3_tail", None)
         if isinstance(metadata, dict) and metadata.get("format") == _RANK_SLICED_FORMAT:
@@ -1114,8 +1350,18 @@ class Exl3Config(QuantizationConfig):
             self.codebook = config.get("codebook", self.codebook)
             self.version = config.get("version", self.version)
             self.tensor_storage = config["tensor_storage"]
+            self.glm_sqg_w4a8 = config.get("glm_sqg_w4a8", self.glm_sqg_w4a8)
+            self.sqg_k6_nonrouted = config.get(
+                "sqg_k6_nonrouted", self.sqg_k6_nonrouted
+            )
+            self.r7_routed_experts = config.get(
+                "r7_routed_experts", self.r7_routed_experts
+            )
 
+        self._validate_r7_routed_experts_contract()
         self._validate_storage_metadata()
+        self._validate_sqg_k6_nonrouted_contract()
+        self._validate_glm_sqg_w4a8_contract()
         self._force_independent_lm_head(hf_config)
 
     def _configure_online_cache_identity(
@@ -1147,6 +1393,172 @@ class Exl3Config(QuantizationConfig):
             encoder_source,
             revision=os.getenv("VLLM_EXL3_ENCODER_REVISION"),
         )
+
+    def _validate_sqg_k6_nonrouted_contract(self) -> None:
+        contract = self.sqg_k6_nonrouted
+        if not contract:
+            return
+        expected = {
+            "bits": 6,
+            "codebook": "sqg_xor_cheb_t12",
+            "execution": "native_sqg_k6_w6a16",
+            "activation_endpoint": "a16",
+            "matrix_count": 380,
+        }
+        for name, value in expected.items():
+            if contract.get(name) != value:
+                raise ValueError(
+                    f"SQG K6 non-routed contract {name} must be {value!r}, got "
+                    f"{contract.get(name)!r}"
+                )
+        if contract.get("allow_mcg_fallback", False):
+            raise ValueError("SQG K6 non-routed execution forbids MCG fallback")
+        if contract.get("allow_bf16_weight_fallback", False):
+            raise ValueError("SQG K6 non-routed execution forbids BF16 weight fallback")
+
+    def _validate_glm_sqg_w4a8_contract(self) -> None:
+        contract = self.glm_sqg_w4a8
+        if not contract:
+            return
+        expected = {
+            "schema": "glm52_sqg_atoms_v2_w4a8_v1",
+            "execution": "full_w4a8",
+            "codebook": "sqg_xor_cheb_t12",
+            "rates": "independent_per_tensor_k3_k4",
+            "direct_e4m3_weights": True,
+            "allow_a16_fallback": False,
+            "activation": "silu_gate_times_up",
+            "topology": "topology_neutral",
+        }
+        for name, value in expected.items():
+            if contract.get(name) != value:
+                raise ValueError(
+                    f"GLM SQG W4A8 contract {name} must be {value!r}, got "
+                    f"{contract.get(name)!r}"
+                )
+
+        if contract.get("per_layer_bit_census") != {
+            "k3": 384,
+            "k4": 384,
+            "total": 768,
+        }:
+            raise ValueError("GLM SQG W4A8 requires 384 K3 and 384 K4 matrices")
+        parallel = contract.get("parallelism")
+        if not isinstance(parallel, dict):
+            raise ValueError("GLM SQG W4A8 requires parallelism metadata")
+        max_tokens = parallel.get("long_context_max_tokens")
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError(
+                "GLM SQG W4A8 long_context_max_tokens must be a positive integer"
+            )
+        for field in (
+            "mtp_num_speculative_tokens",
+            "max_num_batched_tokens",
+            "max_num_seqs",
+            "workspace_lanes",
+        ):
+            value = parallel.get(field)
+            if value is not None and (
+                type(value) is not int
+                or value <= 0
+                or (field == "workspace_lanes" and value > 4)
+            ):
+                raise ValueError(
+                    f"GLM SQG W4A8 parallelism {field} must be a positive integer"
+                )
+        targets = contract.get("down_targets")
+        expected_layers = {str(layer) for layer in range(3, 79)}
+        if not isinstance(targets, dict) or set(targets) != expected_layers:
+            raise ValueError(
+                "GLM SQG W4A8 requires one down target for every routed layer"
+            )
+        for layer_index, target in targets.items():
+            if not isinstance(target, dict):
+                raise ValueError(
+                    f"GLM SQG W4A8 layer {layer_index} target must be a map"
+                )
+            target_id = target.get("derived_down_target_id")
+            beta = target.get("down_target_beta")
+            if not isinstance(target_id, str) or not target_id:
+                raise ValueError(
+                    f"GLM SQG W4A8 layer {layer_index} requires derived_down_target_id"
+                )
+            if (
+                isinstance(beta, bool)
+                or not isinstance(beta, int | float)
+                or not math.isfinite(float(beta))
+            ):
+                raise ValueError(
+                    f"GLM SQG W4A8 layer {layer_index} requires finite down_target_beta"
+                )
+
+    def _validate_r7_routed_experts_contract(self) -> None:
+        r7 = self.r7_routed_experts
+        if not r7:
+            return
+        schema = r7.get("schema")
+        if schema == "r7-complete-v2-checkpoint-v1":
+            return
+        if schema != "glm52-sqg-atoms-v2-routed-v1":
+            raise ValueError(f"unsupported R7 EXL3 schema: {schema!r}")
+        for field, value in {
+            "codebook": "sqg_xor_cheb_t12",
+            "rotation_layout": "shared_h_v1",
+            "k_values": [3, 4],
+        }.items():
+            if r7.get(field) != value:
+                raise ValueError(
+                    f"GLM SQG routed contract {field} must be {value!r}, got "
+                    f"{r7.get(field)!r}"
+                )
+        if r7.get("moe_layers") != [3, 78]:
+            raise ValueError(
+                "GLM SQG routed contract must include target and MTP layers [3,78]"
+            )
+        if (
+            r7.get("gate_up_suh_template")
+            != "model.layers.{layer}.mlp.experts.r7_shared.gate_up_suh"
+            or r7.get("down_svh_template")
+            != "model.layers.{layer}.mlp.experts.r7_shared.down_svh"
+        ):
+            raise ValueError("GLM SQG routed shared-H tensor templates differ")
+
+    def _has_glm_sqg_w4a8_contract(self) -> bool:
+        return self.glm_sqg_w4a8.get("execution") == "full_w4a8"
+
+    def _routed_execution_mode(self, layer_name: str) -> str:
+        """Select one native routed-expert contract for a model layer.
+
+        SQG checkpoints retain the ``r7_routed_experts`` block because it
+        describes their mixed K3/K4 tensor inventory.  That inventory must not
+        select the projection-mixed R7 A16 endpoint when the checkpoint also
+        declares the full-W4A8 SQG contract.
+        """
+
+        if not self._r7_layer_range_contains(layer_name):
+            return "none"
+        if self._has_glm_sqg_w4a8_contract():
+            if not self.glm_sqg_layer_is_encoded(layer_name):
+                raise ValueError(
+                    f"{layer_name}: SQG routed metadata and layer range disagree"
+                )
+            return "sqg_w4a8"
+        return "r7_mixed"
+
+    def glm_sqg_layer_is_encoded(self, layer_name: str) -> bool:
+        """Return whether a routed layer must load native SQG W4A8 bytes."""
+
+        match = _GLM_LAYER_INDEX_RE.search(layer_name)
+        if match is None:
+            raise ValueError(f"cannot derive GLM layer index from {layer_name!r}")
+        return 3 <= int(match.group(1)) <= 78
+
+    def glm_sqg_down_target(self, layer_name: str) -> tuple[str, float]:
+        match = _GLM_LAYER_INDEX_RE.search(layer_name)
+        if match is None:
+            raise ValueError(f"cannot derive GLM layer index from {layer_name!r}")
+        target = self.glm_sqg_w4a8["down_targets"][match.group(1)]
+        return target["derived_down_target_id"], float(target["down_target_beta"])
 
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
         required = {
@@ -1314,15 +1726,29 @@ class Exl3Config(QuantizationConfig):
             stored = entry.get("stored_tensors", {})
             suffixes = {name.rsplit(".", 1)[-1] for name in stored}
             required = {"trellis"}
-            if not ({"suh", "su"} & suffixes):
+            shared_h = entry.get("shared_h_tensor")
+            shared_gate_up = (
+                isinstance(shared_h, str)
+                and shared_h.endswith(".r7_shared.gate_up_suh")
+                and prefix.endswith((".gate_proj", ".up_proj"))
+                and self._r7_layer_range_contains(prefix)
+            )
+            shared_down = (
+                isinstance(shared_h, str)
+                and shared_h.endswith(".r7_shared.down_svh")
+                and prefix.endswith(".down_proj")
+                and self._r7_layer_range_contains(prefix)
+            )
+            if not ({"suh", "su"} & suffixes) and not shared_gate_up:
                 required.add("suh|su")
-            if not ({"svh", "sv"} & suffixes):
+            if not ({"svh", "sv"} & suffixes) and not shared_down:
                 required.add("svh|sv")
             missing = [name for name in required if name not in suffixes]
             if missing:
                 bad.append(f"{prefix}: missing {','.join(sorted(missing))}")
-            if {"mcg", "mul1"} <= suffixes:
-                bad.append(f"{prefix}: both mcg and mul1 are present")
+            markers = sorted({"mcg", "mul1", "sqg"} & suffixes)
+            if len(markers) > 1:
+                bad.append(f"{prefix}: multiple codebooks are present: {markers}")
         if not exl3_count:
             raise ValueError("quantization_config.json has no EXL3 tensor records")
         if bad:
@@ -1350,7 +1776,7 @@ class Exl3Config(QuantizationConfig):
             )
 
     def _require_enforce_eager(self) -> None:
-        if self.rank_sliced_metadata is not None:
+        if self.rank_sliced_metadata is not None or self._has_glm_sqg_w4a8_contract():
             # The routed-expert fast path is eagerly planned before graph
             # capture. Only its large-M parity fallback remains eager.
             return
@@ -1589,6 +2015,8 @@ class Exl3Config(QuantizationConfig):
             return "mcg"
         if "mul1" in suffixes:
             return "mul1"
+        if "sqg" in suffixes:
+            return "sqg_xor_cheb_t12"
         return None
 
     def _r7_layer_range_contains(self, prefix: str) -> bool:
@@ -1620,16 +2048,19 @@ class Exl3Config(QuantizationConfig):
         # The checkpoint stores one hidden-side rotation per layer with no TP
         # rank segment. Expert zero is the canonical storage slot; the loader
         # aliases that tensor for the remaining experts.
-        if getattr(self, "r7_routed_experts", None) is not None:
-            _r7 = re.match(
-                r"^(?P<experts_prefix>.+\.experts)\.r7_shared\."
-                r"(?P<field>gate_up_suh|down_svh)$",
-                name,
-            )
-            if _r7 is not None:
-                if _r7.group("field") == "gate_up_suh":
-                    return f"{_r7.group('experts_prefix')}.0.gate_proj.suh"
-                return f"{_r7.group('experts_prefix')}.0.down_proj.svh"
+        shared = re.match(
+            r"^(?P<experts_prefix>.+\.experts)\.r7_shared\."
+            r"(?P<field>gate_up_suh|down_svh)$",
+            name,
+        )
+        if shared is not None:
+            if not getattr(self, "r7_routed_experts", None):
+                raise ValueError(
+                    "checkpoint contains r7_shared tensor without routed contract"
+                )
+            if shared.group("field") == "gate_up_suh":
+                return f"{shared.group('experts_prefix')}.0.gate_proj.suh"
+            return f"{shared.group('experts_prefix')}.0.down_proj.svh"
         if self.rank_sliced_metadata is None:
             return name
         shared_match = _SHARED_H_WEIGHT_RE.match(name)
@@ -1971,16 +2402,16 @@ class Exl3LinearMethod(LinearMethodBase):
             )
         }
 
-        # su/sv are legacy packed sign bitfields.  Modern checkpoints load
-        # suh/svh directly.
-        for name in ("suh", "svh", "su", "sv", "trellis", "mcg", "mul1"):
+        # Some EXL3 containers store packed sign bitfields as su/sv. Containers
+        # with materialized fp16 sign vectors store suh/svh directly.
+        for name in ("suh", "svh", "su", "sv", "trellis", *_CODEBOOK_MARKERS):
             layer.register_parameter(
                 name,
                 Exl3Parameter(weight_loader=_exl3_weight_loader),
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self._materialize_legacy_hadamard(layer)
+        self._materialize_packed_hadamard_signs(layer)
         missing: list[str] = []
         for attr in ("suh", "svh", "trellis"):
             param = getattr(layer, attr)
@@ -1989,15 +2420,17 @@ class Exl3LinearMethod(LinearMethodBase):
                     missing.append(f"{attr}[{shard_id!r}]")
         for shard_id in layer.exl3_shard_ids:
             expected = layer.exl3_expected_codebooks[shard_id]
-            has_mcg = shard_id in layer.mcg.exl3_tensors
-            has_mul1 = shard_id in layer.mul1.exl3_tensors
-            if has_mcg and has_mul1:
-                missing.append(f"codebook[{shard_id!r}]=both mcg and mul1")
-            elif expected == "mcg" and not has_mcg:
-                missing.append(f"mcg[{shard_id!r}]")
-            elif expected == "mul1" and not has_mul1:
-                missing.append(f"mul1[{shard_id!r}]")
-            elif expected is None and (has_mcg or has_mul1):
+            present = [
+                marker
+                for marker in _CODEBOOK_MARKERS
+                if shard_id in getattr(layer, marker).exl3_tensors
+            ]
+            expected_marker = "sqg" if expected == "sqg_xor_cheb_t12" else expected
+            if len(present) > 1:
+                missing.append(f"codebook[{shard_id!r}]={present}")
+            elif expected_marker is not None and present != [expected_marker]:
+                missing.append(f"{expected_marker}[{shard_id!r}]")
+            elif expected_marker is None and present:
                 missing.append(f"unexpected codebook[{shard_id!r}]")
         if missing:
             prefix = getattr(layer, "prefix", layer.__class__.__name__)
@@ -2014,7 +2447,7 @@ class Exl3LinearMethod(LinearMethodBase):
         # to the model target device.  Its device is the safest destination for
         # the tensors kept in the side dictionaries.
         device = layer.trellis.device
-        for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+        for attr in ("suh", "svh", "trellis", *_CODEBOOK_MARKERS):
             param = getattr(layer, attr)
             for shard_id, tensor in list(param.exl3_tensors.items()):
                 param.exl3_tensors[shard_id] = tensor.to(
@@ -2039,6 +2472,99 @@ class Exl3LinearMethod(LinearMethodBase):
             )
             _warm_b12x_trellis_device(trellis, suh, svh)
 
+        layer.exl3_sqg_k6_weights = {}
+        layer.exl3_sqg_k6_packed_gate_up = None
+        if self.quant_config.sqg_k6_nonrouted:
+            api = _load_b12x_trellis_linear()
+            packed_gate_up = self._prepare_sqg_k6_packed_gate_up(layer, api)
+            if packed_gate_up is not None:
+                layer.exl3_sqg_k6_packed_gate_up = packed_gate_up
+                self._release_sqg_k6_packed_sources(layer)
+                return
+            for shard_id in layer.exl3_shard_ids:
+                if shard_id not in layer.sqg.exl3_tensors:
+                    continue
+                trellis = layer.trellis.exl3_tensors[shard_id]
+                bits = int(trellis.shape[2]) // 16
+                if bits != 6:
+                    raise ValueError(
+                        "SQG K6 non-routed metadata requires every SQG linear "
+                        f"payload to use K6, got K{bits} for shard {shard_id!r}"
+                    )
+                layer.exl3_sqg_k6_weights[shard_id] = api.prepare_weight(
+                    trellis,
+                    layer.suh.exl3_tensors[shard_id],
+                    layer.svh.exl3_tensors[shard_id],
+                    codebook="sqg_xor_cheb_t12",
+                    params_dtype=torch.float16,
+                )
+
+    @staticmethod
+    def _prepare_sqg_k6_packed_gate_up(
+        layer: torch.nn.Module,
+        api: Any,
+    ) -> _SQGK6PackedGateUp | None:
+        """Combine compatible gate/up payloads into one K6 projection.
+
+        GLM shared experts store gate and up as separate logical matrices but
+        assign them one input Hadamard vector. Concatenating the native payload
+        along its output axis preserves both matrices exactly and lets the
+        dense kernel transform the input once. Packed modules with independent
+        input rotations retain the per-shard execution path.
+        """
+
+        prefix = str(getattr(layer, "prefix", ""))
+        shard_ids = list(getattr(layer, "exl3_shard_ids", ()))
+        if not prefix.endswith("gate_up_proj") or shard_ids != [0, 1]:
+            return None
+        if any(shard_id not in layer.sqg.exl3_tensors for shard_id in shard_ids):
+            return None
+
+        trellis_parts = [layer.trellis.exl3_tensors[index] for index in shard_ids]
+        logical_sizes = list(getattr(layer, "exl3_output_partition_sizes", ()))
+        if len(logical_sizes) != 2 or any(
+            int(trellis.shape[1]) * 16 != int(logical_size)
+            for trellis, logical_size in zip(trellis_parts, logical_sizes, strict=True)
+        ):
+            return None
+        if any(
+            trellis.ndim != 3
+            or int(trellis.shape[2]) != 96
+            or trellis.shape[0] != trellis_parts[0].shape[0]
+            for trellis in trellis_parts
+        ):
+            return None
+
+        suh_parts = [layer.suh.exl3_tensors[index] for index in shard_ids]
+        if suh_parts[0].shape != suh_parts[1].shape or not torch.equal(
+            suh_parts[0], suh_parts[1]
+        ):
+            return None
+        svh_parts = [layer.svh.exl3_tensors[index] for index in shard_ids]
+        trellis = torch.cat(trellis_parts, dim=1).contiguous()
+        svh = torch.cat(svh_parts, dim=0).contiguous()
+        suh = suh_parts[0]
+        prepared = api.prepare_weight(
+            trellis,
+            suh,
+            svh,
+            codebook="sqg_xor_cheb_t12",
+            params_dtype=torch.float16,
+        )
+        return _SQGK6PackedGateUp(
+            trellis=trellis,
+            suh=suh,
+            svh=svh,
+            prepared=prepared,
+        )
+
+    @staticmethod
+    def _release_sqg_k6_packed_sources(layer: torch.nn.Module) -> None:
+        """Release source shards after the packed K6 object takes ownership."""
+
+        for attr in ("suh", "svh", "trellis", *_CODEBOOK_MARKERS):
+            getattr(layer, attr).exl3_tensors.clear()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2048,14 +2574,68 @@ class Exl3LinearMethod(LinearMethodBase):
         original_shape = x.shape[:-1]
         original_dtype = x.dtype
         x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
-        outputs = [
-            self._apply_one(layer, x_2d, shard_id) for shard_id in layer.exl3_shard_ids
-        ]
-        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+        packed_gate_up = getattr(layer, "exl3_sqg_k6_packed_gate_up", None)
+        if packed_gate_up is not None:
+            output = self._run_sqg_k6_prepared(
+                x_2d,
+                packed_gate_up.trellis,
+                packed_gate_up.suh,
+                packed_gate_up.svh,
+                packed_gate_up.prepared,
+            )
+        else:
+            outputs = [
+                self._apply_one(layer, x_2d, shard_id)
+                for shard_id in layer.exl3_shard_ids
+            ]
+            output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
         if bias is not None:
             output = output + bias.to(dtype=output.dtype)
         output = output.reshape(*original_shape, output.shape[-1])
         return output if output.dtype == original_dtype else output.to(original_dtype)
+
+    @staticmethod
+    def _run_sqg_k6_prepared(
+        x: torch.Tensor,
+        trellis: torch.Tensor,
+        suh: torch.Tensor,
+        svh: torch.Tensor,
+        prepared: Any,
+    ) -> torch.Tensor:
+        """Execute one prepared SQG K6 matrix with graph-owned temporaries."""
+
+        api = _load_b12x_trellis_linear()
+        out_features = int(trellis.shape[1]) * 16
+        output = torch.empty(
+            (x.shape[0], out_features),
+            dtype=torch.float16,
+            device=x.device,
+        )
+        gemm_output = torch.empty_like(output)
+        rotated_f16 = torch.empty_like(x)
+        c_tmp = torch.empty(
+            api.sqg_k6_w6a16_scratch_elements(
+                int(x.shape[0]),
+                out_features,
+                device=x.device,
+            ),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        _exl3_sqg_k6_gemm_out(
+            x,
+            trellis,
+            suh,
+            svh,
+            prepared.scale,
+            prepared.global_scale,
+            prepared.workspace,
+            c_tmp,
+            output,
+            gemm_output,
+            rotated_f16,
+        )
+        return output
 
     @staticmethod
     def _unpack_signs(bitfield: torch.Tensor) -> torch.Tensor:
@@ -2073,7 +2653,7 @@ class Exl3LinearMethod(LinearMethodBase):
         )
 
     @classmethod
-    def _materialize_legacy_hadamard(cls, layer: torch.nn.Module) -> None:
+    def _materialize_packed_hadamard_signs(cls, layer: torch.nn.Module) -> None:
         for packed_name, half_name in (("su", "suh"), ("sv", "svh")):
             packed = getattr(layer, packed_name).exl3_tensors
             half = getattr(layer, half_name).exl3_tensors
@@ -2127,6 +2707,10 @@ class Exl3LinearMethod(LinearMethodBase):
             if shard_id in layer.mul1.exl3_tensors:
                 cls._validate_marker(
                     layer.mul1.exl3_tensors[shard_id], _MUL1_SENTINEL, "mul1"
+                )
+            if shard_id in layer.sqg.exl3_tensors:
+                cls._validate_marker(
+                    layer.sqg.exl3_tensors[shard_id], _SQG_SENTINEL, "sqg"
                 )
 
     @staticmethod
@@ -2239,11 +2823,11 @@ class Exl3LinearMethod(LinearMethodBase):
                 layer.exl3_expected_codebooks[idx] = layer.exl3_expected_codebooks[
                     tuple_id
                 ]
-                for marker in ("mcg", "mul1"):
+                for marker in _CODEBOOK_MARKERS:
                     tensors = getattr(layer, marker).exl3_tensors
                     if tuple_id in tensors:
                         tensors[idx] = tensors[tuple_id]
-            for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+            for attr in ("suh", "svh", "trellis", *_CODEBOOK_MARKERS):
                 getattr(layer, attr).exl3_tensors.pop(tuple_id, None)
             layer.exl3_expected_codebooks.pop(tuple_id, None)
 
@@ -2292,28 +2876,38 @@ class Exl3LinearMethod(LinearMethodBase):
             )
         if x.shape[-1] < packed_k:
             x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
-        has_mcg = shard_id in layer.mcg.exl3_tensors
-        has_mul1 = shard_id in layer.mul1.exl3_tensors
-        if _b12x_trellis_k6_supported(
-            trellis,
-            has_mcg=has_mcg,
-            has_mul1=has_mul1,
-        ):
-            output = _b12x_trellis_linear(
+        suh = layer.suh.exl3_tensors[shard_id]
+        svh = layer.svh.exl3_tensors[shard_id]
+        sqg_k6_weights = getattr(layer, "exl3_sqg_k6_weights", {})
+        if shard_id in sqg_k6_weights:
+            prepared = sqg_k6_weights[shard_id]
+            output = Exl3LinearMethod._run_sqg_k6_prepared(
                 x,
                 trellis,
-                layer.suh.exl3_tensors[shard_id],
-                layer.svh.exl3_tensors[shard_id],
+                suh,
+                svh,
+                prepared,
             )
+        elif shard_id in layer.sqg.exl3_tensors:
+            output = _exl3_sqg_gemm(x, trellis, suh, svh)
         else:
-            output = _exl3_gemm(
-                x,
+            has_mcg = shard_id in layer.mcg.exl3_tensors
+            has_mul1 = shard_id in layer.mul1.exl3_tensors
+            if _b12x_trellis_k6_supported(
                 trellis,
-                layer.suh.exl3_tensors[shard_id],
-                layer.svh.exl3_tensors[shard_id],
-                has_mcg,
-                has_mul1,
-            )
+                has_mcg=has_mcg,
+                has_mul1=has_mul1,
+            ):
+                output = _b12x_trellis_linear(x, trellis, suh, svh)
+            else:
+                output = _exl3_gemm(
+                    x,
+                    trellis,
+                    suh,
+                    svh,
+                    has_mcg,
+                    has_mul1,
+                )
         logical_n = Exl3LinearMethod._output_shard_size(layer, shard_id)
         if output.shape[-1] < logical_n:
             raise ValueError(
@@ -2460,6 +3054,62 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.quant_config = quant_config
 
+    def _validate_glm_sqg_engine_contract(
+        self,
+        layer: RoutedExperts,
+        vllm_config: Any | None,
+    ) -> None:
+        """Validate runtime properties that affect SQG tensor interpretation."""
+
+        if not self.quant_config._has_glm_sqg_w4a8_contract():
+            return
+        layer.exl3_is_draft = False
+        layer.exl3_num_ubatches = 1
+        parallel = self.quant_config.glm_sqg_w4a8["parallelism"]
+        actual_tp = int(layer.exl3_tp_size)
+        if actual_tp <= 0 or 2048 % actual_tp:
+            raise ValueError(
+                "GLM SQG W4A8 requires TP to divide the 2048-wide routed "
+                f"intermediate dimension, got TP={actual_tp}"
+            )
+        if vllm_config is None:
+            return
+        layer.exl3_is_draft = (
+            getattr(vllm_config.model_config, "runner_type", None) == "draft"
+        )
+        layer.exl3_num_ubatches = (
+            2 if bool(getattr(vllm_config.parallel_config, "enable_dbo", False)) else 1
+        )
+        actual_dcp = int(vllm_config.parallel_config.decode_context_parallel_size)
+        if actual_dcp <= 0 or actual_tp % actual_dcp:
+            raise ValueError(
+                "GLM SQG W4A8 requires DCP to divide TP, got "
+                f"TP={actual_tp}, DCP={actual_dcp}"
+            )
+
+        supported_max_len = int(parallel["long_context_max_tokens"])
+        actual_max_len = int(vllm_config.model_config.max_model_len)
+        if actual_max_len > supported_max_len:
+            raise ValueError(
+                "GLM SQG W4A8 runtime max_model_len exceeds checkpoint metadata: "
+                f"runtime={actual_max_len}, supported={supported_max_len}"
+            )
+
+        speculative = vllm_config.speculative_config
+        mtp_tokens = 0
+        if speculative is not None:
+            if getattr(speculative, "method", None) != "mtp":
+                raise ValueError(
+                    "GLM SQG W4A8 supports model-backed MTP speculation only"
+                )
+            mtp_tokens = int(speculative.num_speculative_tokens)
+
+        scheduler = vllm_config.scheduler_config
+        layer.exl3_dcp_size = actual_dcp
+        layer.exl3_mtp_num_speculative_tokens = mtp_tokens
+        layer.exl3_max_model_len = actual_max_len
+        layer.exl3_max_num_seqs = int(scheduler.max_num_seqs)
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -2476,7 +3126,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         if self.moe.moe_parallel_config.use_ep:
             raise NotImplementedError(
-                "EXL3 correctness MoE currently supports TP but not expert parallelism"
+                "EXL3 correctness MoE supports tensor parallelism but not expert "
+                "parallelism"
             )
         if self.moe.has_bias:
             raise NotImplementedError(
@@ -2487,12 +3138,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
-        rank_sliced_metadata = self.quant_config.rank_sliced_metadata
-        # The checkpoint's routed-expert metadata selects this path; no
-        # serving-time switch is required.
-        layer.exl3_r7_graph = self.quant_config._r7_layer_range_contains(
+        vllm_config = get_current_vllm_config_or_none()
+        scheduler_config = (
+            vllm_config.scheduler_config if vllm_config is not None else None
+        )
+        layer.exl3_max_num_batched_tokens = int(
+            getattr(scheduler_config, "max_num_batched_tokens", 4096)
+        )
+        self._validate_glm_sqg_engine_contract(layer, vllm_config)
+        routed_execution = self.quant_config._routed_execution_mode(
             str(layer.layer_name)
         )
+        layer.exl3_shared_h_rotations = routed_execution != "none"
+        rank_sliced_metadata = self.quant_config.rank_sliced_metadata
+        # Only the projection-mixed R7 contract uses the mixed-Trellis
+        # graph runtime. SQG checkpoints use their full-W4A8 runtime while
+        # retaining the same stream-time TP slicing of checkpoint payloads.
+        layer.exl3_r7_graph = routed_execution == "r7_mixed"
         # Plan the mixed-bitrate staging arena from the scheduler's maximum
         # token batch while model-construction config is available. Profile and
         # CUDA graph capture run after this config context has exited.
@@ -2520,7 +3182,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # and slicing only after the loader has exhausted the checkpoint.
         # At TP4 that changes the peak from the full ~320 GiB expert payload
         # per rank to its local quarter and is required for 96 GiB GPUs.
-        r7_stream_tp = layer.exl3_r7_graph and layer.exl3_tp_size > 1
+        r7_stream_tp = routed_execution != "none" and layer.exl3_tp_size > 1
         layer.exl3_r7_stream_tp_sliced = r7_stream_tp
         r7_slice_start = layer.exl3_tp_rank * layer.exl3_intermediate_size_per_partition
         r7_slice_size = layer.exl3_intermediate_size_per_partition
@@ -2562,10 +3224,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "rank-sliced EXL3 expert count does not match the model: "
                     f"checkpoint={expected_experts}, model={num_experts}"
                 )
-            vllm_config = get_current_vllm_config_or_none()
-            scheduler_config = (
-                vllm_config.scheduler_config if vllm_config is not None else None
-            )
             # No silent fallback: a wrong capacity here puts the target and the
             # rank-sliced MTP draft on different plans with no error, which is
             # exactly the class of mismatch that corrupts only at scale.
@@ -2599,7 +3257,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
-            for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
+            for suffix in ("suh", "svh", "trellis", *_CODEBOOK_MARKERS):
                 shared_parameter = shared_h and (
                     (prefix == "w13" and suffix == "suh")
                     or (prefix == "w2" and suffix == "svh")
@@ -2673,7 +3331,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self._shard_tensors_for_tensor_parallel(layer)
         device = layer.w13_trellis.device
         for prefix in ("w13", "w2"):
-            for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+            for attr in ("suh", "svh", "trellis", *_CODEBOOK_MARKERS):
                 param = getattr(layer, f"{prefix}_{attr}")
                 for key, tensor in list(param.exl3_tensors.items()):
                     param.exl3_tensors[key] = tensor.to(
@@ -2704,9 +3362,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             import torch as _t
 
             _out = [
-                f"R7DBG {layer.layer_name} rank={layer.exl3_tp_rank} "
-                f"shared_h={getattr(layer, 'exl3_shared_h_rotations', None)} "
-                f"rank_sliced={_rs} local_experts={layer.local_num_experts}"
+                (
+                    f"R7DBG {layer.layer_name} rank={layer.exl3_tp_rank} "
+                    f"shared_h={getattr(layer, 'exl3_shared_h_rotations', None)} "
+                    f"rank_sliced={_rs} local_experts={layer.local_num_experts}"
+                )
             ]
             for _g, _a, _k in (
                 ("w13", "suh", (0, "w1")),
@@ -2727,6 +3387,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         f"dtype={_tt.dtype} sum={_v.sum().item():.6f}"
                     )
             print(chr(10).join(_out), flush=True)
+        if self._is_mixed_sqg_k34_layer(layer):
+            if not self.quant_config._has_glm_sqg_w4a8_contract():
+                raise ValueError(
+                    "Mixed K3/K4 SQG expert tensors require the explicit "
+                    "glm_sqg_w4a8 contract; A16 fallback is not permitted"
+                )
+            if not self.quant_config.glm_sqg_layer_is_encoded(layer.layer_name):
+                raise ValueError(
+                    f"{layer.layer_name}: SQG bytes are outside routed layers 3..78"
+                )
+            self._prepare_glm_sqg_w4a8_weights(layer)
+            return
         if getattr(layer, "exl3_r7_graph", False):
             # Prefer the native two- or three-tier B12X mixed-Trellis kernel.
             if _r7_fused_enabled() and self._prepare_r7_b12x_weights(layer):
@@ -2737,6 +3409,120 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if _rs:
             self._prepare_rank_sliced_weights(layer)
             return
+
+    @staticmethod
+    def _is_mixed_sqg_k34_layer(layer: RoutedExperts) -> bool:
+        """True only when every logical expert tensor is native SQG K3/K4."""
+
+        observed_bits: set[int] = set()
+        for expert_id in range(layer.local_num_experts):
+            for group, shard_id in (
+                ("w13", "w1"),
+                ("w13", "w3"),
+                ("w2", "w2"),
+            ):
+                key = (expert_id, shard_id)
+                if key not in getattr(layer, f"{group}_sqg").exl3_tensors:
+                    return False
+                bits = int(
+                    getattr(layer, f"{group}_trellis").exl3_tensors[key].shape[2] // 16
+                )
+                if bits not in (3, 4):
+                    return False
+                observed_bits.add(bits)
+        return observed_bits == {3, 4}
+
+    @staticmethod
+    def _shared_vector(
+        layer: RoutedExperts,
+        *,
+        group: str,
+        attr: str,
+        shard_ids: tuple[str, ...],
+    ) -> torch.Tensor:
+        tensors = getattr(layer, f"{group}_{attr}").exl3_tensors
+        first = tensors[(0, shard_ids[0])]
+        for expert_id in range(layer.local_num_experts):
+            for shard_id in shard_ids:
+                current = tensors[(expert_id, shard_id)]
+                if not torch.equal(current, first):
+                    raise ValueError(
+                        "GLM SQG atoms-v2 topology requires one byte-identical "
+                        f"shared {group}_{attr} vector"
+                    )
+        return first
+
+    def _prepare_glm_sqg_w4a8_weights(self, layer: RoutedExperts) -> None:
+        """Build six rate pools after TP-local intermediate-axis resharing."""
+
+        api = _load_b12x_glm_sqg_w4a8()
+        experts = int(layer.local_num_experts)
+
+        def projection(group: str, shard_id: str):
+            tensors = getattr(layer, f"{group}_trellis").exl3_tensors
+            values = [tensors[(expert, shard_id)] for expert in range(experts)]
+            bits = [int(value.shape[2]) // 16 for value in values]
+            return values, bits
+
+        gate_trellis, gate_bits = projection("w13", "w1")
+        up_trellis, up_bits = projection("w13", "w3")
+        down_trellis, down_bits = projection("w2", "w2")
+        gate_up_suh = self._shared_vector(
+            layer,
+            group="w13",
+            attr="suh",
+            shard_ids=("w1", "w3"),
+        )
+        down_svh = self._shared_vector(
+            layer,
+            group="w2",
+            attr="svh",
+            shard_ids=("w2",),
+        )
+        gate_svh = torch.stack(
+            [layer.w13_svh.exl3_tensors[(expert, "w1")] for expert in range(experts)]
+        ).contiguous()
+        up_svh = torch.stack(
+            [layer.w13_svh.exl3_tensors[(expert, "w3")] for expert in range(experts)]
+        ).contiguous()
+        down_suh = torch.stack(
+            [layer.w2_suh.exl3_tensors[(expert, "w2")] for expert in range(experts)]
+        ).contiguous()
+        local_intermediate = int(layer.exl3_intermediate_size_per_partition)
+        target_id, target_beta = self.quant_config.glm_sqg_down_target(layer.layer_name)
+        layer.exl3_glm_sqg_w4a8_weights = api.prepare_weights(
+            gate_trellis=gate_trellis,
+            gate_bits=gate_bits,
+            up_trellis=up_trellis,
+            up_bits=up_bits,
+            down_trellis=down_trellis,
+            down_bits=down_bits,
+            gate_up_suh=gate_up_suh,
+            gate_svh=gate_svh,
+            up_svh=up_svh,
+            down_suh=down_suh,
+            down_svh=down_svh,
+            hidden_size=int(layer.exl3_hidden_size),
+            intermediate_size=local_intermediate,
+            global_intermediate_size=local_intermediate * int(layer.exl3_tp_size),
+            tp_rank=int(layer.exl3_tp_rank),
+            tp_size=int(layer.exl3_tp_size),
+            derived_down_target_id=target_id,
+            down_target_beta=target_beta,
+        )
+        _record_glm_sqg_w4a8_evidence("loaded_layers", layer.layer_name)
+        self._release_glm_sqg_source_tensors(layer)
+
+    @staticmethod
+    def _release_glm_sqg_source_tensors(layer: RoutedExperts) -> None:
+        """Transfer ownership from per-expert loader tensors to prepared pools."""
+
+        for prefix in ("w13", "w2"):
+            for attr in ("suh", "svh", "trellis", *_CODEBOOK_MARKERS):
+                parameter = getattr(layer, f"{prefix}_{attr}")
+                parameter.exl3_tensors.clear()
+                if hasattr(parameter, "exl3_backing"):
+                    parameter.exl3_backing = None
 
     def _validate_codebooks(self, layer: RoutedExperts) -> None:
         projections = {
@@ -2750,29 +3536,39 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 expected = self.quant_config.codebook_for_prefix(prefix)
                 group = "w2" if shard_id == "w2" else "w13"
                 key = (expert_id, shard_id)
-                has_mcg = key in getattr(layer, f"{group}_mcg").exl3_tensors
-                has_mul1 = key in getattr(layer, f"{group}_mul1").exl3_tensors
-                if has_mcg and has_mul1:
-                    raise ValueError(f"EXL3 MoE {prefix} has both codebooks")
-                if expected == "mcg" and not has_mcg:
-                    raise ValueError(f"EXL3 MoE {prefix} is missing mcg")
-                if expected == "mul1" and not has_mul1:
-                    raise ValueError(f"EXL3 MoE {prefix} is missing mul1")
-                if expected is None and (has_mcg or has_mul1):
+                present = [
+                    marker
+                    for marker in _CODEBOOK_MARKERS
+                    if key in getattr(layer, f"{group}_{marker}").exl3_tensors
+                ]
+                expected_marker = "sqg" if expected == "sqg_xor_cheb_t12" else expected
+                if len(present) > 1:
+                    raise ValueError(
+                        f"EXL3 MoE {prefix} has multiple codebooks: {present}"
+                    )
+                if expected_marker is not None and present != [expected_marker]:
+                    raise ValueError(f"EXL3 MoE {prefix} is missing {expected_marker}")
+                if expected_marker is None and present:
                     raise ValueError(
                         f"EXL3 MoE {prefix} has an unexpected codebook marker"
                     )
-                if has_mcg:
+                if present == ["mcg"]:
                     Exl3LinearMethod._validate_marker(
                         getattr(layer, f"{group}_mcg").exl3_tensors[key],
                         _MCG_SENTINEL,
                         "mcg",
                     )
-                if has_mul1:
+                if present == ["mul1"]:
                     Exl3LinearMethod._validate_marker(
                         getattr(layer, f"{group}_mul1").exl3_tensors[key],
                         _MUL1_SENTINEL,
                         "mul1",
+                    )
+                if present == ["sqg"]:
+                    Exl3LinearMethod._validate_marker(
+                        getattr(layer, f"{group}_sqg").exl3_tensors[key],
+                        _SQG_SENTINEL,
+                        "sqg",
                     )
 
     @classmethod
@@ -2962,7 +3758,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         }
         if len(tiers) != 2:
             raise ValueError(
-                "the one-grid mixed Trellis path currently requires exactly two "
+                "the one-grid mixed Trellis path requires exactly two "
                 f"bitrates, got {tuple(tiers)}"
             )
 
@@ -3264,6 +4060,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     @property
     def topk_indices_dtype(self) -> torch.dtype | None:
+        if self.quant_config._has_glm_sqg_w4a8_contract():
+            return torch.int32
         return torch.long
 
     def _mixed_rank_sliced_runtime(
@@ -4294,6 +5092,105 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             output[start:stop].copy_(out32)
         return output
 
+    def _glm_sqg_w4a8_runtime(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> Any:
+        """Return one graph-stable scratch arena shared by target layers."""
+
+        max_batched_tokens = max(
+            int(layer.exl3_max_num_batched_tokens),
+            int(x.shape[0]),
+        )
+        num_ubatches = int(getattr(layer, "exl3_num_ubatches", 1))
+        if num_ubatches not in (1, 2):
+            raise ValueError(
+                "GLM SQG W4A8 supports one scheduler batch or two DBO "
+                f"microbatches, got {num_ubatches}"
+            )
+        api = _load_b12x_glm_sqg_w4a8()
+        device_index = x.device.index
+        key = (
+            _runtime_owner_token(self.quant_config, layer),
+            device_index,
+            x.dtype,
+            int(layer.exl3_hidden_size),
+            int(layer.exl3_intermediate_size_per_partition),
+            int(layer.local_num_experts),
+            int(topk_ids.shape[1]),
+            max_batched_tokens,
+            num_ubatches,
+        )
+        pool = _GLM_SQG_W4A8_RUNTIMES.get(key)
+        if pool is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GLM SQG W4A8 runtime must be planned during the eager "
+                    "profile pass before CUDA graph capture"
+                )
+            pool = {
+                "runtimes": tuple(
+                    api.prepare_runtime(
+                        layer.exl3_glm_sqg_w4a8_weights,
+                        max_tokens=max_batched_tokens,
+                        topk=int(topk_ids.shape[1]),
+                        output_dtype=x.dtype,
+                    )
+                    for _ in range(num_ubatches)
+                ),
+            }
+            _GLM_SQG_W4A8_RUNTIMES[key] = pool
+            logger.info_once(
+                "GLM SQG full-W4A8 runtime planned: capacity=%d topk=%d "
+                "ubatches=%d TP=%d rank=%d local_intermediate=%d direct-E4M3, "
+                "no A16 fallback",
+                max_batched_tokens,
+                int(topk_ids.shape[1]),
+                num_ubatches,
+                int(layer.exl3_tp_size),
+                int(layer.exl3_tp_rank),
+                int(layer.exl3_intermediate_size_per_partition),
+            )
+
+        # CUDA graph capture may use a different temporary stream for every
+        # graph shape. Those streams execute one logical target or draft owner
+        # at a time and must retain the same arena addresses. DBO microbatches
+        # are the only concurrently live executions and therefore own distinct
+        # arenas.
+        ubatch_id = _current_exl3_ubatch_id()
+        if not 0 <= ubatch_id < len(pool["runtimes"]):
+            raise RuntimeError(
+                "GLM SQG W4A8 received an unplanned DBO microbatch: "
+                f"id={ubatch_id}, planned={len(pool['runtimes'])}"
+            )
+        return pool["runtimes"][ubatch_id]
+
+    def _apply_glm_sqg_w4a8(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        api = _load_b12x_glm_sqg_w4a8()
+        runtime = self._glm_sqg_w4a8_runtime(layer, x, topk_ids)
+        if int(x.shape[0]) > int(runtime.max_tokens):
+            raise ValueError(
+                "GLM SQG W4A8 batch exceeds planned capacity: "
+                f"m={int(x.shape[0])}, capacity={int(runtime.max_tokens)}"
+            )
+        output = api.run(
+            x,
+            topk_weights.to(torch.float32).contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            layer.exl3_glm_sqg_w4a8_weights,
+            runtime,
+        )
+        _record_glm_sqg_w4a8_evidence("executed_layers", layer.layer_name)
+        return output
+
     def _rank_sliced_runtime(
         self,
         layer: RoutedExperts,
@@ -4730,6 +5627,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         ):
             output = self._apply_rank_sliced(layer, x_2d, weights, ids)
             return output.reshape(*original_shape, output.shape[-1])
+        if hasattr(layer, "exl3_glm_sqg_w4a8_weights"):
+            output = self._apply_glm_sqg_w4a8(layer, x_2d, weights, ids)
+            return output.reshape(*original_shape, output.shape[-1])
         if getattr(layer, "exl3_r7_fused", False):
             # The prepared mapping implements the mixed-Trellis launch contract,
             # including graph-stable scratch and prefill capacity planning.
@@ -4794,14 +5694,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         if x.shape[-1] < packed_k:
             x = torch.nn.functional.pad(x, (0, packed_k - x.shape[-1]))
-        output = _exl3_gemm(
-            x,
-            trellis,
-            getattr(layer, f"{group}_suh").exl3_tensors[key],
-            getattr(layer, f"{group}_svh").exl3_tensors[key],
-            key in getattr(layer, f"{group}_mcg").exl3_tensors,
-            key in getattr(layer, f"{group}_mul1").exl3_tensors,
-        )
+        suh = getattr(layer, f"{group}_suh").exl3_tensors[key]
+        svh = getattr(layer, f"{group}_svh").exl3_tensors[key]
+        if key in getattr(layer, f"{group}_sqg").exl3_tensors:
+            output = _exl3_sqg_gemm(x, trellis, suh, svh)
+        else:
+            output = _exl3_gemm(
+                x,
+                trellis,
+                suh,
+                svh,
+                key in getattr(layer, f"{group}_mcg").exl3_tensors,
+                key in getattr(layer, f"{group}_mul1").exl3_tensors,
+            )
         logical_n = (
             layer.hidden_size
             if shard_id == "w2"

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import json
 import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -62,6 +63,42 @@ def _set_online_overlay(monkeypatch, args: QuantizationConfigArgs) -> object:
 
 def _mock_linear() -> Mock:
     return Mock(spec=LinearBase)
+
+
+def test_glm_sqg_evidence_records_process_local_layer_closure(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_GLM_SQG_W4A8_EVIDENCE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        exl3_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=1, world_size=2),
+    )
+    monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_world_size", lambda: 4)
+    for observed in exl3_module._GLM_SQG_W4A8_EVIDENCE.values():
+        observed.clear()
+
+    try:
+        exl3_module._record_glm_sqg_w4a8_evidence(
+            "loaded_layers", "model.layers.3.mlp.experts"
+        )
+        exl3_module._record_glm_sqg_w4a8_evidence(
+            "executed_layers", "model.layers.3.mlp.experts"
+        )
+        exl3_module._record_glm_sqg_w4a8_evidence(
+            "loaded_layers", "model.layers.4.mlp.experts"
+        )
+
+        evidence_path = next(tmp_path.glob("pp-01-pid-*.json"))
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert evidence["schema"] == "glm52-native-sqg-w4a8-rank-evidence-v1"
+        assert evidence["tensor_parallel_size"] == 4
+        assert evidence["pipeline_parallel_size"] == 2
+        assert evidence["pipeline_parallel_rank"] == 1
+        assert evidence["loaded_layers"] == [3, 4]
+        assert evidence["executed_layers"] == [3]
+        assert not tuple(tmp_path.glob(".*.tmp"))
+    finally:
+        for observed in exl3_module._GLM_SQG_W4A8_EVIDENCE.values():
+            observed.clear()
 
 
 def test_exl3_online_overlay_quantizes_only_bf16_dense_and_shared(monkeypatch):
@@ -309,6 +346,283 @@ def test_exl3_online_trellis_cache_hit_skips_encoder(monkeypatch):
     assert captured["device"] == torch.device("cpu")
     assert layer.weight.numel() == 0
     assert layer.exl3_online_trellis_weight is tensors["trellis"]
+
+
+def _sqg_k6_nonrouted_contract(**overrides):
+    contract = {
+        "bits": 6,
+        "codebook": "sqg_xor_cheb_t12",
+        "execution": "native_sqg_k6_w6a16",
+        "activation_endpoint": "a16",
+        "matrix_count": 380,
+    }
+    contract.update(overrides)
+    return contract
+
+
+def test_sqg_k6_nonrouted_contract_is_hydrated_and_validated():
+    contract = _sqg_k6_nonrouted_contract()
+    config = Exl3Config.from_config({"sqg_k6_nonrouted": contract})
+
+    config._validate_sqg_k6_nonrouted_contract()
+
+    assert config.sqg_k6_nonrouted == contract
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("bits", 5),
+        ("codebook", "mcg"),
+        ("execution", "w4a16"),
+        ("activation_endpoint", "a8"),
+        ("matrix_count", 379),
+        ("allow_mcg_fallback", True),
+        ("allow_bf16_weight_fallback", True),
+    ),
+)
+def test_sqg_k6_nonrouted_contract_fails_closed(field, value):
+    config = Exl3Config(sqg_k6_nonrouted=_sqg_k6_nonrouted_contract(**{field: value}))
+
+    with pytest.raises(ValueError):
+        config._validate_sqg_k6_nonrouted_contract()
+
+
+def test_sqg_k6_linear_uses_caller_owned_custom_op_storage(monkeypatch):
+    x = torch.randn((3, 128), dtype=torch.float16)
+    trellis = torch.zeros((8, 8, 96), dtype=torch.int16)
+    scale = torch.ones(128, dtype=torch.float16)
+    prepared = SimpleNamespace(
+        scale=torch.zeros(4, dtype=torch.uint8),
+        global_scale=torch.ones(1, dtype=torch.float32),
+        workspace=torch.zeros(1024, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        trellis=SimpleNamespace(exl3_tensors={None: trellis}),
+        suh=SimpleNamespace(exl3_tensors={None: scale}),
+        svh=SimpleNamespace(exl3_tensors={None: scale.clone()}),
+        sqg=SimpleNamespace(exl3_tensors={None: torch.tensor(0x53514731)}),
+        mcg=SimpleNamespace(exl3_tensors={}),
+        mul1=SimpleNamespace(exl3_tensors={}),
+        exl3_sqg_k6_weights={None: prepared},
+        exl3_output_partition_sizes=[128],
+        exl3_shard_ids=[None],
+    )
+    observed = {}
+
+    def fake_k6_out(*args):
+        observed["args"] = args
+        c_tmp, output, gemm_output, rotated = args[-4:]
+        assert c_tmp.shape == (257,)
+        assert c_tmp.dtype == torch.float32
+        assert output.shape == (3, 128)
+        assert gemm_output.shape == output.shape
+        assert rotated.shape == x.shape
+        output.fill_(7)
+
+    monkeypatch.setattr(exl3_module, "_exl3_sqg_k6_gemm_out", fake_k6_out)
+    monkeypatch.setattr(
+        exl3_module,
+        "_load_b12x_trellis_linear",
+        lambda: SimpleNamespace(
+            sqg_k6_w6a16_scratch_elements=lambda *args, **kwargs: 257
+        ),
+    )
+
+    output = Exl3LinearMethod._apply_one(layer, x, None)
+
+    assert torch.equal(output, torch.full_like(output, 7))
+    assert observed["args"][4] is prepared.scale
+    assert observed["args"][5] is prepared.global_scale
+    assert observed["args"][6] is prepared.workspace
+    assert observed["args"][7].shape == (257,)
+
+
+def _sqg_k6_packed_gate_up_layer(*, shared_suh: bool = True):
+    gate_trellis = torch.arange(8 * 8 * 96, dtype=torch.int32).to(torch.int16)
+    gate_trellis = gate_trellis.reshape(8, 8, 96)
+    up_trellis = (gate_trellis.to(torch.int32) + 17).to(torch.int16)
+    gate_suh = torch.ones(128, dtype=torch.float16)
+    up_suh = gate_suh if shared_suh else -gate_suh
+    gate_svh = torch.arange(128, dtype=torch.float16)
+    up_svh = gate_svh + 1
+    marker = torch.tensor(0x53514731, dtype=torch.int32)
+    empty = SimpleNamespace(exl3_tensors={})
+    return SimpleNamespace(
+        prefix="model.layers.3.mlp.shared_experts.gate_up_proj",
+        exl3_shard_ids=[0, 1],
+        exl3_output_partition_sizes=[128, 128],
+        trellis=SimpleNamespace(exl3_tensors={0: gate_trellis, 1: up_trellis}),
+        suh=SimpleNamespace(exl3_tensors={0: gate_suh, 1: up_suh}),
+        svh=SimpleNamespace(exl3_tensors={0: gate_svh, 1: up_svh}),
+        sqg=SimpleNamespace(exl3_tensors={0: marker, 1: marker}),
+        mcg=empty,
+        mul1=SimpleNamespace(exl3_tensors={}),
+    )
+
+
+def test_sqg_k6_packed_gate_up_preserves_source_order_and_rotation():
+    layer = _sqg_k6_packed_gate_up_layer()
+    observed = {}
+    prepared = object()
+
+    def prepare_weight(trellis, suh, svh, **kwargs):
+        observed.update(trellis=trellis, suh=suh, svh=svh, kwargs=kwargs)
+        return prepared
+
+    packed = Exl3LinearMethod._prepare_sqg_k6_packed_gate_up(
+        layer,
+        SimpleNamespace(prepare_weight=prepare_weight),
+    )
+
+    assert packed is not None
+    assert packed.prepared is prepared
+    assert packed.trellis.shape == (8, 16, 96)
+    assert torch.equal(packed.trellis[:, :8], layer.trellis.exl3_tensors[0])
+    assert torch.equal(packed.trellis[:, 8:], layer.trellis.exl3_tensors[1])
+    assert packed.suh is layer.suh.exl3_tensors[0]
+    assert torch.equal(
+        packed.svh,
+        torch.cat(
+            (layer.svh.exl3_tensors[0], layer.svh.exl3_tensors[1]),
+        ),
+    )
+    assert observed["kwargs"] == {
+        "codebook": "sqg_xor_cheb_t12",
+        "params_dtype": torch.float16,
+    }
+
+
+def test_sqg_k6_packed_gate_up_rejects_independent_input_rotations():
+    layer = _sqg_k6_packed_gate_up_layer(shared_suh=False)
+    api = SimpleNamespace(
+        prepare_weight=lambda *args, **kwargs: pytest.fail(
+            "incompatible gate/up rotations must retain separate weights"
+        )
+    )
+
+    assert Exl3LinearMethod._prepare_sqg_k6_packed_gate_up(layer, api) is None
+
+
+def test_sqg_k6_packed_gate_up_apply_uses_one_custom_op(monkeypatch):
+    x = torch.randn((3, 128), dtype=torch.float16)
+    prepared = SimpleNamespace(
+        scale=torch.zeros(4, dtype=torch.uint8),
+        global_scale=torch.ones(1, dtype=torch.float32),
+        workspace=torch.zeros(1024, dtype=torch.int32),
+    )
+    packed = exl3_module._SQGK6PackedGateUp(
+        trellis=torch.zeros((8, 16, 96), dtype=torch.int16),
+        suh=torch.ones(128, dtype=torch.float16),
+        svh=torch.ones(256, dtype=torch.float16),
+        prepared=prepared,
+    )
+    layer = SimpleNamespace(exl3_sqg_k6_packed_gate_up=packed)
+    calls = []
+
+    def fake_k6_out(*args):
+        calls.append(args)
+        output = args[-3]
+        output[:, :128].fill_(1)
+        output[:, 128:].fill_(2)
+
+    monkeypatch.setattr(exl3_module, "_exl3_sqg_k6_gemm_out", fake_k6_out)
+    monkeypatch.setattr(
+        exl3_module,
+        "_load_b12x_trellis_linear",
+        lambda: SimpleNamespace(
+            sqg_k6_w6a16_scratch_elements=lambda *args, **kwargs: 257
+        ),
+    )
+
+    output = Exl3LinearMethod(SimpleNamespace()).apply(layer, x)
+
+    assert len(calls) == 1
+    assert output.shape == (3, 256)
+    assert torch.equal(output[:, :128], torch.ones((3, 128), dtype=torch.float16))
+    assert torch.equal(output[:, 128:], torch.full((3, 128), 2, dtype=torch.float16))
+
+
+@pytest.mark.parametrize(("tp", "admitted"), ((4, True), (6, False)))
+def test_glm_sqg_engine_contract_uses_topology_neutral_tp_slices(tp, admitted):
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(
+        _has_glm_sqg_w4a8_contract=lambda: True,
+        glm_sqg_w4a8={"parallelism": {"long_context_max_tokens": 1048576}},
+    )
+    layer = SimpleNamespace(exl3_tp_size=tp)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, enable_dbo=False
+        ),
+        model_config=SimpleNamespace(max_model_len=262144, runner_type="generate"),
+        speculative_config=None,
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+    )
+
+    if admitted:
+        method._validate_glm_sqg_engine_contract(layer, vllm_config)
+        assert layer.exl3_dcp_size == 1
+        assert layer.exl3_is_draft is False
+        assert layer.exl3_num_ubatches == 1
+    else:
+        with pytest.raises(ValueError, match="TP to divide"):
+            method._validate_glm_sqg_engine_contract(layer, vllm_config)
+
+
+def test_glm_sqg_runtime_uses_logical_ubatches_not_capture_streams(monkeypatch):
+    """Graph capture streams share storage unless DBO can execute concurrently."""
+
+    prepared = []
+
+    def prepare_runtime(*args, **kwargs):
+        del args, kwargs
+        runtime = object()
+        prepared.append(runtime)
+        return runtime
+
+    api = SimpleNamespace(prepare_runtime=prepare_runtime)
+    method = object.__new__(Exl3MoEMethod)
+    method.quant_config = SimpleNamespace(glm_sqg_w4a8={"parallelism": {}})
+    layer = SimpleNamespace(
+        layer_name="model.layers.3.mlp.experts",
+        exl3_is_draft=False,
+        exl3_num_ubatches=2,
+        exl3_max_num_batched_tokens=8,
+        exl3_hidden_size=6144,
+        exl3_intermediate_size_per_partition=512,
+        local_num_experts=256,
+        exl3_glm_sqg_w4a8_weights=object(),
+        exl3_tp_size=4,
+        exl3_tp_rank=0,
+    )
+    x = torch.empty((1, 6144), dtype=torch.bfloat16)
+    topk_ids = torch.empty((1, 8), dtype=torch.int32)
+    selected_ubatch = {"value": 0}
+
+    monkeypatch.setattr(exl3_module, "_load_b12x_glm_sqg_w4a8", lambda: api)
+    monkeypatch.setattr(
+        exl3_module, "_current_exl3_ubatch_id", lambda: selected_ubatch["value"]
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *args, **kwargs: pytest.fail(
+            "CUDA stream identity must not select mutable SQG storage"
+        ),
+    )
+    exl3_module._GLM_SQG_W4A8_RUNTIMES.clear()
+    try:
+        runtime0 = method._glm_sqg_w4a8_runtime(layer, x, topk_ids)
+        selected_ubatch["value"] = 1
+        runtime1 = method._glm_sqg_w4a8_runtime(layer, x, topk_ids)
+        selected_ubatch["value"] = 0
+        assert method._glm_sqg_w4a8_runtime(layer, x, topk_ids) is runtime0
+    finally:
+        exl3_module._GLM_SQG_W4A8_RUNTIMES.clear()
+
+    assert prepared == [runtime0, runtime1]
 
 
 def test_rank_sliced_checkpoint_selects_exl3_override():
@@ -1310,6 +1624,49 @@ def test_r7_schema_normalizes_declared_integer_contract():
     )
     assert config.r7_routed_experts["moe_layers"] == (3, 77)
     assert config.r7_routed_experts["k_values"] == (3, 4, 5)
+
+
+def test_sqg_routed_schema_survives_config_hydration():
+    routed = {
+        "schema": "glm52-sqg-atoms-v2-routed-v1",
+        "codebook": "sqg_xor_cheb_t12",
+        "rotation_layout": "shared_h_v1",
+        "k_values": [3, 4],
+        "moe_layers": [3, 78],
+        "gate_up_suh_template": (
+            "model.layers.{layer}.mlp.experts.r7_shared.gate_up_suh"
+        ),
+        "down_svh_template": ("model.layers.{layer}.mlp.experts.r7_shared.down_svh"),
+    }
+
+    config = Exl3Config.from_config({"r7_routed_experts": routed})
+    config._validate_r7_routed_experts_contract()
+
+    assert config.r7_routed_experts == routed
+
+
+def test_sqg_contract_overrides_projection_mixed_r7_endpoint():
+    config = Exl3Config(
+        glm_sqg_w4a8={"execution": "full_w4a8"},
+        r7_routed_experts={"moe_layers": [3, 78]},
+    )
+
+    assert config._routed_execution_mode("model.layers.3.mlp.experts") == ("sqg_w4a8")
+    assert config._routed_execution_mode("model.layers.78.mlp.experts") == ("sqg_w4a8")
+    assert config._routed_execution_mode("model.layers.2.mlp.experts") == "none"
+
+
+def test_projection_mixed_r7_contract_keeps_its_execution_endpoint():
+    config = Exl3Config(r7_routed_experts={"moe_layers": [3, 77]})
+
+    assert config._routed_execution_mode("model.layers.10.mlp.experts") == ("r7_mixed")
+
+
+def test_r7_schema_rejects_unknown_contract():
+    with pytest.raises(ValueError, match="unsupported R7 EXL3 schema"):
+        Exl3Config.from_config(
+            {"r7_routed_experts": {"schema": "unrecognized-exl3-schema"}}
+        )
 
 
 def test_rank_sliced_runtime_key_differs_across_models_with_same_shape():

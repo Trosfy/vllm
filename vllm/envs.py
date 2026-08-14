@@ -2402,6 +2402,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_R7_FUSED": lambda: os.getenv("VLLM_EXL3_R7_FUSED"),
     "VLLM_EXL3_R7_FUSED_LAYERS": lambda: os.getenv("VLLM_EXL3_R7_FUSED_LAYERS"),
     "VLLM_EXL3_R7_ROUTE_BLOCK": lambda: os.getenv("VLLM_EXL3_R7_ROUTE_BLOCK"),
+    # Optional directory for per-rank GLM SQG W4A8 load and execution evidence.
+    "VLLM_GLM_SQG_W4A8_EVIDENCE_DIR": lambda: os.getenv(
+        "VLLM_GLM_SQG_W4A8_EVIDENCE_DIR"
+    ),
     # Deterministic online EXL3 encoding and its persistent rank-local cache.
     "VLLM_EXL3_ONLINE_TRELLIS_BITS": lambda: os.getenv("VLLM_EXL3_ONLINE_TRELLIS_BITS"),
     "VLLM_EXL3_ENCODER_SOURCE": lambda: os.getenv("VLLM_EXL3_ENCODER_SOURCE"),

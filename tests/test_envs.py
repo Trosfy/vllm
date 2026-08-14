@@ -66,6 +66,11 @@ def _clear_unknown_vllm_envs(monkeypatch: pytest.MonkeyPatch) -> None:
         ("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "4", 4),
         ("VLLM_USE_B12X_PCIE_DMA", "1", True),
         ("VLLM_CACHE_DIR", "/cache/vllm", "/cache/vllm"),
+        (
+            "VLLM_GLM_SQG_W4A8_EVIDENCE_DIR",
+            "/cache/evidence/glm52-sqg-w4a8",
+            "/cache/evidence/glm52-sqg-w4a8",
+        ),
     ],
 )
 def test_gilded_gnosis_runtime_envs_are_registered(
