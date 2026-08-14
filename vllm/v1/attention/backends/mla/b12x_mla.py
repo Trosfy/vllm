@@ -782,7 +782,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         kv_scale: torch.Tensor | None,
         active_splits: int,
     ) -> Any:
-        """Build a fresh binding from metadata-validated caller scratch."""
+        """Build a binding from metadata-validated caller-owned scratch."""
         return self._dense_mla.bind(
             plan,
             scratch=scratch,
@@ -796,7 +796,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             kv_scale=kv_scale,
             sm_scale=self.scale,
             active_splits=active_splits,
-            validate=False,
         )
 
     def forward_mqa(
