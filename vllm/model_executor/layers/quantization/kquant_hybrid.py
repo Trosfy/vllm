@@ -416,18 +416,21 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
                     )
             storage_format = qsrt.get("storage_format")
             storage_schemas = {
-                "qsrt_atoms_v1": "kquant_kimi_k3_qsrt_atoms_v1",
-                "qsrt_atoms_v2": "qsrt_kimi_k3_qsrt_atoms_v2",
+                "qsrt_atoms_v1": {"kquant_kimi_k3_qsrt_atoms_v1"},
+                "qsrt_atoms_v2": {
+                    "kquant_kimi_k3_qsrt_atoms_v2",
+                    "qsrt_kimi_k3_qsrt_atoms_v2",
+                },
             }
             if storage_format not in storage_schemas:
                 raise ValueError(
                     "QSRT storage_format must be 'qsrt_atoms_v1' or "
                     f"'qsrt_atoms_v2', got {storage_format!r}"
                 )
-            expected_schema = storage_schemas[storage_format]
-            if qsrt.get("schema") != expected_schema:
+            expected_schemas = storage_schemas[storage_format]
+            if qsrt.get("schema") not in expected_schemas:
                 raise ValueError(
-                    f"QSRT schema must be {expected_schema!r}, "
+                    f"QSRT schema must be one of {sorted(expected_schemas)!r}, "
                     f"got {qsrt.get('schema')!r}"
                 )
             profile = qsrt.get("profile")
@@ -581,16 +584,17 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         layer.hybrid_state = state
 
         if state.uses_qsrt_atoms:
-            if hidden != 3584 or inter * tp_size != 3072 or num_experts != 896:
+            if hidden != 3584 or num_experts != 896:
                 raise ValueError(
                     "QSRT serving requires Kimi-K3's global "
                     "H=3584, I=3072, E=896 geometry"
                 )
             if qsrt_profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2:
-                if inter % 128:
+                if inter % 128 or inter * tp_size < 3072:
                     raise ValueError(
-                        "the coupled pure-K2 QSRT profile requires a local "
-                        f"intermediate extent divisible by 128, got I={inter}"
+                        "the coupled pure-K2 QSRT profile requires a padded "
+                        "local intermediate extent divisible by 128 and at "
+                        f"least 3,072 global channels, got I={inter} at TP={tp_size}"
                     )
                 state.tiles = (128, 128, 128, 128)
             elif inter != 256:
