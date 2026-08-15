@@ -399,7 +399,10 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             # called "return_attn_probs" instead of return_softmax_lse
             kwargs["return_attn_probs"] = return_softmax_lse
             assert out is None and output_scale is None
-        if envs.VLLM_BATCH_INVARIANT:
+        if envs.VLLM_BATCH_INVARIANT or (
+            self.vllm_flash_attn_version == 4
+            and current_platform.is_device_capability_family(120)
+        ):
             kwargs["num_splits"] = 1
 
         attn_out = FA4_MLA_PREFILL_KERNEL(
