@@ -13,6 +13,7 @@ from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.models.common.ops import sequence_parallel as sp_ops
+from vllm.models.kimi_k3.nvidia import mla as kimi_mla
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
@@ -75,6 +76,17 @@ class _SequenceParallelMTPBlock:
     ):
         assert residual is None
         return hidden_states * 2, None, hidden_states * 3
+
+
+@pytest.mark.parametrize(
+    ("dcp_world_size", "backend_owns", "expected"),
+    ((1, True, False), (8, False, False), (8, True, True)),
+)
+def test_kimi_detects_backend_owned_decode_dcp(
+    dcp_world_size: int, backend_owns: bool, expected: bool
+) -> None:
+    impl = SimpleNamespace(owns_decode_dcp_collectives=backend_owns)
+    assert kimi_mla._backend_owns_decode_dcp(impl, dcp_world_size) is expected
 
 
 def _mock_sequence_parallel_collectives(monkeypatch):
