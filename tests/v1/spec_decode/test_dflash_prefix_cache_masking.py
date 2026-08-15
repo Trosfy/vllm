@@ -198,5 +198,5 @@ def test_window_shift_updates_shared_sequence_length_once_for_two_groups():
     )
 
     assert seq_lens.item() == draft_kv_window
-    for table, original in zip(tables, originals):
+    for table, original in zip(tables, originals, strict=True):
         torch.testing.assert_close(table[0, :4], original[0, 4:8])

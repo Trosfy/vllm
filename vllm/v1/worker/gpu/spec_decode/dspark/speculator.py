@@ -240,7 +240,7 @@ class DSparkSpeculator(DFlashSpeculator):
                         "B12X TP all-reduce runtime."
                     )
                 probe = torch.empty(
-                    self.max_num_reqs,
+                    self.max_num_reqs * self.num_speculative_steps,
                     self.draft_model_config.hf_config.markov_rank,
                     dtype=self.dtype,
                     device=self.device,

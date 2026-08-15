@@ -7,6 +7,10 @@ from unittest.mock import Mock
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.device_communicators.custom_all_reduce import (
+    CustomAllreduce,
+    get_active_b12x_pcie_allreduce,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
@@ -131,3 +135,80 @@ def test_graph_replay_finishes_markov_tail_from_stable_buffers():
         args.kwargs["precomputed_base_logits"].untyped_storage().data_ptr()
         == speculator._captured_base_logits.untyped_storage().data_ptr()
     )
+
+
+def test_captured_markov_allreduce_probe_covers_every_draft_step(monkeypatch):
+    probe_shapes = []
+
+    class CustomAllreduce:
+        def should_custom_ar(self, probe):
+            probe_shapes.append(tuple(probe.shape))
+            return True
+
+    model = SimpleNamespace(
+        supports_local_draft_argmax=lambda: True,
+        _b12x_dspark_argmax_enabled=True,
+        model=SimpleNamespace(markov_head=SimpleNamespace(replicate_w1=False)),
+    )
+    speculator = SimpleNamespace(
+        use_draft_token_capacity=False,
+        draft_logits=None,
+        _draft_topk=None,
+        _capture_sharded_markov=True,
+        _markov_outside_cudagraph=False,
+        max_num_reqs=8,
+        num_speculative_steps=7,
+        vllm_config=object(),
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(markov_rank=128)
+        ),
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.dspark.speculator.load_dspark_model",
+        lambda _target_model, _config: model,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.custom_all_reduce."
+        "get_active_b12x_pcie_allreduce",
+        lambda: CustomAllreduce(),
+    )
+
+    loaded = DSparkSpeculator.load_draft_model(
+        speculator,
+        target_model=object(),
+        target_attn_layer_names=set(),
+    )
+
+    assert loaded is model
+    assert probe_shapes == [(56, 128)]
+
+
+def test_active_b12x_accessor_accepts_hierarchical_runtime(monkeypatch):
+    custom_allreduce = object.__new__(CustomAllreduce)
+    custom_allreduce.disabled = False
+    custom_allreduce._pcie_runtime = object()
+    group = SimpleNamespace(
+        device_communicator=SimpleNamespace(ca_comm=custom_allreduce)
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: group
+    )
+
+    assert get_active_b12x_pcie_allreduce() is custom_allreduce
+
+
+def test_active_b12x_accessor_rejects_disabled_runtime(monkeypatch):
+    custom_allreduce = object.__new__(CustomAllreduce)
+    custom_allreduce.disabled = True
+    custom_allreduce._pcie_runtime = object()
+    group = SimpleNamespace(
+        device_communicator=SimpleNamespace(ca_comm=custom_allreduce)
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: group
+    )
+
+    assert get_active_b12x_pcie_allreduce() is None

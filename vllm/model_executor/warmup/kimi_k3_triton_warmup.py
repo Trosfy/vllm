@@ -188,14 +188,14 @@ def kimi_k3_triton_warmup(worker: Worker) -> None:
     if not current_platform.is_cuda():
         return
 
-    layer = _get_kda_layer(worker)
-    if layer is None:
-        return
-
     if envs.VLLM_KIMI_FUSED_TOPK16:
         from vllm.models.kimi_k3.nvidia.ops.topk16 import warmup_kimi_topk16
 
         warmup_kimi_topk16()
+
+    layer = _get_kda_layer(worker)
+    if layer is None:
+        return
 
     _warm_attn_res(worker)
     _warm_recurrent_kda(layer, worker.model_config.dtype)

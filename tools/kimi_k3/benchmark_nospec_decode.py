@@ -15,7 +15,17 @@ from urllib.parse import urlparse
 
 
 def _validated_http_url(url: str) -> str:
-    """Return an HTTP(S) URL or reject unsupported URL schemes."""
+    """Validate that a URL uses HTTP or HTTPS and has a network location.
+
+    Args:
+        url: URL accepted from the command line or discovered endpoint.
+
+    Returns:
+        The unchanged validated URL.
+
+    Raises:
+        ValueError: If the URL is not an absolute HTTP or HTTPS URL.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"expected an HTTP(S) URL, got {url!r}")

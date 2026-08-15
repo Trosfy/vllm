@@ -46,8 +46,11 @@ else()
           GIT_TAG f3e1a4f74c99145c0717709860bf765de1703779
           GIT_SUBMODULES ${VLLM_FLASH_ATTN_GIT_SUBMODULES}
           GIT_PROGRESS TRUE
-          PATCH_COMMAND git apply --unidiff-zero --whitespace=nowarn
-            ${CMAKE_SOURCE_DIR}/cmake/patches/vllm_flash_attn_fa4_dynamic_causal.patch
+          PATCH_COMMAND ${CMAKE_COMMAND}
+            -DGIT_EXECUTABLE=git
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -DPATCH_FILE=${CMAKE_SOURCE_DIR}/cmake/patches/vllm_flash_attn_fa4_dynamic_causal.patch
+            -P ${CMAKE_SOURCE_DIR}/cmake/patches/apply_git_patch.cmake
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )

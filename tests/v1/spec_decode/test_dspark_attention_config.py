@@ -35,7 +35,9 @@ def test_dspark_loader_constructs_model_with_draft_parallel_geometry(
     draft_config = SimpleNamespace(
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         attention_config=SimpleNamespace(backend=None, use_non_causal=False),
+        quant_config=object(),
     )
+    draft_quant_config = object()
     captured = {}
 
     def fake_replace(value, **updates):
@@ -63,6 +65,10 @@ def test_dspark_loader_constructs_model_with_draft_parallel_geometry(
         "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
         lambda _config: True,
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.utils.get_draft_quant_config",
+        lambda config: draft_quant_config if config is target_config else None,
+    )
 
     with pytest.raises(ModelCaptured):
         dspark_utils.load_dspark_model(object(), target_config)
@@ -72,6 +78,7 @@ def test_dspark_loader_constructs_model_with_draft_parallel_geometry(
     assert loaded_config.parallel_config.decode_context_parallel_size == 1
     assert loaded_config.attention_config.backend == AttentionBackendEnum.B12X_MLA
     assert loaded_config.attention_config.use_non_causal
+    assert loaded_config.quant_config is draft_quant_config
 
 
 def test_dspark_attention_metadata_uses_draft_parallel_geometry(monkeypatch) -> None:

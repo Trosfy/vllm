@@ -5,10 +5,24 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.model_executor.warmup import kimi_k3_triton_warmup as warmup_module
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     _warm_recurrent_kda,
 )
+from vllm.models.kimi_k3.nvidia.ops import topk16
 from vllm.models.kimi_k3.nvidia.ops.third_party.kda import fused_recurrent
+
+
+def test_fused_router_warmup_does_not_require_a_kda_layer(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv("VLLM_KIMI_FUSED_TOPK16", "1")
+    monkeypatch.setattr(warmup_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(warmup_module, "_get_kda_layer", lambda _worker: None)
+    monkeypatch.setattr(topk16, "warmup_kimi_topk16", lambda: calls.append("topk16"))
+
+    warmup_module.kimi_k3_triton_warmup(SimpleNamespace())
+
+    assert calls == ["topk16"]
 
 
 def test_speculative_kda_warmup_before_kv_cache_binding(monkeypatch) -> None:
