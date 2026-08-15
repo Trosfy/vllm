@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
     VLLM_DSPARK_CAPTURE_SHARDED_MARKOV: bool = False
     VLLM_K3_KV_GROUP_SIZE: int = 0
+    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -1178,6 +1179,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DSPARK_CAPTURE_SHARDED_MARKOV", "0"))
     ),
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
+    # Bound the number of context tokens expanded into dense MLA K/V tensors
+    # per attention call. Zero selects the memory-based automatic limit.
+    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
+    ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
