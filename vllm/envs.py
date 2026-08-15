@@ -66,6 +66,8 @@ if TYPE_CHECKING:
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
+    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -1150,6 +1152,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # workspaces that materialize only rows consumed by one draft forward.
     "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
         int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
+    ),
+    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
     ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
