@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
@@ -21,6 +22,7 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode as fused_recurrent_kda_packed_decode_amd,
 )
 from vllm.models.kimi_k3.nvidia.kda import (
+    initialize_kda_input_projection_padding,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
     use_split_mixed_precision_input_projection,
@@ -65,6 +67,35 @@ def test_kda_mixed_precision_input_projection_selection(
     )
 
     assert use_split_mixed_precision_input_projection(quant_config) is expected
+
+
+def test_kda_input_projection_padding_is_declared_and_zeroed():
+    layer = nn.Linear(3, 4, bias=False)
+    layer.weight.data.fill_(1)
+
+    initialize_kda_input_projection_padding(layer, padding_rows=2, hidden_size=3)
+
+    assert layer._vllm_online_processing_unloaded == {"weight": 6}
+    torch.testing.assert_close(layer.weight[:2], torch.ones(2, 3))
+    torch.testing.assert_close(layer.weight[2:], torch.zeros(2, 3))
+
+
+def test_kda_input_projection_without_padding_has_no_declaration():
+    layer = nn.Linear(3, 4, bias=False)
+    original = layer.weight.detach().clone()
+
+    initialize_kda_input_projection_padding(layer, padding_rows=0, hidden_size=3)
+
+    assert not hasattr(layer, "_vllm_online_processing_unloaded")
+    torch.testing.assert_close(layer.weight, original)
+
+
+@pytest.mark.parametrize("padding_rows", [-1, 5])
+def test_kda_input_projection_rejects_invalid_padding(padding_rows: int):
+    layer = nn.Linear(3, 4, bias=False)
+
+    with pytest.raises(ValueError, match="must fit"):
+        initialize_kda_input_projection_padding(layer, padding_rows, hidden_size=3)
 
 
 @torch.inference_mode()
