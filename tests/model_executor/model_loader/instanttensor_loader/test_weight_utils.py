@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import glob
+import inspect
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -11,6 +12,9 @@ import torch
 from safetensors.torch import save_file
 
 import vllm.model_executor.model_loader.weight_utils as weight_utils
+from vllm.model_executor.model_loader.reload.layerwise import (
+    _own_deferred_accelerator_tensors,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     instanttensor_weights_iterator,
@@ -53,6 +57,7 @@ def test_instanttensor_copy_contract(
         raise AssertionError
 
     monkeypatch.setenv("INSTANTTENSOR_COPY", setting)
+    monkeypatch.delenv("INSTANTTENSOR_BUFFER_SIZE", raising=False)
     monkeypatch.setattr(
         weight_utils,
         "current_platform",
@@ -136,7 +141,7 @@ def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
         "model.expert.weight": str(overlay_shard.resolve()),
     }
 
-    weight_utils._restrict_instanttensor_to_selected_ranges(
+    cpu_fallback = weight_utils._restrict_instanttensor_to_selected_ranges(
         instant_open,
         indexed_tensor_files=indexed_tensor_files,
         weight_name_prefixes=None,
@@ -160,6 +165,75 @@ def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
         "model.expert.weight": 1,
     }
     assert buffer_sizes == [None]
+    assert cpu_fallback == []
+
+
+def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
+    shard = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "model.large.weight": torch.arange(8, dtype=torch.float32),
+            "model.small.weight": torch.arange(2, dtype=torch.float32),
+        },
+        shard,
+    )
+    physical_names = []
+    with weight_utils.safe_open(shard, framework="pt") as physical_file:
+        physical_names = list(physical_file.offset_keys())
+    metadata_by_name = {
+        "model.large.weight": {"data_offsets": [0, 32]},
+        "model.small.weight": {"data_offsets": [32, 40]},
+    }
+    offsets_by_name = {
+        "model.large.weight": (0, 32),
+        "model.small.weight": (32, 40),
+    }
+    metadata = [(name, metadata_by_name[name]) for name in physical_names]
+    offsets = [(0, offsets_by_name[physical_names[0]][0])]
+    offsets.extend((0, offsets_by_name[name][1]) for name in physical_names)
+    buffer_sizes = []
+    instant_open = SimpleNamespace(
+        filename=[str(shard)],
+        ordered_tensor_metadatas=metadata,
+        tensor_offsets=offsets,
+        tensor_sizes=[32, 8],
+        total_tensor_size=40,
+        tensor_name_to_index={},
+        loader_handle=None,
+        _determine_buffer_size=lambda requested: buffer_sizes.append(requested),
+    )
+
+    cpu_fallback = weight_utils._restrict_instanttensor_to_selected_ranges(
+        instant_open,
+        indexed_tensor_files=None,
+        weight_name_prefixes=None,
+        max_tensor_size=16,
+    )
+
+    assert [name for name, _ in instant_open.ordered_tensor_metadatas] == [
+        "model.small.weight"
+    ]
+    assert cpu_fallback == [("model.large.weight", str(shard))]
+    assert instant_open.total_tensor_size == 8
+    assert buffer_sizes == [None]
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Borrowed accelerator storage requires CUDA",
+)
+def test_deferred_loader_owns_accelerator_tensor():
+    def loader(param, loaded_weight):
+        pass
+
+    source = torch.arange(8, device="cuda")
+    bound_args = inspect.signature(loader).bind(None, source)
+
+    _own_deferred_accelerator_tensors(bound_args)
+
+    owned = bound_args.arguments["loaded_weight"]
+    assert owned.data_ptr() != source.data_ptr()
+    assert torch.equal(owned, source)
 
 
 @pytest.mark.skipif(

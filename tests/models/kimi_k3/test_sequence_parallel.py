@@ -358,6 +358,22 @@ def test_kimi_column_parallel_loader_zero_fills_tail():
     torch.testing.assert_close(param, expected)
 
 
+def test_kimi_gate_local_projection_preserves_linear_return_contract():
+    layer = object.__new__(kimi_model.KimiColumnParallelGate)
+    nn.Module.__init__(layer)
+    layer.weight = nn.Parameter(torch.arange(12).view(3, 4).float())
+    hidden_states = torch.arange(8).view(2, 4).float()
+
+    output, bias = layer.forward_local(hidden_states)
+
+    torch.testing.assert_close(
+        output,
+        torch.nn.functional.linear(hidden_states, layer.weight),
+    )
+    assert output.dtype == torch.float32
+    assert bias is None
+
+
 def test_kimi_row_parallel_loader_zero_fills_tail():
     layer = object.__new__(kimi_model.KimiPaddedRowParallelLinear)
     layer.tp_rank = 1

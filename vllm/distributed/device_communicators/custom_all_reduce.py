@@ -93,8 +93,32 @@ def _parse_byte_size(value: str) -> int:
     return int(value)
 
 
-def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
-    allreduce_max_size = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+def _b12x_pcie_allreduce_default_max_size(world_size: int) -> str:
+    """Return the configured or B12X-recommended all-reduce byte limit."""
+    configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
+    if configured is not None:
+        return configured
+    try:
+        from b12x.comm.pcie.pcie_allreduce import recommended_max_bytes
+    except Exception:
+        return envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE
+
+    default = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    resolved = recommended_max_bytes(world_size, default=default)
+    if resolved != default:
+        logger.info(
+            "B12X raised the PCIe all-reduce limit for TP%d from %d to %d bytes.",
+            world_size,
+            default,
+            resolved,
+        )
+    return str(resolved)
+
+
+def _b12x_pcie_oneshot_limits(world_size: int = 2) -> tuple[int, int, int]:
+    allreduce_max_size = _parse_byte_size(
+        _b12x_pcie_allreduce_default_max_size(world_size)
+    )
     fused_max_size = _parse_byte_size(
         envs.VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
     )
@@ -126,6 +150,16 @@ def _load_b12x_pcie_oneshot_pool() -> Any | None:
     except Exception:
         return None
     return PCIeOneshotAllReducePool
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_allreduce() -> Any | None:
+    """Load the B12X dispatcher that supports bounded-degree TP12 and TP16."""
+    try:
+        from b12x.comm.pcie import AllReduce as PCIeAllReduce
+    except Exception:
+        return None
+    return PCIeAllReduce
 
 
 @lru_cache(maxsize=1)
@@ -318,6 +352,7 @@ class CustomAllreduce:
         self._pcie_dma = None
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_capture_channel_id: str | None = None
+        self._pcie_runtime_semantic_channels = False
         self._pcie_allreduce_max_size: int | None = None
         self._pcie_fused_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
@@ -515,12 +550,15 @@ class CustomAllreduce:
                     physical_device_ids,
                 )
                 return
-            pool_cls = (
-                _load_b12x_pcie_oneshot_pool()
+            use_world_dispatched_b12x = pcie_backend == "b12x" and world_size > 8
+            runtime_cls = (
+                _load_b12x_pcie_allreduce()
+                if use_world_dispatched_b12x
+                else _load_b12x_pcie_oneshot_pool()
                 if pcie_backend == "b12x"
                 else _load_flashinfer_pcie_oneshot_pool()
             )
-            if pool_cls is None:
+            if runtime_cls is None:
                 logger.warning(
                     "%s PCIe custom allreduce was requested, but its runtime "
                     "is unavailable.",
@@ -553,7 +591,7 @@ class CustomAllreduce:
                 self._pcie_allreduce_max_size,
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
-            ) = _b12x_pcie_oneshot_limits()
+            ) = _b12x_pcie_oneshot_limits(world_size)
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because %s PCIe oneshot "
@@ -568,21 +606,31 @@ class CustomAllreduce:
             pcie_runtime = None
             pcie_init_error: Exception | None = None
             try:
-                pcie_runtime = pool_cls.from_exchange_group(
-                    exchange_group=self.nccl_group,
-                    device=self.device,
-                    eager_buffer_bytes=pcie_oneshot_buffer_size,
-                    max_size=pcie_oneshot_buffer_size,
-                    single_channel=pcie_single_channel,
-                    max_concurrent_channels=_B12X_PCIE_MAX_CONCURRENT_CHANNELS,
-                )
-                if not pcie_single_channel:
-                    pcie_runtime.prepare_channels((_B12X_PCIE_EAGER_CHANNEL_ID,))
-                pcie_runtime.for_stream(
-                    channel_id=(
-                        None if pcie_single_channel else _B12X_PCIE_EAGER_CHANNEL_ID
+                if use_world_dispatched_b12x:
+                    pcie_runtime = runtime_cls.from_exchange_group(
+                        exchange_group=self.nccl_group,
+                        device=self.device,
+                        eager_buffer_bytes=pcie_oneshot_buffer_size,
+                        max_size=pcie_oneshot_buffer_size,
+                        single_channel=pcie_single_channel,
                     )
-                )
+                    pcie_runtime.for_stream()
+                else:
+                    pcie_runtime = runtime_cls.from_exchange_group(
+                        exchange_group=self.nccl_group,
+                        device=self.device,
+                        eager_buffer_bytes=pcie_oneshot_buffer_size,
+                        max_size=pcie_oneshot_buffer_size,
+                        single_channel=pcie_single_channel,
+                        max_concurrent_channels=_B12X_PCIE_MAX_CONCURRENT_CHANNELS,
+                    )
+                    if not pcie_single_channel:
+                        pcie_runtime.prepare_channels((_B12X_PCIE_EAGER_CHANNEL_ID,))
+                    pcie_runtime.for_stream(
+                        channel_id=(
+                            None if pcie_single_channel else _B12X_PCIE_EAGER_CHANNEL_ID
+                        )
+                    )
             except Exception as exc:
                 pcie_init_error = exc
 
@@ -610,18 +658,30 @@ class CustomAllreduce:
                 return
             assert pcie_runtime is not None
             self._pcie_runtime = pcie_runtime
+            self._pcie_runtime_semantic_channels = not use_world_dispatched_b12x
             self._pcie_backend_name = pcie_backend
             # Prefill-size DMA allreduce alongside the oneshot. A deployment
             # preflight can tune its crossover or disable it when lossless DMA
             # never beats NCCL on the selected PCIe topology.
+            supports_all_peer_auxiliary = bool(
+                getattr(pcie_runtime, "supports_all_peer_auxiliary", True)
+            )
             dma_min_bytes = (
-                _b12x_pcie_dma_min_bytes() if pcie_backend == "b12x" else None
+                _b12x_pcie_dma_min_bytes()
+                if pcie_backend == "b12x" and supports_all_peer_auxiliary
+                else None
             )
             dma_cls = None if dma_min_bytes is None else _load_b12x_pcie_dma()
             if pcie_backend != "b12x":
                 logger.info(
                     "FlashInfer PCIe IPC handles only tuned one-shot shapes; "
                     "larger allreduces stay on PyNCCL."
+                )
+            elif not supports_all_peer_auxiliary:
+                logger.info(
+                    "B12X PCIe %s all-reduce does not expose the all-peer "
+                    "topology required by DMA; larger tensors use PyNCCL.",
+                    getattr(pcie_runtime, "algorithm", "bounded-degree"),
                 )
             elif dma_min_bytes is None:
                 logger.info(
@@ -678,8 +738,9 @@ class CustomAllreduce:
             if rank == 0:
                 logger.info(
                     "Configured %s PCIe crossovers: "
-                    "oneshot max=%d, fused max=%d, DMA min=%s.",
+                    "algorithm=%s, allreduce max=%d, fused max=%d, DMA min=%s.",
                     pcie_backend,
+                    getattr(pcie_runtime, "algorithm", "oneshot"),
                     self._pcie_allreduce_max_size,
                     self._pcie_fused_add_rms_norm_max_size,
                     dma_min_bytes if dma_min_bytes is not None else "off",
@@ -873,18 +934,25 @@ class CustomAllreduce:
             if self._pcie_runtime is None:
                 yield
             else:
-                if channel_id is None:
+                uses_semantic_channels = getattr(
+                    self, "_pcie_runtime_semantic_channels", True
+                )
+                if uses_semantic_channels and channel_id is None:
                     raise RuntimeError(
                         "distributed PCIe graph capture requires an explicit "
                         "semantic channel_id"
                     )
                 self._pcie_capture_stream = stream
                 self._pcie_capture_channel_id = channel_id
-                with self._pcie_runtime.capture(
-                    stream=stream,
-                    channel_id=channel_id,
-                ):
-                    yield
+                if uses_semantic_channels:
+                    with self._pcie_runtime.capture(
+                        stream=stream,
+                        channel_id=channel_id,
+                    ):
+                        yield
+                else:
+                    with self._pcie_runtime.capture(stream=stream):
+                        yield
         finally:
             self._pcie_capture_stream = old_pcie_capture_stream
             self._pcie_capture_channel_id = old_pcie_capture_channel_id
@@ -942,12 +1010,20 @@ class CustomAllreduce:
     def _pcie_runtime_channel_id(self) -> str:
         return self._pcie_capture_channel_id or _B12X_PCIE_EAGER_CHANNEL_ID
 
+    def _pcie_runtime_for_stream(self) -> Any:
+        """Bind the active PCIe runtime using its stream-ownership contract."""
+        assert self._pcie_runtime is not None
+        stream = self._pcie_runtime_stream()
+        if getattr(self, "_pcie_runtime_semantic_channels", True):
+            return self._pcie_runtime.for_stream(
+                stream,
+                channel_id=self._pcie_runtime_channel_id(),
+            )
+        return self._pcie_runtime.for_stream(stream)
+
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
-            self._pcie_runtime.for_stream(
-                self._pcie_runtime_stream(),
-                channel_id=self._pcie_runtime_channel_id(),
-            ).register_graph_buffers()
+            self._pcie_runtime_for_stream().register_graph_buffers()
             return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         logger.debug("Registering %d cuda graph addresses", len(offset))
@@ -975,10 +1051,7 @@ class CustomAllreduce:
             use_custom = (
                 self._pcie_allreduce_max_size is not None
                 and inp_size <= self._pcie_allreduce_max_size
-                and self._pcie_runtime.for_stream(
-                    self._pcie_runtime_stream(),
-                    channel_id=self._pcie_runtime_channel_id(),
-                ).should_allreduce(inp)
+                and self._pcie_runtime_for_stream().should_allreduce(inp)
             )
             if (
                 not use_custom
@@ -1060,12 +1133,15 @@ class CustomAllreduce:
                     inp.numel() * inp.element_size(),
                     self._pcie_runtime_stream() is not None,
                 )
-            return self._pcie_runtime.all_reduce(
-                inp,
-                out=out,
-                stream=self._pcie_runtime_stream(),
-                channel_id=self._pcie_runtime_channel_id(),
-            )
+            stream = self._pcie_runtime_stream()
+            if getattr(self, "_pcie_runtime_semantic_channels", True):
+                return self._pcie_runtime.all_reduce(
+                    inp,
+                    out=out,
+                    stream=stream,
+                    channel_id=self._pcie_runtime_channel_id(),
+                )
+            return self._pcie_runtime.all_reduce(inp, out=out, stream=stream)
         if out is None:
             out = torch.empty_like(inp)
         if registered:
@@ -1105,10 +1181,7 @@ class CustomAllreduce:
         ):
             return False
         assert self._pcie_runtime is not None
-        if not self._pcie_runtime.for_stream(
-            self._pcie_runtime_stream(),
-            channel_id=self._pcie_runtime_channel_id(),
-        ).should_allreduce(inp):
+        if not self._pcie_runtime_for_stream().should_allreduce(inp):
             return False
         if (
             inp.ndim == 0
@@ -1126,15 +1199,19 @@ class CustomAllreduce:
         ):
             return False
 
+        kwargs: dict[str, Any] = {
+            "out": inp,
+            "residual_out": residual,
+            "stream": self._pcie_runtime_stream(),
+        }
+        if getattr(self, "_pcie_runtime_semantic_channels", True):
+            kwargs["channel_id"] = self._pcie_runtime_channel_id()
         self._pcie_runtime.all_reduce_fused_add_rms_norm(
             inp,
             residual,
             weight,
             epsilon,
-            out=inp,
-            residual_out=residual,
-            stream=self._pcie_runtime_stream(),
-            channel_id=self._pcie_runtime_channel_id(),
+            **kwargs,
         )
         return True
 

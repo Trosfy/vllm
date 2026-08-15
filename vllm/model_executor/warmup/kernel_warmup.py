@@ -210,21 +210,35 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     from vllm.models.deepseek_v4.nvidia.b12x import (
         DeepseekV4B12xMLAAttention,
     )
-    from vllm.v1.attention.ops.dcp_alltoall import warmup_b12x_dcp_a2a
+    from vllm.models.kimi_k3.nvidia.mla import (
+        MultiHeadLatentAttention as KimiK3MLAAttention,
+    )
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        warmup_b12x_dcp_a2a,
+    )
 
     model = worker.get_model()
-    candidates = list(model.modules())
+    target_dtype = worker.model_config.dtype
+    candidates = [(module, target_dtype) for module in model.modules()]
+    speculator = getattr(worker.model_runner, "speculator", None)
+    draft_model = getattr(speculator, "model", None)
+    if isinstance(draft_model, nn.Module):
+        draft_model_config = getattr(speculator, "draft_model_config", None)
+        draft_dtype = getattr(draft_model_config, "dtype", target_dtype)
+        candidates.extend((module, draft_dtype) for module in draft_model.modules())
     candidates.extend(
-        worker.vllm_config.compilation_config.static_forward_context.values()
+        (module, target_dtype)
+        for module in (
+            worker.vllm_config.compilation_config.static_forward_context.values()
+        )
     )
     seen_modules: set[int] = set()
     warmed_signatures: set[tuple[torch.device, torch.dtype, int, int, int]] = set()
-    for module in candidates:
+    for module, dtype in candidates:
         if id(module) in seen_modules:
             continue
         seen_modules.add(id(module))
 
-        dtype = worker.model_config.dtype
         if isinstance(module, DeepseekV4B12xMLAAttention):
             device = module.attn_sink.device
             total_heads = int(module.n_local_heads) * dcp_world_size
@@ -234,6 +248,17 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
             device = next(module.parameters()).device
             total_heads = int(module.num_heads) * dcp_world_size
             query_head_dim = int(module.kv_lora_rank + module.qk_rope_head_dim)
+            output_head_dim = int(module.kv_lora_rank)
+        elif (
+            isinstance(module, KimiK3MLAAttention)
+            and module.attn_backend.get_name() == "B12X_MLA"
+        ):
+            module_dcp_world_size = int(module.impl.dcp_world_size)
+            if module_dcp_world_size <= 1:
+                continue
+            device = next(module.parameters()).device
+            total_heads = int(module.num_local_heads) * module_dcp_world_size
+            query_head_dim = int(module.head_size)
             output_head_dim = int(module.kv_lora_rank)
         else:
             continue
@@ -260,6 +285,34 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
         warmed_signatures.add(signature)
 
     return len(warmed_signatures)
+
+
+def _warmup_b12x_kimi_projection_gathers(worker: "Worker") -> int:
+    """Create Kimi projection channels independently of attention DCP."""
+    if (
+        not envs.VLLM_KIMI_USE_B12X_PROJECTION_GATHER
+        or not envs.VLLM_KIMI_USE_B12X_PAIRED_PROJECTION_GATHER
+    ):
+        return 0
+
+    from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        warmup_b12x_kimi_projection_gathers,
+    )
+
+    dcp_group = get_dcp_group()
+    tp_group = get_tp_group()
+    projection_group = (
+        dcp_group
+        if dcp_group.world_size == tp_group.world_size
+        and list(dcp_group.ranks) == list(tp_group.ranks)
+        else tp_group
+    )
+    model = worker.get_model()
+    return warmup_b12x_kimi_projection_gathers(
+        projection_group,
+        device=next(model.parameters()).device,
+    )
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool:
@@ -322,6 +375,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
         logger.info(
             "Warmed up %d B12X DCP collective signature(s).",
             warmed_dcp_a2a,
+        )
+    warmed_projection_gathers = _warmup_b12x_kimi_projection_gathers(worker)
+    if warmed_projection_gathers:
+        logger.info(
+            "Warmed up %d B12X Kimi projection signature(s).",
+            warmed_projection_gathers,
         )
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)

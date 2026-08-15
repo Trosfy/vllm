@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -70,6 +71,9 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_key_concat_kv_cache_insert,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
@@ -86,7 +90,12 @@ from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
@@ -103,6 +112,67 @@ _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Apply the sigmoid output gate to a precomputed ``g_proj`` projection."""
     return attn_out * gate.sigmoid()
+
+
+def _restore_merged_output_order(
+    rank_major_output: torch.Tensor,
+    output_sizes: list[int],
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert rank-major merged shards into logical projection order."""
+    if tp_size == 1:
+        return rank_major_output
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            f"Merged output sizes {output_sizes} must be divisible by TP={tp_size}"
+        )
+    local_sizes = [size // tp_size for size in output_sizes]
+    local_total = sum(local_sizes)
+    expected_width = local_total * tp_size
+    if rank_major_output.shape[-1] != expected_width:
+        raise ValueError(
+            "Unexpected gathered merged projection width: "
+            f"got {rank_major_output.shape[-1]}, expected {expected_width}"
+        )
+    rank_major = rank_major_output.unflatten(-1, (tp_size, local_total))
+    logical_local_shards = rank_major.split(local_sizes, dim=-1)
+    return torch.cat(
+        [shards.flatten(-2) for shards in logical_local_shards],
+        dim=-1,
+    )
+
+
+class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Merged column projection with one gather and logical-shard reorder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size == 1:
+            return output_parallel, output_bias
+        rank_major_output = gather_kimi_sharded_projection(output_parallel)
+        output = _restore_merged_output_order(
+            rank_major_output,
+            self.output_sizes,
+            self.tp_size,
+        )
+        return output, output_bias
 
 
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
@@ -135,6 +205,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        self.draft_kv_window = (
+            int(envs.VLLM_DSPARK_DRAFT_KV_WINDOW)
+            if non_causal_multi_token_decode
+            else 0
+        )
+        if self.draft_kv_window < 0:
+            raise ValueError(
+                "VLLM_DSPARK_DRAFT_KV_WINDOW must be non-negative, got "
+                f"{self.draft_kv_window}."
+            )
         # Latent "head" seen by the attention kernel / KV cache.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = self.qk_head_dim**-0.5
@@ -190,14 +270,26 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # the low-rank latents are shared across TP ranks; TP splitting
             # happens at q_b_proj / kv_b_proj. Checkpoint weights ``q_a_proj``
             # and ``kv_a_proj_with_mqa`` map onto shards 0 and 1 respectively.
-            self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-                disable_tp=True,
-            )
+            qkv_a_output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            if envs.VLLM_KIMI_SHARD_QKV_A and tp_size > 1:
+                self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+            else:
+                self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                    disable_tp=True,
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -321,13 +413,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "parallelism."
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
-        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
-            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
-            "context parallelism because gathered queries require gathered "
-            "positions."
+        self.impl_handles_dcp = (
+            self.dcp_world_size > 1 and self.attn_backend.get_name() == "B12X_MLA"
+        )
+        assert (
+            self.dcp_world_size <= 1 or self.rotary_emb is None or self.impl_handles_dcp
+        ), (
+            "Kimi-K3 RoPE with decode context parallelism requires an attention "
+            "backend that implements DCP natively."
         )
         self.dcp_manager: MLADCPManager | None = None
-        if self.dcp_world_size > 1:
+        if self.dcp_world_size > 1 and not self.impl_handles_dcp:
             query_dtype = (
                 torch.float8_e4m3fn
                 if is_quantized_kv_cache(self.kv_cache_dtype)
@@ -372,14 +468,42 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
-        return MLAAttentionSpec(  # type: ignore[call-arg]
+        raw_shard_draft = envs.VLLM_DCP_SHARD_DRAFT
+        shard_draft = (
+            False
+            if raw_shard_draft is None
+            else raw_shard_draft.lower() in ("1", "true", "yes")
+        )
+        dcp_replicated = bool(
+            self.non_causal_multi_token_decode
+            and not shard_draft
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
+        common_kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dcp_replicated=dcp_replicated,
+        )
+        if self.draft_kv_window:
+            if self.draft_kv_window < vllm_config.cache_config.block_size:
+                raise ValueError(
+                    "VLLM_DSPARK_DRAFT_KV_WINDOW must be at least one KV "
+                    f"block ({vllm_config.cache_config.block_size}), got "
+                    f"{self.draft_kv_window}."
+                )
+            return SlidingWindowMLASpec(
+                **common_kwargs,
+                sliding_window=self.draft_kv_window,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+            )
+        # TODO: Remove this type suppression when MLAAttentionSpec declares
+        # non_causal_multi_token_decode in its constructor signature.
+        return MLAAttentionSpec(  # type: ignore[call-arg]
+            **common_kwargs,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
@@ -462,6 +586,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attention front-end: fused qkv-a proj -> norms -> q_b -> attention.
 
@@ -500,13 +625,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe, attn_out)
+        self._attention(
+            positions,
+            q,
+            kv_c_normed,
+            k_pe,
+            attn_out,
+            rope_cos_sin_cache=rope_cos_sin_cache,
+        )
         return attn_out
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Both branches produce (attn_out, gate); they differ only in whether
         # the g_proj GEMM is overlapped on the aux stream.
@@ -519,14 +652,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
         ):
             attn_out, gate = maybe_execute_in_parallel(
-                lambda: self._forward_attn(positions, hidden_states),
+                lambda: self._forward_attn(
+                    positions, hidden_states, rope_cos_sin_cache
+                ),
                 lambda: g_proj(hidden_states)[0],
                 events[0],
                 events[1],
                 self.aux_stream,
             )
         else:
-            attn_out = self._forward_attn(positions, hidden_states)
+            attn_out = self._forward_attn(positions, hidden_states, rope_cos_sin_cache)
             gate = g_proj(hidden_states)[0] if g_proj is not None else None
 
         if gate is not None:
@@ -546,6 +681,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         attn_out: torch.Tensor,
+        *,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_by_layer = forward_context.attn_metadata
@@ -558,6 +695,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         num_actual_toks = attn_metadata.num_actual_tokens
+        if num_actual_toks < int(attn_out.shape[0]):
+            # Downstream gate and output projections consume the padded rows.
+            # Define inactive rows so collective kernels never consume
+            # uninitialized values.
+            attn_out[num_actual_toks:].zero_()
         slot_mapping_by_layer = forward_context.slot_mapping
         assert isinstance(slot_mapping_by_layer, dict)
         slot_mapping = slot_mapping_by_layer[self.layer_name]
@@ -573,7 +715,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.rotary_emb is not None:
             # Pass the fp32 cos/sin table straight to the fused epilogue (it reads
             # fp32 and does the RoPE math in fp32) -- no per-forward dtype cast.
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            cos_sin_cache = (
+                rope_cos_sin_cache
+                if rope_cos_sin_cache is not None
+                else self.rotary_emb.cos_sin_cache
+            )
             rope_positions = positions
 
         # Decode tokens are laid out first, prefill tokens after. The fused
@@ -616,16 +762,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
             )
-            if self.dcp_world_size > 1:
-                assert self.dcp_manager is not None
+            if self.dcp_manager is not None:
                 assert self.dcp_manager.query_gather is not None
                 mqa_q = self.dcp_manager.query_gather(mqa_q)
             latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
             )
-            if self.dcp_world_size > 1:
+            if self.dcp_manager is not None:
                 assert lse is not None
-                assert self.dcp_manager is not None
                 assert attn_metadata.decode is not None
                 latent_out = self.dcp_manager.combine(
                     latent_out,

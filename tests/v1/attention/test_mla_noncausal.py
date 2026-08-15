@@ -120,7 +120,8 @@ def test_mla_cache_marker_is_promoted_to_group_capability():
     unmarked = MLAAttentionSpec(**kwargs)
 
     assert MLAAttentionSpec.merge([marked, marked]).non_causal_multi_token_decode
-    assert MLAAttentionSpec.merge([marked, unmarked]).non_causal_multi_token_decode
+    with pytest.raises(AssertionError, match="causal mode"):
+        MLAAttentionSpec.merge([marked, unmarked])
     assert not MLAAttentionSpec.merge(
         [unmarked, unmarked]
     ).non_causal_multi_token_decode

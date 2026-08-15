@@ -1307,7 +1307,8 @@ class FusedMoEKernelModularImpl:
         )
 
         use_output_alias = (
-            output_alias is not None
+            not envs.VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS
+            and output_alias is not None
             and output_alias.shape == fused_out.shape
             and output_alias.dtype == fused_out.dtype
             and output_alias.device == fused_out.device

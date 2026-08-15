@@ -1,0 +1,10 @@
+diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
+index 91f7826..5987ace 100644
+--- a/flash_attn/cute/flash_fwd.py
++++ b/flash_attn/cute/flash_fwd.py
+@@ -624,0 +625 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
++        self.is_split_kv = False
+@@ -791,0 +793 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
++            mDynamicCausal,
+@@ -831,0 +834 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
++        mDynamicCausal: Optional[cute.Tensor] = None,
