@@ -489,7 +489,9 @@ def test_kimi_router_decodes_precomputed_topk_payload_without_copy():
     torch.testing.assert_close(ids, expected_ids)
 
 
-def test_kimi_router_marks_precomputed_padding_routes_inactive(monkeypatch):
+def test_kimi_router_encodes_precomputed_padding_as_zero_weight_routes(
+    monkeypatch,
+):
     router = kimi_model.KimiK3PrecomputedTopKRouter(
         top_k=16,
         global_num_experts=896,
@@ -519,9 +521,11 @@ def test_kimi_router_marks_precomputed_padding_routes_inactive(monkeypatch):
 
     assert weights.data_ptr() == payload.data_ptr()
     assert ids.data_ptr() == payload[num_tokens:].data_ptr()
-    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(weights[0], expected_weights[0])
+    torch.testing.assert_close(weights[1], torch.zeros(16))
+    torch.testing.assert_close(weights[2], expected_weights[2])
     torch.testing.assert_close(ids[0], expected_ids[0])
-    torch.testing.assert_close(ids[1], torch.full((16,), -1, dtype=torch.int32))
+    torch.testing.assert_close(ids[1], torch.zeros(16, dtype=torch.int32))
     torch.testing.assert_close(ids[2], expected_ids[2])
 
 
