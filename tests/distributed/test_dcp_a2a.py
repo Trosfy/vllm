@@ -10,7 +10,7 @@ Tests cover:
 
 import importlib.util
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 import multiprocess as mp
@@ -369,6 +369,52 @@ class TestLSEWeightedCombine:
         assert _dcp_a2a_lse_pack_dim(torch.float32) == 1
 
 
+def test_a2a_converts_activation_dtype_lse_before_packing(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    output = torch.zeros(2, 4, 8, dtype=torch.bfloat16)
+    lse = torch.zeros(2, 4, dtype=torch.bfloat16)
+    send = torch.empty(2, 2, 2, 10, dtype=torch.bfloat16)
+    recv = torch.empty_like(send)
+    result = torch.empty(2, 2, 8, dtype=torch.bfloat16)
+    received: dict[str, torch.dtype] = {}
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_dcp_a2a_send_recv_buffers",
+        lambda *args, **kwargs: (send, recv),
+    )
+
+    def record_pack(_cp_attn_out, cp_attn_lse, *_args, **_kwargs):
+        received["dtype"] = cp_attn_lse.dtype
+
+    class _Work:
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(dcp_alltoall, "_dcp_a2a_pack_send", record_pack)
+    monkeypatch.setattr(
+        dcp_alltoall.dist,
+        "all_to_all_single",
+        lambda *args, **kwargs: _Work(),
+    )
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_dcp_a2a_unpack_combine",
+        lambda *args, **kwargs: result,
+    )
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        output,
+        lse,
+        group,  # type: ignore[arg-type]
+    )
+
+    assert actual is result
+    assert received == {"dtype": torch.float32}
+
+
 def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
@@ -418,6 +464,55 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
         "is_lse_base_on_e": True,
         "max_batch_size": 8192,
         "query_head_dim": None,
+    }
+
+
+def test_b12x_large_batch_uses_configured_ag_rs(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import common, dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    monkeypatch.setenv("VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs")
+    partial_output = torch.zeros(5, 4, 8, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(5, 4, dtype=torch.float32)
+    expected = torch.ones(5, 2, 8, dtype=torch.bfloat16)
+    captured: dict[str, Any] = {}
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_lse_reduce",
+        lambda *args, **kwargs: None,
+    )
+
+    def fake_ag_rs(output, lse, cp_group, **kwargs):
+        captured.update(output=output, lse=lse, group=cp_group, **kwargs)
+        return expected
+
+    monkeypatch.setattr(common, "cp_lse_ag_out_rs", fake_ag_rs)
+    monkeypatch.setattr(
+        dcp_alltoall.dist,
+        "all_to_all_single",
+        lambda *args, **kwargs: pytest.fail("packed NCCL A2A must not run"),
+    )
+
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        partial_output,
+        partial_lse,
+        group,  # type: ignore[arg-type]
+        use_b12x=True,
+        b12x_max_batch_size=4,
+    )
+
+    assert actual is expected
+    assert captured == {
+        "output": partial_output,
+        "lse": partial_lse,
+        "group": group,
+        "ctx": None,
+        "return_lse": False,
+        "is_lse_base_on_e": True,
+        "head_major_output": True,
     }
 
 
@@ -690,6 +785,73 @@ def test_b12x_dcp_capture_rejects_missing_semantic_id(monkeypatch):
         pass
 
 
+def test_b12x_pool_initialized_inside_graph_context_joins_graph_channel(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events: list[Any] = []
+
+    class _FakePool:
+        @classmethod
+        def from_exchange_group(cls, **kwargs):
+            events.append(("create", kwargs["exchange_group"]))
+            return cls()
+
+        def prepare_channels(self, channel_ids):
+            events.append(("prepare", tuple(channel_ids)))
+
+        def for_stream(self, *, channel_id):
+            events.append(("eager", channel_id))
+
+        @contextmanager
+        def capture(self, *, stream, channel_id):
+            events.append(("enter", stream, channel_id))
+            try:
+                yield
+            finally:
+                events.append(("exit", stream, channel_id))
+
+    device_group = object()
+    group = _FakeCPGroup(2, device_group)  # type: ignore[arg-type]
+    stream = object()
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_POOLS", {})
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_DISABLED", set())
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_ACTIVE_CAPTURE", {})
+    monkeypatch.setattr(dcp_alltoall, "_load_b12x_dcp_a2a_pool", lambda: _FakePool)
+    monkeypatch.setattr(dcp_alltoall, "_b12x_dcp_init_failed", lambda *args: False)
+    monkeypatch.setattr(
+        dcp_alltoall.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+
+    with dcp_alltoall.capture_b12x_dcp_a2a(
+        group,  # type: ignore[arg-type]
+        stream,
+        channel_id="vllm:target:decode",
+    ):
+        pool = dcp_alltoall._get_b12x_dcp_a2a_pool(
+            group,  # type: ignore[arg-type]
+            device=torch.device("cuda:0"),
+            total_heads=64,
+            head_dim=512,
+            query_head_dim=576,
+            max_batch_size=64,
+        )
+        assert pool is not None
+        assert (
+            dcp_alltoall._b12x_dcp_channel_id(group)  # type: ignore[arg-type]
+            == "vllm:target:decode"
+        )
+
+    assert dcp_alltoall._b12x_dcp_channel_id(group) == "vllm:eager:dcp"  # type: ignore[arg-type]
+    assert events == [
+        ("create", device_group),
+        ("prepare", ("vllm:eager:dcp", "vllm:target:decode")),
+        ("enter", stream, "vllm:target:decode"),
+        ("exit", stream, "vllm:target:decode"),
+    ]
+
+
 def test_b12x_dcp_channel_rollback_restores_existing_and_closes_new_pools(
     monkeypatch,
 ):
@@ -749,23 +911,25 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
             events.append(("rollback-tp", checkpoint))
 
     class _FakeGroup:
-        def __init__(self, *, world_size, communicator=None):
+        def __init__(self, name, *, world_size, communicator=None):
+            self.name = name
             self.world_size = world_size
+            self.device_group = object()
             self.device_communicator = type(
                 "DeviceCommunicator", (), {"ca_comm": communicator}
             )()
 
     communicator = _FakeCommunicator()
-    tp_group = _FakeGroup(world_size=8, communicator=communicator)
-    pp_group = _FakeGroup(world_size=1, communicator=communicator)
-    dcp_group = _FakeGroup(world_size=2)
+    tp_group = _FakeGroup("tp", world_size=8, communicator=communicator)
+    pp_group = _FakeGroup("pp", world_size=1, communicator=communicator)
+    dcp_group = _FakeGroup("dcp", world_size=2)
     monkeypatch.setattr(parallel_state, "_TP", tp_group)
     monkeypatch.setattr(parallel_state, "_PP", pp_group)
     monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
 
     def checkpoint_dcp(group):
-        events.append("checkpoint-dcp")
-        return "dcp-checkpoint"
+        events.append(("checkpoint-pool", group.name))
+        return f"{group.name}-pool-checkpoint"
 
     monkeypatch.setattr(
         dcp_alltoall,
@@ -783,13 +947,46 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
 
     assert events == [
         "checkpoint-tp",
-        "checkpoint-dcp",
-        ("rollback-dcp", "dcp-checkpoint"),
+        ("checkpoint-pool", "tp"),
+        ("checkpoint-pool", "dcp"),
+        ("rollback-dcp", "dcp-pool-checkpoint"),
+        ("rollback-dcp", "tp-pool-checkpoint"),
         ("rollback-tp", "tp-checkpoint"),
     ]
 
 
-def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
+def test_profile_channel_checkpoint_deduplicates_shared_b12x_pool(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    class _FakeGroup:
+        def __init__(self, name, *, world_size, device_group):
+            self.name = name
+            self.world_size = world_size
+            self.device_group = device_group
+            self.device_communicator = type(
+                "DeviceCommunicator", (), {"ca_comm": None}
+            )()
+
+    events: list[str] = []
+    shared_device_group = object()
+    tp_group = _FakeGroup("tp", world_size=16, device_group=shared_device_group)
+    dcp_group = _FakeGroup("dcp", world_size=16, device_group=shared_device_group)
+    monkeypatch.setattr(parallel_state, "_TP", tp_group)
+    monkeypatch.setattr(parallel_state, "_PP", None)
+    monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "checkpoint_b12x_dcp_a2a_channels",
+        lambda group: events.append(group.name) or group.name,
+    )
+
+    parallel_state.checkpoint_b12x_graph_channels()
+
+    assert events == ["tp"]
+
+
+def test_global_graph_capture_enters_b12x_tp_and_dcp_pools(monkeypatch):
     from vllm.distributed import parallel_state
     from vllm.v1.attention.ops import dcp_alltoall
 
@@ -800,6 +997,7 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
 
         def __init__(self, name):
             self.name = name
+            self.device_group = object()
 
         @contextmanager
         def graph_capture(self, context):
@@ -841,6 +1039,12 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
         ("enter-group", "dcp", "vllm:target:profile"),
         (
             "enter-b12x",
+            tp_group,
+            stream,
+            "vllm:target:profile",
+        ),
+        (
+            "enter-b12x",
             dcp_group,
             stream,
             "vllm:target:profile",
@@ -851,10 +1055,58 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
             stream,
             "vllm:target:profile",
         ),
+        (
+            "exit-b12x",
+            tp_group,
+            stream,
+            "vllm:target:profile",
+        ),
         ("exit-group", "dcp", "vllm:target:profile"),
         ("exit-group", "pp", "vllm:target:profile"),
         ("exit-group", "tp", "vllm:target:profile"),
     ]
+
+
+def test_global_graph_capture_keeps_distinct_b12x_coordinator_scopes(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    class _FakeGroup:
+        world_size = 16
+
+        def __init__(self, name, device_group):
+            self.name = name
+            self.device_group = device_group
+
+        @contextmanager
+        def graph_capture(self, context):
+            yield context
+
+    shared_device_group = object()
+    tp_group = _FakeGroup("tp", shared_device_group)
+    dcp_group = _FakeGroup("dcp", shared_device_group)
+    pp_group = _FakeGroup("pp", object())
+    entered_pools: list[str] = []
+
+    @contextmanager
+    def fake_b12x_capture(group, selected_stream, *, channel_id):
+        entered_pools.append(group.name)
+        yield
+
+    monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(dcp_alltoall, "capture_b12x_dcp_a2a", fake_b12x_capture)
+    context = parallel_state.GraphCaptureContext(  # type: ignore[arg-type]
+        object(),
+        channel_id="vllm:target:decode",
+    )
+
+    with parallel_state.graph_capture(torch.device("cpu"), context):
+        pass
+
+    assert entered_pools == ["tp", "dcp"]
 
 
 def test_group_capture_forwards_semantic_id_to_custom_allreduce(monkeypatch):
@@ -907,7 +1159,10 @@ def test_group_capture_forwards_semantic_id_to_custom_allreduce(monkeypatch):
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
-def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_b12x_lse_reduce_honors_token_cap(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+):
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
@@ -935,7 +1190,7 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
         return _FakePool()
 
     monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
-    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+    group = _FakeCPGroup(world_size, None)  # type: ignore[arg-type]
 
     out = torch.zeros(4, 16, 64, dtype=torch.bfloat16, device="cuda")
     lse = torch.zeros(4, 16, dtype=torch.float32, device="cuda")
@@ -953,6 +1208,23 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     assert created["max_batch_size"] == 4
     assert created["channel_id"] == "vllm:eager:dcp"
 
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_B12X_DCP_ACTIVE_CAPTURE",
+        {id(group.device_group): ("vllm:target:decode", None, ExitStack())},
+    )
+    result = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out,
+        lse,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=8192,
+        query_head_dim=64,
+    )
+    assert result is sentinel
+    assert created["channel_id"] == "vllm:target:decode"
+
     out_large = torch.zeros(8, 16, 64, dtype=torch.bfloat16, device="cuda")
     lse_large = torch.zeros(8, 16, dtype=torch.float32, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_lse_reduce(
@@ -969,7 +1241,10 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
-def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_b12x_query_gather_honors_token_cap(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+):
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
@@ -989,7 +1264,7 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
         return _FakePool()
 
     monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
-    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+    group = _FakeCPGroup(world_size, None)  # type: ignore[arg-type]
 
     small = torch.zeros(4, 8, 64, dtype=torch.bfloat16, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
@@ -1002,6 +1277,20 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     assert created["max_batch_size"] == 4
     assert created["channel_id"] == "vllm:eager:dcp"
 
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_B12X_DCP_ACTIVE_CAPTURE",
+        {id(group.device_group): ("vllm:target:decode", None, ExitStack())},
+    )
+    result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        small,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8192,
+        output_head_dim=64,
+    )
+    assert result is sentinel
+    assert created["channel_id"] == "vllm:target:decode"
+
     large = torch.zeros(8, 8, 64, dtype=torch.bfloat16, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
         large,
@@ -1010,6 +1299,86 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
         output_head_dim=64,
     )
     assert result is None
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_query_gather_supports_fp8_caller_output(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    received: dict[str, Any] = {}
+
+    class _FakePool:
+        def all_gather_heads(self, local_input, *, out, channel_id):
+            received.update(input=local_input, out=out, channel_id=channel_id)
+            return out
+
+    def fake_get_pool(
+        cp_group, *, device, total_heads, head_dim, query_head_dim, max_batch_size
+    ):
+        received.update(
+            total_heads=total_heads,
+            head_dim=head_dim,
+            query_head_dim=query_head_dim,
+            max_batch_size=max_batch_size,
+        )
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    group = _FakeCPGroup(4, object())  # type: ignore[arg-type]
+    local_input = torch.zeros(2, 2, 64, dtype=torch.float8_e4m3fn, device="cuda")
+    out = torch.empty(2, 8, 64, dtype=local_input.dtype, device=local_input.device)
+
+    actual = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        local_input,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8,
+        output_head_dim=512,
+        out=out,
+    )
+
+    assert actual is out
+    assert received.pop("input") is local_input
+    assert received.pop("out") is out
+    assert received == {
+        "channel_id": "vllm:eager:dcp",
+        "total_heads": 8,
+        "head_dim": 512,
+        "query_head_dim": 64,
+        "max_batch_size": 8,
+    }
+
+    unaligned = torch.zeros(
+        2, 2, 24, dtype=torch.float8_e4m3fn, device=local_input.device
+    )
+    assert (
+        dcp_alltoall._try_b12x_dcp_all_gather_heads(
+            unaligned,
+            group,  # type: ignore[arg-type]
+            max_batch_size=8,
+            output_head_dim=512,
+        )
+        is None
+    )
+
+
+def test_query_gather_fallback_copies_into_caller_output(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.delenv("VLLM_USE_B12X_DCP_A2A", raising=False)
+    local_input = torch.zeros(2, 2, 8, dtype=torch.bfloat16)
+    gathered = torch.arange(64, dtype=torch.bfloat16).reshape(2, 4, 8)
+    out = torch.empty_like(gathered)
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+    group.all_gather = lambda _value, dim: gathered  # type: ignore[attr-defined]
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_heads(
+        local_input,
+        group,  # type: ignore[arg-type]
+        out=out,
+    )
+
+    assert actual is out
+    torch.testing.assert_close(actual, gathered)
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
@@ -1108,6 +1477,96 @@ def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
     assert actual is expected
 
 
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_pair_gather_uses_one_pool_operation_at_dcp16(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    received: dict[str, Any] = {}
+    local_first = torch.zeros(2, 224, dtype=torch.bfloat16, device="cuda")
+    local_second = torch.zeros(2, 56, dtype=torch.float32, device="cuda")
+    expected = (
+        torch.empty(2, 224 * 16, dtype=local_first.dtype, device="cuda"),
+        torch.empty(2, 56 * 16, dtype=local_second.dtype, device="cuda"),
+    )
+
+    class _FakePool:
+        def all_gather_pair(self, first, second, *, channel_id):
+            received.update(first=first, second=second, channel_id=channel_id)
+            return expected
+
+    def fake_get_pool(cp_group, **kwargs):
+        received.update(kwargs)
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_b12x_dcp_channel_id",
+        lambda _group: "vllm:target:decode:graph-1",
+    )
+    group = _FakeCPGroup(16, object())  # type: ignore[arg-type]
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_pair(
+        local_first,
+        local_second,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8,
+    )
+
+    assert actual is expected
+    assert received.pop("first") is local_first
+    assert received.pop("second") is local_second
+    assert received.pop("device") == local_first.device
+    assert received == {
+        "channel_id": "vllm:target:decode:graph-1",
+        "total_heads": 16,
+        "head_dim": 672,
+        "query_head_dim": 672,
+        "max_batch_size": 8,
+    }
+    unaligned_first = local_first[:, :223].contiguous()
+    assert (
+        dcp_alltoall._try_b12x_dcp_all_gather_pair(
+            unaligned_first,
+            local_second,
+            group,  # type: ignore[arg-type]
+            max_batch_size=8,
+        )
+        is None
+    )
+
+
+def test_pair_gather_fallback_preserves_tensor_order(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.delenv("VLLM_USE_B12X_DCP_A2A", raising=False)
+    local_first = torch.zeros(2, 8)
+    local_second = torch.ones(2, 4)
+    gathered_first = torch.full((2, 16), 2.0)
+    gathered_second = torch.full((2, 8), 3.0)
+    calls: list[tuple[torch.Tensor, int]] = []
+
+    def gather(value, dim):
+        calls.append((value, dim))
+        return gathered_first if value is local_first else gathered_second
+
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+    group.all_gather = gather  # type: ignore[attr-defined]
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_pair(
+        local_first,
+        local_second,
+        group,  # type: ignore[arg-type]
+    )
+
+    assert actual[0] is gathered_first
+    assert actual[1] is gathered_second
+    assert len(calls) == 2
+    assert calls[0][0] is local_first and calls[0][1] == -1
+    assert calls[1][0] is local_second and calls[1][1] == -1
+
+
 def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
@@ -1132,6 +1591,40 @@ def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
         head_dim=512,
         query_head_dim=576,
     )
+
+
+def test_warmup_accepts_dcp16_geometry(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def gather(local_input, *args, **kwargs):
+        calls.append(("gather", tuple(local_input.shape)))
+        return torch.empty(1)
+
+    def reduce(partial_output, *args, **kwargs):
+        calls.append(("reduce", tuple(partial_output.shape)))
+        return torch.empty(1)
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_all_gather_heads", gather)
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_lse_reduce", reduce)
+    group = _FakeCPGroup(16, None)  # type: ignore[arg-type]
+
+    dcp_alltoall.warmup_b12x_dcp_a2a(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_batch_size=8192,
+        total_heads=96,
+        head_dim=512,
+        query_head_dim=576,
+    )
+
+    assert calls == [
+        ("gather", (1, 6, 576)),
+        ("reduce", (1, 96, 512)),
+    ]
 
 
 class TestPackedA2AKernels:
@@ -1159,7 +1652,7 @@ class TestPackedA2AKernels:
         world_size, B, h_per_rank, D = 4, 7, 2, 32
         H = world_size * h_per_rank
         cp_attn_out = torch.randn(B, H, D, device=device, dtype=dtype)
-        cp_attn_lse = torch.randn(B, H, device=device, dtype=dtype)
+        cp_attn_lse = torch.randn(B, H, device=device, dtype=torch.float32)
         lse_pack_dim = _dcp_a2a_lse_pack_dim(dtype)
         send_buffer = torch.empty(
             (world_size, B, h_per_rank, D + lse_pack_dim),
@@ -1355,7 +1848,7 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         lses = torch.stack(
             [t[:, rank * h_per_rank : (rank + 1) * h_per_rank] for t in gathered_lse],
             dim=0,
-        )
+        ).float()
         from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         expected_out, expected_lse = _lse_weighted_combine(
@@ -1595,9 +2088,6 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
     reason="Need two GPUs and b12x.",
 )
 def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
-    from b12x.comm.pcie.pcie_dcp_a2a import _load_extension
-
-    _load_extension()
     _distributed_run(
         _distributed_b12x_a2a_worker,
         world_size=2,
