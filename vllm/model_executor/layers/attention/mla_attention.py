@@ -319,6 +319,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    get_kv_cache_dcp_shard_count,
     get_kv_quant_mode,
 )
 
@@ -326,6 +327,19 @@ logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
+
+
+def _get_mla_kv_dcp_world_size(
+    kv_cache_spec: KVCacheSpec, configured_dcp_world_size: int
+) -> int:
+    """Return the DCP group size that owns distinct KV position shards."""
+    shard_count = get_kv_cache_dcp_shard_count(kv_cache_spec, configured_dcp_world_size)
+    if shard_count not in (1, configured_dcp_world_size):
+        raise NotImplementedError(
+            "MLA metadata supports fully sharded or replicated DCP KV groups; "
+            "partial DCP KV sharding requires a matching subgroup"
+        )
+    return shard_count
 
 
 def _run_mla_query_bmm(
@@ -2504,6 +2518,7 @@ class MLACommonPrefillMetadata:
         context_lens_list: list[int]
         empty_token_slices: list[slice]
         dcp_manager: MLADCPManager | None = None
+        direct_dcp_kv_gather: bool = False
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -2793,6 +2808,7 @@ def build_mla_chunked_context_metadata(
     dcp_local_block_size: int,
     dcp_virtual_block_size: int,
     dcp_manager: MLADCPManager | None = None,
+    direct_dcp_kv_gather: bool = False,
 ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
     """Build chunked-context metadata for an MLA prefill.
 
@@ -2812,6 +2828,8 @@ def build_mla_chunked_context_metadata(
         dcp_local_block_size: Per-rank interleave block size for DCP.
         dcp_virtual_block_size: ``dcp_local_block_size * dcp_world_size``.
         dcp_manager: Shared MLA DCP collective manager.
+        direct_dcp_kv_gather: Gather context KV through the process DCP group
+            when the decode backend owns its query and output collectives.
 
     Returns:
         The chunked-context metadata, or None when no prefill has any context.
@@ -3001,6 +3019,7 @@ def build_mla_chunked_context_metadata(
         context_lens_list=context_lens,
         empty_token_slices=empty_token_slices,
         dcp_manager=dcp_manager,
+        direct_dcp_kv_gather=direct_dcp_kv_gather,
     )
 
 
@@ -3023,6 +3042,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     # Whether this builder can flatten a non-causal query block into decode rows.
     supports_non_causal_multi_token_decode: ClassVar[bool] = False
 
+    # A decode backend that owns DCP query and output collectives can omit an
+    # MLADCPManager. Chunked-context prefill still gathers KV through the
+    # process DCP group before it runs the configured prefill backend.
+    supports_direct_dcp_kv_gather: ClassVar[bool] = False
+
     # The threshold for reordering the batch into decode and prefill requests.
     # If > 1, the batch will be reordered such that requests with
     # query length <= threshold are classified as decode requests.
@@ -3036,22 +3060,25 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
-        chunked_prefill_workspace_size = min(
-            # Try for 8 full length request or at least 4 pages per-request
-            max(
-                8 * model_config.max_model_len,
-                4 * scheduler_config.max_num_seqs * cache_config.block_size,
-            ),
-            # For long-context models try not to over-allocate limiting
-            # kv-cache space, limiting it to 64k tokens,
-            # which would result in the workspace being:
-            #   2*(576)*(64*1024) = 144mb
-            # (assuming 576 MLA head dim, and fp16)
-            # which would result in up-projected context being
-            #   2*(192*128)*(64*1024) = 3gb
-            # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
-        )
+        configured_workspace_size = envs.VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE
+        if configured_workspace_size < 0:
+            raise ValueError(
+                "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE must be non-negative, "
+                f"got {configured_workspace_size}."
+            )
+        if configured_workspace_size:
+            chunked_prefill_workspace_size = configured_workspace_size
+        else:
+            chunked_prefill_workspace_size = min(
+                # Try for 8 full-length requests or at least 4 pages per request.
+                max(
+                    8 * model_config.max_model_len,
+                    4 * scheduler_config.max_num_seqs * cache_config.block_size,
+                ),
+                # Bound persistent compressed-KV storage and transient dense K/V
+                # projections for long-context models.
+                64 * 1024,
+            )
 
         return align_mla_chunked_context_workspace_size(
             vllm_config,
@@ -3146,10 +3173,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
 
         try:
-            self.dcp_world_size = get_dcp_group().world_size
+            configured_dcp_world_size = int(get_dcp_group().world_size)
         except AssertionError:
             # DCP might not be initialized in testing
-            self.dcp_world_size = 1
+            configured_dcp_world_size = 1
+        self.dcp_world_size = _get_mla_kv_dcp_world_size(
+            kv_cache_spec, configured_dcp_world_size
+        )
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -3180,11 +3210,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 device=device,
             )
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
-            assert isinstance(self.dcp_manager, MLADCPManager)
-            self.dcp_manager.init_kv_gather(
-                self.chunked_prefill_workspace,
-                self.chunked_prefill_workspace_size,
-            )
+            if self.dcp_manager is not None:
+                if not isinstance(self.dcp_manager, MLADCPManager):
+                    raise TypeError(
+                        "MLA attention layer dcp_manager must be an "
+                        f"MLADCPManager, got {type(self.dcp_manager).__name__}."
+                    )
+                self.dcp_manager.init_kv_gather(
+                    self.chunked_prefill_workspace,
+                    self.chunked_prefill_workspace_size,
+                )
+            elif not self.supports_direct_dcp_kv_gather:
+                raise RuntimeError(
+                    f"{type(self).__name__} requires MLADCPManager when DCP is enabled."
+                )
         else:
             self.chunked_prefill_workspace = torch.empty(
                 (
@@ -3340,6 +3379,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 dcp_local_block_size=self.dcp_local_block_size,
                 dcp_virtual_block_size=self.dcp_virtual_block_size,
                 dcp_manager=self.dcp_manager,
+                direct_dcp_kv_gather=(
+                    self.dcp_world_size > 1
+                    and self.dcp_manager is None
+                    and self.supports_direct_dcp_kv_gather
+                ),
             )
 
             prefill_metadata = MLACommonPrefillMetadata(
@@ -3470,6 +3514,23 @@ def reorg_kvcache(
     assert reorganized_k_pe.shape[0] == sum_seq_len
     assert max_seq_len_check == max_seq_len
     return reorganized_kv_c_normed, reorganized_k_pe
+
+
+def _gather_dcp_context_kv(
+    gathered_kv: torch.Tensor,
+    local_kv: torch.Tensor,
+    *,
+    dcp_manager: MLADCPManager | None,
+    direct_dcp_kv_gather: bool,
+) -> None:
+    """Gather one chunk of DCP-sharded context KV into caller storage."""
+    if dcp_manager is not None:
+        dcp_manager.kv_gather(gathered_kv, local_kv)
+        return
+    if direct_dcp_kv_gather:
+        gathered_kv.copy_(get_dcp_group().all_gather(local_kv, dim=0))
+        return
+    raise RuntimeError("MLA DCP chunked prefill has no configured KV gather path.")
 
 
 def init_mla_context_partial(
@@ -3779,8 +3840,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             ]
             assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
             cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
-            dcp_manager = cast(MLADCPManager, chunked_context.dcp_manager)
-            dcp_manager.kv_gather(cur_allgather_kvcache, local_gathered_kvcache)
+            _gather_dcp_context_kv(
+                cur_allgather_kvcache,
+                local_gathered_kvcache,
+                dcp_manager=chunked_context.dcp_manager,
+                direct_dcp_kv_gather=chunked_context.direct_dcp_kv_gather,
+            )
             assert (
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim

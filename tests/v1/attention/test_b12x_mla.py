@@ -3,8 +3,10 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla import b12x_mla
 from vllm.v1.attention.backends.mla.b12x_mla import (
@@ -31,7 +33,115 @@ def test_b12x_mla_is_registered_with_k3_envelope() -> None:
     assert B12xMLAMetadataBuilder.query_len_support is b12x_mla.QueryLenSupport.UNIFORM
 
 
+@pytest.mark.parametrize(
+    ("logical_heads", "kernel_heads"),
+    ((6, 8), (8, 8), (12, 16), (16, 16)),
+)
+def test_b12x_mla_pads_query_heads_to_kernel_tile(
+    logical_heads: int, kernel_heads: int
+) -> None:
+    assert b12x_mla._kernel_query_heads(logical_heads) == kernel_heads
+
+
+def test_b12x_mla_uses_gathered_dcp_head_geometry() -> None:
+    assert b12x_mla._kernel_query_heads(6, 8) == 48
+    assert b12x_mla._kernel_query_heads(12, 8) == 96
+    with pytest.raises(ValueError, match="multiple of eight"):
+        b12x_mla._kernel_query_heads(6, 2)
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "expected"),
+    ((None, 8), (0, 1), (64, 1), (65, 1), (256, 1), (257, 2), (4096, 8)),
+)
+def test_b12x_mla_limits_active_cache_splits(
+    max_seq_len: int | None, expected: int
+) -> None:
+    plan = SimpleNamespace(num_splits=8, chunks_per_split=4)
+    assert b12x_mla._active_dense_mla_splits(plan, max_seq_len) == expected
+
+
+def test_b12x_mla_plans_local_interleaved_dcp_cache() -> None:
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            cp_kv_cache_interleave_size=64,
+        ),
+        model_config=SimpleNamespace(max_model_len=1_048_576),
+    )
+
+    assert b12x_mla._max_dcp_local_cache_tokens(config) == 131_072
+
+
+def test_mla_uses_one_kv_shard_for_replicated_dcp_cache() -> None:
+    replicated = SimpleNamespace(dcp_replicated=True, dcp_kv_shard_count=None)
+    sharded = SimpleNamespace(dcp_replicated=False, dcp_kv_shard_count=None)
+
+    assert mla_attention._get_mla_kv_dcp_world_size(replicated, 16) == 1
+    assert mla_attention._get_mla_kv_dcp_world_size(sharded, 16) == 16
+
+
+def test_mla_rejects_partial_dcp_cache_without_matching_subgroup() -> None:
+    partial = SimpleNamespace(dcp_replicated=False, dcp_kv_shard_count=4)
+
+    with pytest.raises(NotImplementedError, match="partial DCP KV sharding"):
+        mla_attention._get_mla_kv_dcp_world_size(partial, 16)
+
+
+def _support_reason(monkeypatch, *, dcp_size: int, pcp_size: int = 1) -> str | None:
+    parallel_config = SimpleNamespace(
+        decode_context_parallel_size=dcp_size,
+        prefill_context_parallel_size=pcp_size,
+        cp_kv_cache_interleave_size=64,
+    )
+    model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            model_type="kimi_linear",
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+        ),
+        max_model_len=1_048_576,
+        get_num_attention_heads=lambda _: 6,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    )
+    monkeypatch.setattr(b12x_mla, "_load_dense_mla", lambda: object())
+    monkeypatch.setattr(b12x_mla, "get_current_vllm_config", lambda: config)
+    return B12xMLABackend.supports_combination(
+        head_size=576,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8",
+        block_size=944,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=DeviceCapability(12, 0),
+    )
+
+
+def test_b12x_mla_selects_supported_native_dcp_geometry(monkeypatch) -> None:
+    assert _support_reason(monkeypatch, dcp_size=8) is None
+    assert _support_reason(monkeypatch, dcp_size=16) is None
+
+
+def test_b12x_mla_rejects_unsupported_parallel_geometry(monkeypatch) -> None:
+    assert "multiple of eight" in _support_reason(monkeypatch, dcp_size=2)
+    assert "prefill context parallelism" in _support_reason(
+        monkeypatch, dcp_size=8, pcp_size=2
+    )
+
+
 class _FakePlan:
+    caps = SimpleNamespace(max_page_table_width=4)
+    num_splits = 1
+    chunks_per_split = 1
+
     def shapes_and_dtypes(self):
         return (((256,), torch.uint8),)
 
@@ -59,13 +169,14 @@ class _FakeDenseMLA:
 
 
 def _fake_impl(monkeypatch, *, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakeDenseMLA]:
-    monkeypatch.setattr(b12x_mla, "is_workspace_manager_initialized", lambda: False)
     impl = object.__new__(B12xMLAImpl)
     impl.num_heads = num_heads
     impl.kv_lora_rank = 512
     impl.scale = 192**-0.5
+    impl.dcp_world_size = 1
+    impl._dcp_comm_backend = "a2a"
+    impl._dcp_max_batch_size = 16
     impl._compiled_bindings = set()
-    impl._fallback_scratch = {}
     dense_mla = _FakeDenseMLA()
     impl._dense_mla = dense_mla
     return impl, dense_mla
@@ -79,6 +190,7 @@ def test_b12x_mla_adapter_binds_common_decode_metadata(monkeypatch) -> None:
     cache = torch.randn(4, 16, 576, dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         decode=SimpleNamespace(
             block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
@@ -107,6 +219,8 @@ def test_b12x_mla_adapter_binds_common_decode_metadata(monkeypatch) -> None:
     assert binding.q_scale is None
     assert binding.kv_scale is None
     assert binding.sm_scale == impl.scale
+    assert binding.active_splits == 1
+    assert binding.scratch is metadata.dense_mla_scratch
 
 
 def test_b12x_mla_adapter_accepts_non_multiple_of_eight_heads(monkeypatch) -> None:
@@ -115,6 +229,9 @@ def test_b12x_mla_adapter_accepts_non_multiple_of_eight_heads(monkeypatch) -> No
     cache = torch.randn(2, 16, 576, dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_padded_q=torch.empty(1, 8, 576, dtype=torch.bfloat16),
+        dense_mla_padded_output=torch.empty(1, 8, 512, dtype=torch.bfloat16),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         decode=SimpleNamespace(
             block_table=torch.tensor([[0, 1]], dtype=torch.int32),
@@ -126,7 +243,10 @@ def test_b12x_mla_adapter_accepts_non_multiple_of_eight_heads(monkeypatch) -> No
     output, _ = impl.forward_mqa(q, cache, metadata, layer)
 
     assert output.shape == (1, 6, 512)
-    assert dense_mla.bindings[0].q.shape == (1, 6, 576)
+    binding = dense_mla.bindings[0]
+    assert binding.q.shape == (1, 8, 576)
+    torch.testing.assert_close(binding.q[:, :6], q)
+    torch.testing.assert_close(binding.q[:, 6:], torch.zeros_like(binding.q[:, 6:]))
 
 
 def test_b12x_mla_adapter_binds_causal_multiquery_blocks(monkeypatch) -> None:
@@ -137,11 +257,27 @@ def test_b12x_mla_adapter_binds_causal_multiquery_blocks(monkeypatch) -> None:
     q = torch.randn(total_q, 8, 576, dtype=torch.bfloat16)
     cache = torch.randn(8, 16, 576, dtype=torch.bfloat16)
     query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32)
+    source_table = torch.tensor(
+        [[0, 1, 2, 3], [4, 5, 6, 7]],
+        dtype=torch.int32,
+    )
+    flat_table = source_table[:, None, :].expand(-1, query_len, -1).reshape(total_q, -1)
+    flat_lens = torch.cat(
+        (
+            torch.arange(25, 33, dtype=torch.int32),
+            torch.arange(41, 49, dtype=torch.int32),
+        )
+    )
+    flat_query_start = torch.arange(total_q + 1, dtype=torch.int32)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_flat_block_table=flat_table,
+        dense_mla_flat_seq_lens=flat_lens,
+        dense_mla_flat_query_start_loc=flat_query_start,
         query_start_loc=query_start_loc,
         decode=SimpleNamespace(
-            block_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            block_table=source_table,
             seq_lens=torch.tensor([32, 48], dtype=torch.int32),
         ),
     )
@@ -156,21 +292,73 @@ def test_b12x_mla_adapter_binds_causal_multiquery_blocks(monkeypatch) -> None:
     assert output.shape == (total_q, 8, 512)
     assert lse is not None and lse.shape == (total_q, 8)
     assert binding.q.shape[0] == total_q
-    assert binding.cache_seqlens.shape[0] == batch
-    assert binding.cu_seqlens_q.data_ptr() == query_start_loc.data_ptr()
+    assert binding.cache_seqlens.data_ptr() == flat_lens.data_ptr()
+    assert binding.cu_seqlens_q.data_ptr() == flat_query_start.data_ptr()
 
 
 def test_b12x_mla_builder_flattens_non_causal_draft_block(monkeypatch) -> None:
     builder = object.__new__(B12xMLAMetadataBuilder)
     builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
     builder._max_dense_mla_rows = 16
     builder._dense_mla_flat_block_table = torch.zeros(16, 4, dtype=torch.int32)
     builder._dense_mla_flat_seq_lens = torch.empty(16, dtype=torch.int32)
     builder._dense_mla_flat_query_start_loc = torch.arange(17, dtype=torch.int32)
+    builder.dcp_world_size = 1
 
     source_table = torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
     metadata = SimpleNamespace(
         causal=False,
+        num_decodes=1,
+        num_decode_tokens=8,
+        decode=SimpleNamespace(
+            block_table=source_table,
+            seq_lens=torch.tensor([32], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    assert result.dense_mla_scratch is builder._dense_mla_scratch
+    torch.testing.assert_close(
+        result.dense_mla_flat_block_table,
+        source_table.expand(8, -1),
+    )
+    torch.testing.assert_close(
+        result.dense_mla_flat_seq_lens,
+        torch.full((8,), 32, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        result.dense_mla_flat_query_start_loc,
+        torch.arange(9, dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_flattens_causal_verification_block(monkeypatch) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 16
+    builder._dense_mla_flat_block_table = torch.zeros(16, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(16, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(17, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-7, 1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = None
+    builder._dense_mla_flat_dcp_remainder = None
+    builder.dcp_world_size = 1
+
+    source_table = torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        causal=True,
         num_decodes=1,
         num_decode_tokens=8,
         decode=SimpleNamespace(
@@ -192,11 +380,102 @@ def test_b12x_mla_builder_flattens_non_causal_draft_block(monkeypatch) -> None:
     )
     torch.testing.assert_close(
         result.dense_mla_flat_seq_lens,
-        torch.full((8,), 32, dtype=torch.int32),
+        torch.arange(25, 33, dtype=torch.int32),
     )
     torch.testing.assert_close(
         result.dense_mla_flat_query_start_loc,
         torch.arange(9, dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_maps_causal_verification_lengths_to_dcp_rank(
+    monkeypatch,
+) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 8
+    builder._dense_mla_flat_block_table = torch.zeros(8, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(9, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-3, 1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_dcp_remainder = torch.empty(8, dtype=torch.int32)
+    builder.dcp_world_size = 4
+    builder._dcp_rank = 3
+    builder.cp_kv_cache_interleave_size = 2
+
+    metadata = SimpleNamespace(
+        causal=True,
+        num_decodes=1,
+        num_decode_tokens=4,
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            dcp_tot_seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    torch.testing.assert_close(
+        result.dense_mla_flat_seq_lens,
+        torch.tensor([2, 3, 4, 4], dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_bounds_single_token_draft_table(monkeypatch) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 2
+    builder._dense_mla_flat_block_table = torch.zeros(2, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(2, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(3, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.zeros(1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = None
+    builder._dense_mla_flat_dcp_remainder = None
+    builder.dcp_world_size = 1
+
+    source_table = torch.tensor(
+        [[0, 1, 2, 3, 90, 91], [4, 5, 6, 7, 92, 93]],
+        dtype=torch.int32,
+    )
+    source_lens = torch.tensor([32, 48], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        causal=False,
+        num_decodes=2,
+        num_decode_tokens=2,
+        decode=SimpleNamespace(
+            block_table=source_table,
+            seq_lens=source_lens,
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    torch.testing.assert_close(
+        result.dense_mla_flat_block_table,
+        source_table[:, :4],
+    )
+    torch.testing.assert_close(result.dense_mla_flat_seq_lens, source_lens)
+    torch.testing.assert_close(
+        result.dense_mla_flat_query_start_loc,
+        torch.arange(3, dtype=torch.int32),
     )
 
 
@@ -211,6 +490,9 @@ def test_b12x_mla_adapter_uses_flattened_non_causal_rows(monkeypatch) -> None:
     flat_query_start = torch.arange(query_rows + 1, dtype=torch.int32)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_padded_q=torch.empty(query_rows, 8, 576, dtype=torch.bfloat16),
+        dense_mla_padded_output=torch.empty(query_rows, 8, 512, dtype=torch.bfloat16),
         dense_mla_flat_block_table=flat_table,
         dense_mla_flat_seq_lens=flat_lens,
         dense_mla_flat_query_start_loc=flat_query_start,
@@ -238,6 +520,7 @@ def test_b12x_mla_adapter_passes_fp8_scales(monkeypatch) -> None:
     cache = torch.empty(2, 16, 576, dtype=torch.float8_e4m3fn)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         decode=SimpleNamespace(
             block_table=torch.tensor([[0, 1]], dtype=torch.int32),
@@ -254,3 +537,119 @@ def test_b12x_mla_adapter_passes_fp8_scales(monkeypatch) -> None:
     binding = dense_mla.bindings[0]
     assert binding.q_scale is layer._q_scale
     assert binding.kv_scale is layer._k_scale
+
+
+def test_b12x_mla_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch, num_heads=6)
+    impl.dcp_world_size = 8
+    batch = 2
+    q = torch.randn(batch, 6, 576, dtype=torch.bfloat16)
+    cache = torch.randn(4, 16, 576, dtype=torch.bfloat16)
+    group = SimpleNamespace(world_size=8)
+    calls: list[str] = []
+
+    monkeypatch.setattr(b12x_mla, "get_dcp_group", lambda: group)
+
+    def gather(local_q, actual_group, *, max_batch_size, output_head_dim, out):
+        assert actual_group is group
+        assert max_batch_size == 16
+        assert output_head_dim == 512
+        assert out.shape == (batch, 48, 576)
+        calls.append("gather")
+        out.copy_(local_q.repeat(1, 8, 1))
+        return out
+
+    def reduce(output, lse, actual_group, **kwargs):
+        assert actual_group is group
+        assert output.shape == (batch, 48, 512)
+        assert lse.shape == (batch, 48)
+        assert "seq_lens" not in kwargs
+        assert "query_start_loc" not in kwargs
+        assert kwargs["b12x_query_head_dim"] == 576
+        calls.append("reduce")
+        return output[:, :6].add(1)
+
+    monkeypatch.setattr(b12x_mla, "dcp_b12x_all_gather_heads", gather)
+    monkeypatch.setattr(b12x_mla, "dcp_a2a_lse_reduce", reduce)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_padded_q=torch.empty(batch, 48, 576, dtype=torch.bfloat16),
+        dense_mla_padded_output=torch.zeros(batch, 48, 512, dtype=torch.bfloat16),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+            seq_lens=torch.tensor([17, 31], dtype=torch.int32),
+        ),
+    )
+
+    output, lse = impl.forward_mqa(
+        q,
+        cache,
+        metadata,
+        SimpleNamespace(_q_scale=None, _k_scale=None),
+    )
+
+    assert calls == ["gather", "reduce"]
+    assert dense_mla.bindings[0].q.shape == (batch, 48, 576)
+    assert dense_mla.bindings[0].q.data_ptr() == metadata.dense_mla_padded_q.data_ptr()
+    torch.testing.assert_close(output, torch.ones_like(output))
+    assert lse is None
+
+
+def test_b12x_mla_adapter_skips_dcp_for_replicated_cache(monkeypatch) -> None:
+    impl, dense_mla = _fake_impl(monkeypatch, num_heads=6)
+    impl.dcp_world_size = 8
+    batch = 2
+    q = torch.randn(batch, 6, 576, dtype=torch.bfloat16)
+    cache = torch.randn(4, 16, 576, dtype=torch.bfloat16)
+
+    def unexpected_collective(*args, **kwargs):
+        raise AssertionError("replicated KV attention must not use DCP collectives")
+
+    monkeypatch.setattr(b12x_mla, "get_dcp_group", unexpected_collective)
+    monkeypatch.setattr(b12x_mla, "dcp_b12x_all_gather_heads", unexpected_collective)
+    monkeypatch.setattr(b12x_mla, "dcp_a2a_lse_reduce", unexpected_collective)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_padded_q=torch.empty(batch, 8, 576, dtype=torch.bfloat16),
+        dense_mla_padded_output=torch.empty(batch, 8, 512, dtype=torch.bfloat16),
+        dense_mla_dcp_world_size=1,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+            seq_lens=torch.tensor([17, 31], dtype=torch.int32),
+        ),
+    )
+
+    output, lse = impl.forward_mqa(
+        q,
+        cache,
+        metadata,
+        SimpleNamespace(_q_scale=None, _k_scale=None),
+    )
+
+    assert output.shape == (batch, 6, 512)
+    assert lse is not None and lse.shape == (batch, 6)
+    assert dense_mla.bindings[0].q.shape == (batch, 8, 576)
+
+
+def test_b12x_mla_adapter_requires_caller_owned_scratch(monkeypatch) -> None:
+    impl, _ = _fake_impl(monkeypatch)
+    metadata = SimpleNamespace(
+        dense_mla_plan=_FakePlan(),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="caller-owned dense MLA scratch"):
+        impl.forward_mqa(
+            torch.randn(1, 8, 576, dtype=torch.bfloat16),
+            torch.randn(1, 16, 576, dtype=torch.bfloat16),
+            metadata,
+            SimpleNamespace(_q_scale=None, _k_scale=None),
+        )
