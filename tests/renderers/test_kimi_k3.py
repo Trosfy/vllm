@@ -341,6 +341,213 @@ def test_render_messages_ignores_client_supplied_xtml_tool_attrs():
     assert "index" not in conversation[1]
 
 
+def test_render_messages_merges_split_assistant_prose_and_tool_calls():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "inspect config"},
+            {"role": "assistant", "content": "Checking config now."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    unified = assistant_messages[0]
+    assert unified["content"] == "Checking config now."
+    assert unified["tool_calls"][0]["function"]["name"] == "lookup"
+    # The tool message still resolves against the merged assistant turn.
+    assert conversation[-1]["tool"] == "lookup"
+    assert conversation[-1]["index"] == 1
+    assert tokenizer.conversations[-1] == conversation
+
+
+def test_render_messages_merges_empty_prose_and_tool_calls_pair():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": ""},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == ""
+    assert assistant_messages[0]["tool_calls"]
+
+
+def test_render_messages_keeps_assistant_pair_when_second_has_prose():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "first turn"},
+            {
+                "role": "assistant",
+                "content": "second turn with prose",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 2
+    assert assistant_messages[0]["content"] == "first turn"
+    assert assistant_messages[1]["content"] == "second turn with prose"
+
+
+def test_render_messages_keeps_pair_when_both_have_reasoning():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    conversation, _ = renderer.render_messages(
+        [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "prose",
+                "reasoning": "thought A",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning": "thought B",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 2
+    assert assistant_messages[0]["reasoning"] == "thought A"
+    assert assistant_messages[1]["reasoning"] == "thought B"
+
+
+def test_render_messages_merge_preserves_single_reasoning():
+    tokenizer = StubTokenizer([1, 2, 3])
+    renderer = _make_renderer(tokenizer)
+
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "prose",
+            "reasoning": "thought A",
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    conversation, _ = renderer.render_messages(messages, ChatParams())
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["content"] == "prose"
+    assert assistant_messages[0]["reasoning"] == "thought A"
+    assert assistant_messages[0]["reasoning_content"] == "thought A"
+    assert assistant_messages[0]["tool_calls"]
+    # Inputs are not mutated by the merge.
+    assert messages[1] == {
+        "role": "assistant",
+        "content": "prose",
+        "reasoning": "thought A",
+    }
+
+
+@pytest.mark.asyncio
+async def test_render_messages_async_merge_preserves_single_reasoning():
+    renderer = _make_renderer(StubTokenizer([1, 2, 3]))
+
+    conversation, _ = await renderer.render_messages_async(
+        [
+            {"role": "assistant", "content": "prose", "reasoning": "thought A"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        ChatParams(),
+    )
+
+    assistant_messages = [
+        message for message in conversation if message["role"] == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0]["reasoning"] == "thought A"
+    assert assistant_messages[0]["tool_calls"]
+
+
 @pytest.mark.asyncio
 async def test_render_messages_async_returns_token_prompt():
     renderer = _make_renderer(StubTokenizer([4, 5]))
