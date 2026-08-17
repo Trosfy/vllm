@@ -83,6 +83,8 @@ def test_dspark_markov_head_is_replicated(
         "get_current_vllm_config",
         lambda: SimpleNamespace(model_config=None),
     )
+    monkeypatch.delenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", raising=False)
+    monkeypatch.delenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", raising=False)
 
     head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
     assert head.markov_w2.tp_size == 1
@@ -104,6 +106,65 @@ def test_dspark_markov_head_is_replicated(
     bias = head.bias(markov_embed, logits_processor)
     assert markov_embed.shape == (2, 8)
     assert bias.shape == (2, 128)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("replicate_w1", [False, True])
+def test_dspark_markov_head_shards_vocabulary_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    replicate_w1: bool,
+) -> None:
+    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+
+    monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
+    monkeypatch.setenv(
+        "VLLM_DSPARK_REPLICATE_MARKOV_W1",
+        "1" if replicate_w1 else "0",
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 3
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(
+        logits_processor,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=None),
+    )
+
+    head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+
+    assert head.shard_across_tp
+    assert head.replicate_w1 is replicate_w1
+    assert head.markov_w2.tp_size == 8
+    assert head.markov_w2.weight.shape == (16, 8)
+    if replicate_w1:
+        assert isinstance(head.markov_w1, nn.Embedding)
+        assert head.markov_w1.weight.shape == (128, 8)
+    else:
+        assert isinstance(
+            head.markov_w1,
+            vocab_parallel_embedding.VocabParallelEmbedding,
+        )
+        assert head.markov_w1.weight.shape == (16, 8)
+
+    processor = LogitsProcessor(128)
+    local_bias = head.local_bias(torch.ones((2, 8)), processor)
+    assert local_bias.shape == (2, 16)
+
+
+@pytest.mark.cpu_test
+def test_replicated_markov_w1_requires_sharded_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", raising=False)
+    monkeypatch.setenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "1")
+
+    with pytest.raises(ValueError, match="requires VLLM_DSPARK_SHARD_MARKOV_HEAD"):
+        DSparkMarkovHead(128, 128, 8, prefix="markov_head")
 
 
 @pytest.mark.cpu_test
@@ -164,6 +225,68 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
             },
         )
     ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("tp_size", "expect_sharded"),
+    [(1, False), (8, True), (12, False), (16, True)],
+)
+def test_k3_dspark_context_projection_uses_divisible_tp_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    expect_sharded: bool,
+) -> None:
+    context_projection_calls = []
+
+    class DummyModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    def make_sharded_projection(*args, **kwargs):
+        context_projection_calls.append((args, kwargs))
+        return DummyModule()
+
+    monkeypatch.setattr(dspark_mla, "get_draft_quant_config", lambda _: None)
+    monkeypatch.setattr(dspark_mla, "ColumnParallelLinear", make_sharded_projection)
+    monkeypatch.setattr(dspark_mla, "ReplicatedLinear", DummyModule)
+    monkeypatch.setattr(dspark_mla, "MergedColumnParallelLinear", DummyModule)
+    monkeypatch.setattr(dspark_mla, "RMSNorm", DummyModule)
+    monkeypatch.setattr(dspark_mla, "K3DSparkDecoderLayer", DummyModule)
+    monkeypatch.setattr(dspark_mla, "DSparkMarkovHead", DummyModule)
+
+    config = SimpleNamespace(
+        target_hidden_size=7168,
+        num_target_layers=5,
+        hidden_size=7168,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        vocab_size=163840,
+        draft_vocab_size=163840,
+        markov_rank=256,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=config)
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+    )
+
+    model = K3DSparkModel(
+        vllm_config=vllm_config,
+        start_layer_id=0,
+        prefix="model",
+    )
+
+    assert model.context_proj_sharded is expect_sharded
+    assert bool(context_projection_calls) is expect_sharded
+    if expect_sharded:
+        args, kwargs = context_projection_calls[0]
+        assert args == (7168 * 5, 7168)
+        assert kwargs["gather_output"] is True
 
 
 def test_context_kv_weights_are_loaded_as_merged_linear_shards():
