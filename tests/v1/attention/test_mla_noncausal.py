@@ -7,12 +7,13 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLAAttention,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 
 class _NonCausalMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -120,7 +121,47 @@ def test_mla_cache_marker_is_promoted_to_group_capability():
     unmarked = MLAAttentionSpec(**kwargs)
 
     assert MLAAttentionSpec.merge([marked, marked]).non_causal_multi_token_decode
-    assert MLAAttentionSpec.merge([marked, unmarked]).non_causal_multi_token_decode
+    with pytest.raises(AssertionError, match="causal mode"):
+        MLAAttentionSpec.merge([marked, unmarked])
     assert not MLAAttentionSpec.merge(
         [unmarked, unmarked]
     ).non_causal_multi_token_decode
+
+
+def test_sliding_mla_cache_marker_is_a_group_invariant():
+    kwargs = {
+        "block_size": 64,
+        "num_kv_heads": 1,
+        "head_size": 576,
+        "dtype": torch.bfloat16,
+        "sliding_window": 32768,
+    }
+    marked = SlidingWindowMLASpec(
+        **kwargs,
+        non_causal_multi_token_decode=True,
+    )
+    unmarked = SlidingWindowMLASpec(**kwargs)
+
+    merged = SlidingWindowMLASpec.merge([marked, marked])
+    assert merged.non_causal_multi_token_decode
+    assert merged.is_uniform_with_collection({"first": marked, "second": marked})
+    assert not merged.is_uniform_with_collection({"first": marked, "second": unmarked})
+    with pytest.raises(AssertionError, match="causal mode"):
+        SlidingWindowMLASpec.merge([marked, unmarked])
+
+
+def test_sliding_mla_cache_spec_preserves_noncausal_marker():
+    layer = SimpleNamespace(
+        kv_cache_dtype="auto",
+        head_size=576,
+        non_causal_multi_token_decode=True,
+        sliding_window=32768,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64), model_config=None
+    )
+
+    spec = MLAAttention.get_kv_cache_spec(layer, vllm_config)
+
+    assert isinstance(spec, SlidingWindowMLASpec)
+    assert spec.non_causal_multi_token_decode

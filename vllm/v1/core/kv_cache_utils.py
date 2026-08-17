@@ -1181,6 +1181,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    group_size_override: int | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1240,9 +1241,16 @@ def _get_kv_cache_groups_uniform_page_size(
     memory per block is the same for all groups.
 
     Args:
-        kv_cache_spec: The KVCacheSpec of each attention layer in the model
+        kv_cache_spec: KV-cache specification for each attention layer.
+        group_size_override: Number of physical layers assigned to every
+            cache group. When omitted, the grouping heuristic derives the
+            size from the attention-layer counts.
+
     Returns:
-        The generated KVCacheGroupSpecs
+        Cache-group specifications with a uniform physical page size.
+
+    Raises:
+        ValueError: If ``group_size_override`` is not positive.
     """
     # Group all layers by kv_cache_spec.
     # E.g., 2 full attention layers and 3 sliding window attention layers,
@@ -1296,6 +1304,13 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    if group_size_override is not None:
+        if group_size_override <= 0:
+            raise ValueError(
+                "KV cache group size override must be positive, got "
+                f"{group_size_override}."
+            )
+        group_size = group_size_override
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -1745,6 +1760,12 @@ def group_and_unify_kv_cache_specs(
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
+    # Recurrent state pages require the generic hybrid-cache planner. Packing
+    # them into the heterogeneous MLA tuple layout would charge the larger
+    # state page to every packed block and reduce attention-cache capacity.
+    if any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.values()):
+        return None
+
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )
@@ -2064,7 +2085,32 @@ def get_kv_cache_groups(
         if fallback_groups is None:
             raise
         return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    k3_group_size = envs.VLLM_K3_KV_GROUP_SIZE
+    use_k3_group_size_override = (
+        k3_group_size > 0
+        and model_type == "kimi_k3"
+        and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+        and any(
+            isinstance(spec, SlidingWindowMLASpec)
+            and spec.non_causal_multi_token_decode
+            for spec in filtered_spec.values()
+        )
+    )
+    if use_k3_group_size_override:
+        groups = _get_kv_cache_groups_uniform_page_size(
+            filtered_spec, group_size_override=k3_group_size
+        )
+        logger.info_once(
+            "Kimi-K3 uses hybrid KV group size %d (%d groups) to reduce "
+            "cache padding and block-table overhead.",
+            k3_group_size,
+            len(groups),
+        )
+    else:
+        groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
