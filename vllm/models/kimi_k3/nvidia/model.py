@@ -683,7 +683,9 @@ class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 is_padding = get_forward_context().is_padding
                 if is_padding is not None:
-                    topk_ids.masked_fill_(is_padding[:num_tokens, None], -1)
+                    padding = is_padding[:num_tokens, None]
+                    topk_ids.masked_fill_(padding, 0)
+                    topk_weights.masked_fill_(padding, 0.0)
             return topk_weights, topk_ids
         return super()._compute_routing(
             hidden_states,
