@@ -49,6 +49,10 @@ _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 # owns the graph's semantic channel, stream, and cleanup stack.
 _B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
 _B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
+_KIMI_LATENT_WIDTH = 3584
+_KIMI_ROUTER_WIDTH = 896
+_KIMI_ROUTER_TOPK = 16
+_KIMI_PAIRED_MAX_BATCH_SIZE = 8
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -541,6 +545,185 @@ def dcp_b12x_all_gather_pair(
         cp_group.all_gather(local_first, dim=-1),
         cp_group.all_gather(local_second, dim=-1),
     )
+
+
+def try_dcp_b12x_all_gather_pair_kimi_topk(
+    local_down: torch.Tensor,
+    local_router: torch.Tensor,
+    correction_bias: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Gather Kimi projections and select routed experts through B12X.
+
+    The returned routing payload has contiguous FP32 weight and int32 expert-ID
+    planes, each shaped ``[num_tokens, 16]``. The expert-ID plane is an integer
+    view of the second half of the FP32 allocation, which gives graph callers
+    one allocation to retain.
+
+    A one-token input uses the combined B12X projection-gather and expert-
+    selection operation. Inputs of two through eight tokens use the paired
+    projection gather followed by one batched B12X expert-selection kernel.
+
+    This binding has no collective fallback because the ordinary paired gather
+    and router are model-level operations. Callers must use those operations
+    when this function returns ``None``.
+    """
+    world_size = cp_group.world_size
+    if world_size not in _B12X_DCP_WORLD_SIZES:
+        return None
+    if local_down.ndim != 2 or local_router.ndim != 2:
+        return None
+    batch = int(local_down.shape[0])
+    local_down_width = _KIMI_LATENT_WIDTH // world_size
+    local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    if (
+        not envs.VLLM_USE_B12X_DCP_A2A
+        or batch < 1
+        or batch > _KIMI_PAIRED_MAX_BATCH_SIZE
+        or local_down.shape != (batch, local_down_width)
+        or local_down.dtype != torch.bfloat16
+        or local_router.shape != (batch, local_router_width)
+        or local_router.dtype != torch.float32
+        or correction_bias.shape != (_KIMI_ROUTER_WIDTH,)
+        or correction_bias.dtype != torch.float32
+        or not local_down.is_cuda
+        or not local_router.is_cuda
+        or not correction_bias.is_cuda
+        or local_down.device != local_router.device
+        or local_down.device != correction_bias.device
+        or not local_down.is_contiguous()
+        or not local_router.is_contiguous()
+        or not correction_bias.is_contiguous()
+    ):
+        return None
+
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0 and batch > token_cap:
+        return None
+    max_batch_size = 1 if batch == 1 else _KIMI_PAIRED_MAX_BATCH_SIZE
+    if token_cap > 0:
+        max_batch_size = min(max_batch_size, token_cap)
+
+    combined_row_bytes = (
+        local_down_width * local_down.element_size()
+        + local_router_width * local_router.element_size()
+    )
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_down.device,
+        total_heads=world_size,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=max_batch_size,
+    )
+    if pool is None:
+        return None
+    if batch == 1:
+        if not hasattr(pool, "all_gather_pair_kimi_topk"):
+            return None
+    elif not hasattr(pool, "all_gather_pair") or not hasattr(pool, "kimi_topk16"):
+        return None
+
+    routing_payload = torch.empty(
+        (batch * 2, _KIMI_ROUTER_TOPK),
+        device=local_down.device,
+        dtype=torch.float32,
+    )
+    topk_weights = routing_payload[:batch]
+    topk_ids = routing_payload[batch:].view(torch.int32)
+    channel_id = _b12x_dcp_channel_id(cp_group)
+    if batch == 1:
+        gathered_down = torch.empty(
+            (1, _KIMI_LATENT_WIDTH),
+            device=local_down.device,
+            dtype=torch.bfloat16,
+        )
+        pool.all_gather_pair_kimi_topk(
+            local_down,
+            local_router,
+            correction_bias,
+            gathered_down,
+            topk_weights,
+            topk_ids,
+            channel_id=channel_id,
+        )
+    else:
+        gathered_down, gathered_router = pool.all_gather_pair(
+            local_down,
+            local_router,
+            channel_id=channel_id,
+        )
+        pool.kimi_topk16(
+            gathered_router,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            channel_id=channel_id,
+        )
+    return gathered_down, routing_payload
+
+
+def warmup_b12x_kimi_projection_gathers(
+    projection_group: GroupCoordinator,
+    *,
+    device: torch.device,
+) -> int:
+    """Compile B12X Kimi paired-projection graph operations eagerly."""
+    world_size = projection_group.world_size
+    if not envs.VLLM_USE_B12X_DCP_A2A or world_size not in _B12X_DCP_WORLD_SIZES:
+        return 0
+
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    pair_batch = (
+        _KIMI_PAIRED_MAX_BATCH_SIZE
+        if token_cap <= 0
+        else min(token_cap, _KIMI_PAIRED_MAX_BATCH_SIZE)
+    )
+    local_down_width = _KIMI_LATENT_WIDTH // world_size
+    local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    local_down = torch.zeros(
+        (pair_batch, local_down_width),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    local_router = torch.zeros(
+        (pair_batch, local_router_width),
+        device=device,
+        dtype=torch.float32,
+    )
+    warmed = 0
+    paired = _try_b12x_dcp_all_gather_pair(
+        local_down,
+        local_router,
+        projection_group,
+        max_batch_size=_KIMI_PAIRED_MAX_BATCH_SIZE,
+    )
+    if paired is not None:
+        warmed += 1
+
+    correction_bias = torch.zeros(
+        (_KIMI_ROUTER_WIDTH,),
+        device=device,
+        dtype=torch.float32,
+    )
+    fused = try_dcp_b12x_all_gather_pair_kimi_topk(
+        local_down[:1],
+        local_router[:1],
+        correction_bias,
+        projection_group,
+    )
+    if fused is not None:
+        warmed += 1
+    if pair_batch > 1:
+        batched = try_dcp_b12x_all_gather_pair_kimi_topk(
+            local_down,
+            local_router,
+            correction_bias,
+            projection_group,
+        )
+        if batched is not None:
+            warmed += 1
+    return warmed
 
 
 def warmup_b12x_dcp_a2a(

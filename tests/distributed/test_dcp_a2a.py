@@ -1567,6 +1567,235 @@ def test_pair_gather_fallback_preserves_tensor_order(monkeypatch):
     assert calls[1][0] is local_second and calls[1][1] == -1
 
 
+@pytest.mark.parametrize("world_size", [2, 4, 8, 16])
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_kimi_pair_topk_supports_projection_world_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    batch: int,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    local_down = torch.zeros(
+        batch, 3584 // world_size, dtype=torch.bfloat16, device="cuda"
+    )
+    local_router = torch.zeros(
+        batch, 896 // world_size, dtype=torch.float32, device="cuda"
+    )
+    correction_bias = torch.zeros(896, dtype=torch.float32, device="cuda")
+    received: dict[str, Any] = {}
+
+    class _FakePool:
+        def all_gather_pair_kimi_topk(
+            self,
+            down,
+            router,
+            bias,
+            out_down,
+            topk_weights,
+            topk_ids,
+            *,
+            channel_id,
+        ):
+            received.update(
+                operation="combined",
+                down=down,
+                router=router,
+                bias=bias,
+                out_down=out_down,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                channel_id=channel_id,
+            )
+
+        def all_gather_pair(self, down, router, *, channel_id):
+            gathered_down = torch.empty(
+                batch, 3584, dtype=torch.bfloat16, device="cuda"
+            )
+            gathered_router = torch.empty(
+                batch, 896, dtype=torch.float32, device="cuda"
+            )
+            received.update(
+                operation="batched",
+                down=down,
+                router=router,
+                gathered_down=gathered_down,
+                gathered_router=gathered_router,
+                channel_id=channel_id,
+            )
+            return gathered_down, gathered_router
+
+        def kimi_topk16(
+            self,
+            router,
+            bias,
+            topk_weights,
+            topk_ids,
+            *,
+            channel_id,
+        ):
+            received.update(
+                topk_router=router,
+                bias=bias,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                topk_channel_id=channel_id,
+            )
+
+    def fake_get_pool(cp_group, **kwargs):
+        received.update(kwargs)
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_b12x_dcp_channel_id",
+        lambda _group: "vllm:draft:decode:graph-2",
+    )
+    group = _FakeCPGroup(world_size, object())  # type: ignore[arg-type]
+
+    actual = dcp_alltoall.try_dcp_b12x_all_gather_pair_kimi_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        group,  # type: ignore[arg-type]
+    )
+
+    assert actual is not None
+    gathered_down, routing_payload = actual
+    assert gathered_down.shape == (batch, 3584)
+    assert gathered_down.dtype == torch.bfloat16
+    assert routing_payload.shape == (batch * 2, 16)
+    assert routing_payload.dtype == torch.float32
+    assert received.pop("down") is local_down
+    assert received.pop("router") is local_router
+    assert received.pop("bias") is correction_bias
+    assert received.pop("topk_weights").data_ptr() == routing_payload.data_ptr()
+    assert received.pop("topk_ids").data_ptr() == routing_payload[batch].data_ptr()
+    if batch == 1:
+        assert received.pop("operation") == "combined"
+        assert received.pop("out_down") is gathered_down
+    else:
+        assert received.pop("operation") == "batched"
+        assert received.pop("gathered_down") is gathered_down
+        assert received.pop("topk_router") is received.pop("gathered_router")
+        assert received.pop("topk_channel_id") == "vllm:draft:decode:graph-2"
+    combined_row_bytes = 7168 // world_size + 3584 // world_size
+    assert received == {
+        "channel_id": "vllm:draft:decode:graph-2",
+        "device": local_down.device,
+        "total_heads": world_size,
+        "head_dim": combined_row_bytes,
+        "query_head_dim": combined_row_bytes,
+        "max_batch_size": 1 if batch == 1 else 8,
+    }
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_kimi_pair_topk_rejects_non_contract_inputs(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_get_b12x_dcp_a2a_pool",
+        lambda *args, **kwargs: pytest.fail("invalid inputs must not create a pool"),
+    )
+    group = _FakeCPGroup(8, object())  # type: ignore[arg-type]
+    down = torch.zeros(1, 448, dtype=torch.bfloat16, device="cuda")
+    router = torch.zeros(1, 112, dtype=torch.float32, device="cuda")
+    bias = torch.zeros(896, dtype=torch.float32, device="cuda")
+
+    invalid_inputs = (
+        (down.expand(9, -1), router.expand(9, -1), bias),
+        (down.expand(2, -1), router, bias),
+        (down[:, :-1].contiguous(), router, bias),
+        (down, router[:, :-1].contiguous(), bias),
+        (down, router, bias[:-1].contiguous()),
+        (down.float(), router, bias),
+        (down, router.bfloat16(), bias),
+    )
+    for invalid_down, invalid_router, invalid_bias in invalid_inputs:
+        assert (
+            dcp_alltoall.try_dcp_b12x_all_gather_pair_kimi_topk(
+                invalid_down,
+                invalid_router,
+                invalid_bias,
+                group,  # type: ignore[arg-type]
+            )
+            is None
+        )
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_kimi_batched_topk_requires_batched_router_binding(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+
+    class _OneTokenPool:
+        def all_gather_pair_kimi_topk(self, *args, **kwargs):
+            pytest.fail("an eight-token input must not use the one-token operation")
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_get_b12x_dcp_a2a_pool",
+        lambda *args, **kwargs: _OneTokenPool(),
+    )
+    group = _FakeCPGroup(8, object())  # type: ignore[arg-type]
+
+    result = dcp_alltoall.try_dcp_b12x_all_gather_pair_kimi_topk(
+        torch.zeros(8, 448, dtype=torch.bfloat16, device="cuda"),
+        torch.zeros(8, 112, dtype=torch.float32, device="cuda"),
+        torch.zeros(896, dtype=torch.float32, device="cuda"),
+        group,  # type: ignore[arg-type]
+    )
+
+    assert result is None
+
+
+def test_kimi_projection_warmup_respects_transport_token_cap(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    group = _FakeCPGroup(8, object())  # type: ignore[arg-type]
+    calls: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+
+    def pair(local_down, local_router, projection_group, *, max_batch_size):
+        assert projection_group is group
+        assert max_batch_size == 8
+        calls.append(("pair", tuple(local_down.shape), tuple(local_router.shape)))
+        return local_down, local_router
+
+    def topk(local_down, local_router, correction_bias, projection_group):
+        assert projection_group is group
+        assert correction_bias.shape == (896,)
+        calls.append(("topk", tuple(local_down.shape), tuple(local_router.shape)))
+        return local_down, torch.empty(local_down.shape[0] * 2, 16)
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_all_gather_pair", pair)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        topk,
+    )
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 3
+    assert calls == [
+        ("pair", (4, 448), (4, 112)),
+        ("topk", (1, 448), (1, 112)),
+        ("topk", (4, 448), (4, 112)),
+    ]
+
+
 def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
