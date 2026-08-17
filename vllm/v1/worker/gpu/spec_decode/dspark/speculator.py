@@ -424,6 +424,7 @@ class DSparkSpeculator(DFlashSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
         num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
         if num_query_per_req is None:
             num_query_per_req = self.num_query_per_req
