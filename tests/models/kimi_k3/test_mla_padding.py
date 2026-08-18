@@ -32,7 +32,7 @@ def test_kimi_mla_absorbed_weight_preallocation_uses_local_heads():
     assert w_uk_t.is_contiguous()
 
 
-def test_kimi_mla_decode_query_uses_allocation_safe_bmm(monkeypatch):
+def test_kimi_mla_decode_query_materializes_interleaved_heads(monkeypatch):
     from vllm.models.kimi_k3.nvidia import mla
 
     attention = object.__new__(mla.MultiHeadLatentAttention)
@@ -55,9 +55,9 @@ def test_kimi_mla_decode_query_uses_allocation_safe_bmm(monkeypatch):
 
     assert len(calls) == 1
     captured_query, captured_weight, use_safe_op = calls[0]
-    assert captured_query.data_ptr() == query.data_ptr()
+    assert captured_query.data_ptr() != query.data_ptr()
     assert captured_query.shape == query.transpose(0, 1).shape
-    assert captured_query.stride() == query.transpose(0, 1).stride()
+    assert captured_query.is_contiguous()
     assert captured_weight is attention.W_UK_T
     assert use_safe_op is True
     expected = torch.bmm(query.transpose(0, 1).contiguous(), attention.W_UK_T)

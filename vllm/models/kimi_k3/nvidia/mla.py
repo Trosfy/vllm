@@ -587,13 +587,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
     def _absorb_decode_query(self, q_nope: torch.Tensor) -> torch.Tensor:
-        """Project a tight Kimi decode-query view into MLA latent space.
+        """Project the Kimi decode query into MLA latent space.
 
-        The query is a non-contiguous view into the combined NoPE/RoPE
-        projection. The allocation-safe MLA BMM supplies explicit leading
-        dimensions so cuBLAS does not read beyond that view's backing storage.
+        The NoPE component is an interleaved head view of the combined
+        NoPE/RoPE projection. Tensor-core cuBLAS batched-GEMM algorithms may
+        issue vector reads beyond the logical matrix when the batch stride is
+        smaller than a matrix's storage span. Materializing head-major storage
+        gives every batch matrix an independent contiguous range.
         """
-        query = q_nope.transpose(0, 1)
+        query = q_nope.transpose(0, 1).contiguous()
         output = query.new_empty((query.shape[0], query.shape[1], self.kv_lora_rank))
         _run_mla_query_bmm(
             query,
