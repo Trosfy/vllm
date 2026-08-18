@@ -15,6 +15,7 @@ def _require_safe_mla_query_bmm():
 @pytest.mark.parametrize(
     "heads,tokens,q_dim",
     [
+        (6, 14, 128),
         (8, 1, 512),
         (8, 6, 512),
         (8, 11, 512),
