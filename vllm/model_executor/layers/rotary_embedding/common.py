@@ -151,7 +151,7 @@ class ApplyRotaryEmb(CustomOp):
             except ModuleNotFoundError as error:
                 missing = error.name or ""
                 expected = "vllm.vllm_flash_attn.layers.rotary"
-                if not expected.startswith(missing):
+                if not missing or not expected.startswith(missing):
                     raise
 
     @staticmethod

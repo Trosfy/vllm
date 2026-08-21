@@ -22,10 +22,28 @@ from vllm.config import (
     get_cached_compilation_config,
     set_current_vllm_config,
 )
+from vllm.model_executor.layers.rotary_embedding import common
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.platforms import current_platform
 
 CUDA_DEVICES = ["cuda:0"]
+
+
+def test_cuda_rotary_reraises_nameless_vendored_import_failure(
+    monkeypatch, default_vllm_config: VllmConfig
+) -> None:
+    """An existing vendored module must not hide its internal import failure."""
+
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    def raise_nameless(_name: str):
+        raise ModuleNotFoundError("vendored rotary initialization failed")
+
+    monkeypatch.setattr(common, "import_module", raise_nameless)
+
+    with pytest.raises(ModuleNotFoundError, match="initialization failed"):
+        ApplyRotaryEmb()
 
 
 def test_cuda_rotary_uses_native_path_without_vendored_kernel(
