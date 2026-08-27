@@ -1540,10 +1540,13 @@ def test_resolve_model_path_falls_back_to_offline_snapshot_download(
 # --------------------------------------------------------------------------- #
 # (a) env-on vs env-off FORWARD equivalence, through the CPU dispatch key.
 # Widened per the R2.18 fallback: env-on now hashes AND gathers inside the
-# op, so this compares the WHOLE forward — stock hashing (env-off) against
-# the widened op's internal call to the SAME _hash_ngram_ids (env-on) — a
-# stronger test than the old gather-only seam, since a hashing regression
-# would now be caught here too, not just a gather regression.
+# op. Both arms call the SAME Qwen4ExpNGramEmbedding._hash_ngram_ids, so
+# this test proves the env-on path loads the RIGHT weights and gathers and
+# dequantizes them the same way the stock VocabParallelEmbedding path
+# does — it does NOT independently verify the hashing math itself: a bug
+# in _hash_ngram_ids would move both arms identically and cancel out here.
+# Hashing correctness is pinned separately by
+# test_hash_ngram_ids_matches_golden_ids below.
 # --------------------------------------------------------------------------- #
 
 
@@ -1557,7 +1560,9 @@ def test_env_on_off_forward_equivalence_fp8_and_dequantized(
     IDENTICAL weight values, driven through the REGISTERED widened op via
     its CPU dispatch key. Same input_ids/query_start_loc/ngram_context on
     both sides; compared byte-equal at fp8 AND through
-    _dequantize_embeddings to bf16.
+    _dequantize_embeddings to bf16. Proves weight-loading/gather/dequant
+    equivalence between the two paths, not hashing correctness (both
+    arms share the same _hash_ngram_ids call, see module comment above).
     """
     config = _make_text_config()  # ngram_size=3, heads_per_ngram=2 -> 4 heads
     embedding_dim = 8  # head_dim = 2
@@ -1660,6 +1665,52 @@ def test_env_on_off_forward_equivalence_fp8_and_dequantized(
     dequant_on = mmap_ple_layer._dequantize_embeddings(got, torch.bfloat16)
 
     assert torch.equal(dequant_on, dequant_off)
+
+
+# --------------------------------------------------------------------------- #
+# (M1) _hash_ngram_ids golden pin. The equivalence test above drives BOTH
+# arms through the same _hash_ngram_ids call, so it cannot catch a bug in
+# the hashing math itself (xor chain / remainder / offset) — a mutation
+# there moves both arms identically and cancels out. This test freezes the
+# exact output of a fixed, small, real Qwen4ExpNGramEmbedding on fixed
+# inputs, so a hashing regression has to change these hardcoded numbers.
+# --------------------------------------------------------------------------- #
+
+
+def test_hash_ngram_ids_matches_golden_ids() -> None:
+    """Golden values captured by running this exact scenario once and
+    hardcoding the result — they pin the xor-chain/remainder/offset math
+    in _hash_ngram_ids (ngram_size=3, heads_per_ngram=2, seed=1234,
+    ple_dense_layer_id=0), not merely its shape.
+    """
+    config = _make_text_config()  # ngram_size=3, heads_per_ngram=2 -> 4 heads
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        8,
+        0,
+        8,
+        2,
+        "model.layers.1.ple.ple_embedding",
+        "model.layers.1.ple",
+        params_dtype=torch.float32,
+    )
+
+    input_ids = torch.tensor([11, 22, 33], dtype=torch.long)
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.long)
+    ngram_context = torch.tensor([[44, 55], [66, 77]], dtype=torch.long)
+
+    ngram_ids = module._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
+
+    assert ngram_ids.shape == (3, 4)
+    golden = torch.tensor(
+        [
+            [647, 1359, 2559, 3257],
+            [128, 1518, 2612, 3993],
+            [891, 1118, 2768, 3902],
+        ],
+        dtype=torch.long,
+    )
+    assert torch.equal(ngram_ids, golden)
 
 
 # --------------------------------------------------------------------------- #

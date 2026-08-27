@@ -591,10 +591,12 @@ def set_weight_scale(
 
 
 # --------------------------------------------------------------------------- #
-# Startup guard: the gather must never run inside CUDA graph capture.
+# Startup guard: the whole-forward op (hashing + gather) must never run
+# inside CUDA graph capture.
 # --------------------------------------------------------------------------- #
 def check_cudagraph_safety(compilation_config: CompilationConfig) -> None:
-    """Raise if VLLM_PLE_MMAP=1 would run the CPU gather inside a capture.
+    """Raise if VLLM_PLE_MMAP=1 would run the hashing+gather forward inside
+    a capture.
 
     Three independent checks (R1.1/R3.4/R4.2), any of which alone would miss
     a real route into a capture:
@@ -611,8 +613,9 @@ def check_cudagraph_safety(compilation_config: CompilationConfig) -> None:
     """
     if compilation_config.cudagraph_mode.has_full_cudagraphs():
         raise RuntimeError(
-            "VLLM_PLE_MMAP=1 requires piecewise-only CUDA graphs (the CPU "
-            "gather cannot run inside a capture); got cudagraph_mode="
+            "VLLM_PLE_MMAP=1 requires piecewise-only CUDA graphs (the "
+            "hashing+gather forward cannot run inside a capture); "
+            "got cudagraph_mode="
             f"{compilation_config.cudagraph_mode}. Pass "
             "-cc.cudagraph_mode=PIECEWISE."
         )
@@ -951,7 +954,9 @@ def _qwen4_exp_ple_mmap_forward(
             f"PLE mmap: {layer_name!r} is not registered in no_compile_layers"
         ) from None
     ple_embedding_module = getattr(layer, "ple_embedding", None)
-    if ple_embedding_module is None:
+    if ple_embedding_module is None or not hasattr(
+        ple_embedding_module, "_hash_ngram_ids"
+    ):
         raise RuntimeError(f"PLE mmap: {layer_name!r} does not resolve to a PLE layer")
     # The stock trigram hashing runs here, eagerly and untraced — ordinary
     # GPU tensor ops are fine inside a custom op body; they are simply never
