@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +49,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import copy_ple_embedding_shard_
+from . import ple_mmap
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -214,10 +216,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         max_total_tokens: int,
         max_num_reqs: int,
         prefix: str,
+        layer_name: str,
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self.layer_name = layer_name
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
@@ -274,16 +278,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
-            ),
-        )
+        self.ngram_embedding: VocabParallelEmbedding | ple_mmap.MmapNgramEmbedding
+        if ple_mmap.enabled():
+            vllm_config = get_current_vllm_config()
+            ple_mmap.check_cudagraph_safety(vllm_config.compilation_config)
+            ple_mmap.validate_shards_for(
+                vllm_config.model_config, layer_name, self.head_dim
+            )
+            self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
+                padded_vocab_size, self.head_dim
+            )
+        else:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+                quant_method=_get_ple_embedding_quant_method(
+                    quant_config, f"{prefix}.ngram_embedding"
+                ),
+            )
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -398,6 +413,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
+        if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            output = ngram_ids.new_empty(
+                (ngram_ids.shape[0], self.embedding_dim),
+                dtype=self.ngram_embedding.torch_dtype,
+            )
+            torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, self.layer_name)
+            return output
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -411,6 +433,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
+        embedding = self.ngram_embedding
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
@@ -426,6 +449,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
                 loaded.add(name)
                 continue
+            if (
+                isinstance(embedding, ple_mmap.MmapNgramEmbedding)
+                and name == "ngram_embedding.weight_scale"
+            ):
+                # The placeholder has no registered weight_scale Parameter for
+                # AutoWeightsLoader to find generically; register it directly,
+                # on whatever device the module's other buffers already live.
+                ple_mmap.set_weight_scale(
+                    embedding,
+                    loaded_weight,
+                    cast(torch.Tensor, self.layer_multipliers).device,
+                )
+                loaded.add(name)
+                continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
@@ -437,7 +474,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"PLE embedding shard index {shard_index} exceeds "
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
-                embedding = self.ngram_embedding
                 shard_size = (
                     embedding.org_vocab_size + self.split_ngram_parts - 1
                 ) // self.split_ngram_parts
@@ -453,12 +489,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                if isinstance(embedding, ple_mmap.MmapNgramEmbedding):
+                    # Served from disk via mmap; the loader still streams
+                    # this shard transiently, but it is never retained.
+                    # weights_streamed distinguishes this real (non-dummy)
+                    # load from a --load-format dummy probe that never
+                    # calls load_weights at all — build_tables must attach
+                    # a real table before any forward, or the placeholder
+                    # raises instead of silently serving fp8 zeros.
+                    embedding.weights_streamed = True
+                    loaded.add("ngram_embedding.weight")
+                    continue
+                # The stock path below reads .weight/.shard_indices, which
+                # only the real VocabParallelEmbedding provides (never
+                # reached when mmap-enabled, per the isinstance branch
+                # above); cast rather than assert so duck-typed test
+                # doubles still work.
+                stock_embedding = cast(VocabParallelEmbedding, embedding)
                 copy_ple_embedding_shard_(
-                    embedding.weight.data,
+                    stock_embedding.weight.data,
                     loaded_weight,
                     checkpoint_start=checkpoint_start,
-                    tp_start=embedding.shard_indices.org_vocab_start_index,
-                    tp_end=embedding.shard_indices.org_vocab_end_index,
+                    tp_start=stock_embedding.shard_indices.org_vocab_start_index,
+                    tp_end=stock_embedding.shard_indices.org_vocab_end_index,
                 )
                 loaded.add("ngram_embedding.weight")
                 continue
@@ -506,6 +559,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.scheduler_config.max_num_seqs,
             f"{prefix}.ple_embedding",
+            prefix,
             quant_config=quant_config,
             params_dtype=model_config.dtype,
         )
