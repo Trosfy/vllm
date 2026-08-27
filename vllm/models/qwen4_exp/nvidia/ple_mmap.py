@@ -18,12 +18,16 @@ How, with ``VLLM_PLE_MMAP=1``:
     checkpoint's global FP8 ``weight_scale`` as a buffer on the placeholder,
     which the untouched ``Qwen4ExpPLELayer._dequantize_embeddings`` already
     knows how to consume.
-  * the trigram hashing in ``Qwen4ExpNGramEmbedding.forward`` stays exactly
-    as upstream (compiled, captured); only the row gather itself
-    (``self.ngram_embedding(ngram_ids)``) is wrapped in a custom op,
-    ``vllm::qwen4_exp_ple_mmap_gather``, so it can be listed in
-    ``splitting_ops`` and run OUTSIDE CUDA graph capture (it is CPU work
-    plus a pageable H2D copy, which cannot live inside a capture).
+  * the WHOLE forward — trigram hashing plus the row gather — is wrapped in
+    a custom op, ``vllm::qwen4_exp_ple_mmap_forward``, so it runs OUTSIDE
+    CUDA graph capture and outside torch.compile tracing entirely (R2.18
+    fallback: the stock hashing's ``.numel()``-derived slicing specializes
+    vLLM's dynamic dims under Dynamo — ``ConstraintViolationError`` on
+    ``query_start_loc.size()[0]`` — when only the gather was split out;
+    widening the op boundary to cover the hashing too, per the plan's
+    pre-authorized contingency, sidesteps tracing it at all). The op is
+    listed in ``splitting_ops`` the same way the narrower gather-only op
+    was.
 
 This module is imported unconditionally at ``nvidia/ple_layer.py`` module
 scope so the custom op registers at import time; every behavior above is
@@ -68,7 +72,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("vllm.ple_mmap")
 
-OP_NAME = "qwen4_exp_ple_mmap_gather"
+OP_NAME = "qwen4_exp_ple_mmap_forward"
 QUALIFIED_OP_NAME = f"vllm::{OP_NAME}"
 
 _FP8_DTYPES: dict[str, torch.dtype] = {
@@ -928,10 +932,15 @@ def _attach_table(
 
 
 # --------------------------------------------------------------------------- #
-# Custom op: the gather itself, split out of the compiled/captured graph.
+# Custom op: the WHOLE forward (hashing + gather), split out of the
+# compiled/captured graph (R2.18 fallback — see the module docstring).
 # --------------------------------------------------------------------------- #
-def _qwen4_exp_ple_mmap_gather(
-    ngram_ids: torch.Tensor, output: torch.Tensor, layer_name: str
+def _qwen4_exp_ple_mmap_forward(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
 ) -> None:
     from vllm.forward_context import get_forward_context
 
@@ -944,21 +953,31 @@ def _qwen4_exp_ple_mmap_gather(
     ple_embedding_module = getattr(layer, "ple_embedding", None)
     if ple_embedding_module is None:
         raise RuntimeError(f"PLE mmap: {layer_name!r} does not resolve to a PLE layer")
+    # The stock trigram hashing runs here, eagerly and untraced — ordinary
+    # GPU tensor ops are fine inside a custom op body; they are simply never
+    # seen by Dynamo, which is the whole point of the R2.18 fallback.
+    ngram_ids = ple_embedding_module._hash_ngram_ids(
+        input_ids, query_start_loc, ngram_context
+    )
     result = ple_embedding_module.ngram_embedding(ngram_ids).flatten(-2)
     output.copy_(result)
 
 
-def _qwen4_exp_ple_mmap_gather_fake(
-    ngram_ids: torch.Tensor, output: torch.Tensor, layer_name: str
+def _qwen4_exp_ple_mmap_forward_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
 ) -> None:
     return
 
 
 direct_register_custom_op(
     op_name=OP_NAME,
-    op_func=_qwen4_exp_ple_mmap_gather,
+    op_func=_qwen4_exp_ple_mmap_forward,
     mutates_args=["output"],
-    fake_impl=_qwen4_exp_ple_mmap_gather_fake,
+    fake_impl=_qwen4_exp_ple_mmap_forward_fake,
 )
 # The op above registers under the platform-default dispatch key (CUDA in
 # production). Unit tests run without a GPU-resident model and need the same
@@ -967,7 +986,7 @@ direct_register_custom_op(
 # re-define the schema and raise at MODULE IMPORT, killing every serve,
 # since this module is imported unconditionally (R2.5).
 if current_platform.dispatch_key != "CPU":
-    vllm_lib.impl(OP_NAME, _qwen4_exp_ple_mmap_gather, dispatch_key="CPU")
+    vllm_lib.impl(OP_NAME, _qwen4_exp_ple_mmap_forward, dispatch_key="CPU")
 
 __all__ = [
     "OP_NAME",

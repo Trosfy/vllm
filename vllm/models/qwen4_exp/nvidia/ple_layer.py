@@ -349,12 +349,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def _hash_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        """Stock trigram hashing. Factored out of ``forward`` so the env-off
+        path and the env-on widened custom op (R2.18 fallback) share
+        exactly one implementation — this body is otherwise byte-identical
+        to what used to be inline in ``forward``.
+        """
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1
@@ -412,14 +417,34 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
+        return torch.cat(id_blocks, dim=-1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
         if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
-            output = ngram_ids.new_empty(
-                (ngram_ids.shape[0], self.embedding_dim),
+            # R2.18 fallback: the stock hashing above specializes vLLM's
+            # dynamic dims (Python ints from .numel()-derived slicing) when
+            # traced under torch.compile — ConstraintViolationError on
+            # query_start_loc.size()[0]. Widen the op boundary to the WHOLE
+            # forward (hashing runs eagerly, untraced, inside the op)
+            # rather than just the gather. The allocation below is still
+            # traced code; new_empty with a symbolic dim is fine — it is
+            # the .numel()-to-int SLICING inside _hash_ngram_ids that
+            # specialized, so num_tokens here must stay symbolic (no int()).
+            num_tokens = input_ids.reshape(-1).shape[0]
+            output = input_ids.new_empty(
+                (num_tokens, self.embedding_dim),
                 dtype=self.ngram_embedding.torch_dtype,
             )
-            torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, self.layer_name)
+            torch.ops.vllm.qwen4_exp_ple_mmap_forward(
+                input_ids, query_start_loc, ngram_context, output, self.layer_name
+            )
             return output
+        ngram_ids = self._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -27,6 +27,7 @@ import vllm.models.qwen4_exp.nvidia.model as model_module
 import vllm.models.qwen4_exp.nvidia.ple_mmap as ple_mmap
 from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
@@ -570,7 +571,7 @@ def test_op_is_registered_under_platform_default_and_cpu_dispatch_keys() -> None
         assert torch._C._dispatch_has_kernel_for_dispatch_key(
             ple_mmap.QUALIFIED_OP_NAME, "CUDA"
         )
-    # (F-1b) The output arg's alias annotation ("(a1!)") is what tells
+    # (F-1b) The output arg's alias annotation ("(a3!)") is what tells
     # torch.compile the write to `output` must survive functionalization —
     # without it (mutates_args=[]), a compiled graph can drop the write and
     # the caller reads back its own uninitialized new_empty buffer instead
@@ -581,38 +582,57 @@ def test_op_is_registered_under_platform_default_and_cpu_dispatch_keys() -> None
     assert "!) output" in schema, schema
     assert schema.endswith("-> ()")
     # Exercise the CPU key directly: this is what every other test below
-    # relies on to run without a GPU.
-    result_holder: dict[str, torch.Tensor] = {}
+    # relies on to run without a GPU. The widened (R2.18) op calls
+    # ple_embedding_module._hash_ngram_ids THEN .ngram_embedding(...), so
+    # the fake stands in for both.
+    hash_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    gather_calls: list[torch.Tensor] = []
 
-    class _FakeEmbedding:
-        def __call__(self, ids: torch.Tensor) -> torch.Tensor:
-            result_holder["ids"] = ids
-            return torch.zeros((*ids.shape, 2), dtype=torch.float8_e4m3fn)
+    class _FakePleEmbeddingModule:
+        def _hash_ngram_ids(
+            self,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor,
+        ) -> torch.Tensor:
+            hash_calls.append((input_ids, query_start_loc, ngram_context))
+            return torch.zeros((input_ids.reshape(-1).shape[0], 2), dtype=torch.long)
 
-    fake_layer = SimpleNamespace(
-        ple_embedding=SimpleNamespace(ngram_embedding=_FakeEmbedding())
-    )
+        def ngram_embedding(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+            gather_calls.append(ngram_ids)
+            return torch.zeros((*ngram_ids.shape, 2), dtype=torch.float8_e4m3fn)
+
+    fake_layer = SimpleNamespace(ple_embedding=_FakePleEmbeddingModule())
     ctx = SimpleNamespace(no_compile_layers={"layer0": fake_layer})
-    ngram_ids = torch.zeros((2, 2), dtype=torch.long)
+    input_ids = torch.zeros((2,), dtype=torch.long)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.long)
+    ngram_context = torch.zeros((1, 4), dtype=torch.long)
     output = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
 
     with forward_context.override_forward_context(ctx):
-        torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, "layer0")
+        torch.ops.vllm.qwen4_exp_ple_mmap_forward(
+            input_ids, query_start_loc, ngram_context, output, "layer0"
+        )
 
-    assert torch.equal(result_holder["ids"], ngram_ids)
+    assert len(hash_calls) == 1
+    assert len(gather_calls) == 1
     assert torch.equal(output, torch.zeros_like(output))
 
 
 def test_op_raises_named_error_when_layer_name_does_not_resolve() -> None:
     ctx = SimpleNamespace(no_compile_layers={"layer0": SimpleNamespace()})
-    ngram_ids = torch.zeros((1, 2), dtype=torch.long)
+    input_ids = torch.zeros((1,), dtype=torch.long)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.long)
+    ngram_context = torch.zeros((1, 4), dtype=torch.long)
     output = torch.empty((1, 4), dtype=torch.float8_e4m3fn)
 
     with (
         forward_context.override_forward_context(ctx),
         pytest.raises(RuntimeError, match="does not resolve to a PLE layer"),
     ):
-        torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, "layer0")
+        torch.ops.vllm.qwen4_exp_ple_mmap_forward(
+            input_ids, query_start_loc, ngram_context, output, "layer0"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1518,73 +1538,127 @@ def test_resolve_model_path_falls_back_to_offline_snapshot_download(
 
 
 # --------------------------------------------------------------------------- #
-# (a) env-on vs env-off gather equivalence, through the CPU dispatch key.
+# (a) env-on vs env-off FORWARD equivalence, through the CPU dispatch key.
+# Widened per the R2.18 fallback: env-on now hashes AND gathers inside the
+# op, so this compares the WHOLE forward — stock hashing (env-off) against
+# the widened op's internal call to the SAME _hash_ngram_ids (env-on) — a
+# stronger test than the old gather-only seam, since a hashing regression
+# would now be caught here too, not just a gather regression.
 # --------------------------------------------------------------------------- #
 
 
-def test_env_on_off_gather_equivalence_fp8_and_dequantized(tmp_path: Path) -> None:
-    """The env-off reference arm (weight.view(uint8) -> index_select ->
-    view(fp8)) is byte-exact, CPU-legal, and torch-version-agnostic (no CPU
-    fp8 embedding kernel is assumed — the same reinterpret-cast MmapPleTable
-    performs). Compared against the REGISTERED custom op via its CPU
-    dispatch key, at fp8 AND through _dequantize_embeddings to bf16.
+def test_env_on_off_forward_equivalence_fp8_and_dequantized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """env-off: a real stock VocabParallelEmbedding under
+    Qwen4ExpPLEFp8EmbeddingMethod (real FP8 weight + weight_scale
+    Parameters, mirrors test_ple.py's _make_fp8_embedding_layer). env-on:
+    an MmapNgramEmbedding placeholder attached to shard files holding the
+    IDENTICAL weight values, driven through the REGISTERED widened op via
+    its CPU dispatch key. Same input_ids/query_start_loc/ngram_context on
+    both sides; compared byte-equal at fp8 AND through
+    _dequantize_embeddings to bf16.
     """
-    vocab, cols, heads = 12, 4, 2
-    weight = (
-        torch.remainder(
-            torch.arange(vocab * cols, dtype=torch.float32).reshape(vocab, cols), 6.0
-        )
-        - 3.0
-    )
-    weight_fp8 = weight.to(torch.float8_e4m3fn)
-    scale = torch.tensor([0.5], dtype=torch.bfloat16)
-    ngram_ids = torch.tensor([[0, 5], [11, 2], [5, 0]], dtype=torch.long)
+    config = _make_text_config()  # ngram_size=3, heads_per_ngram=2 -> 4 heads
+    embedding_dim = 8  # head_dim = 2
+    scale = 0.5
 
-    reference = (
-        weight_fp8.view(torch.uint8)
-        .index_select(0, ngram_ids.reshape(-1))
-        .view(torch.float8_e4m3fn)
-        .reshape(*ngram_ids.shape, cols)
-        .flatten(-2)
+    # --- env-off: real stock FP8 VocabParallelEmbedding. ---
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        ignored_layers=[],
+        weight_block_size=[128, 128],
+    )
+    stock = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim,
+        0,
+        16,
+        4,
+        "model.layers.1.ple.ple_embedding",
+        "model.layers.1.ple",
+        quant_config=quant_config,
+        params_dtype=torch.bfloat16,
+    )
+    assert isinstance(stock.ngram_embedding, embedding_module.VocabParallelEmbedding)
+    vocab = stock.ngram_embedding.org_vocab_size
+    head_dim = stock.head_dim
+    parts = stock.split_ngram_parts
+    weight = _synthetic_weight(vocab, head_dim, layer_idx=1)
+    stock.ngram_embedding.weight.data.copy_(weight)
+    stock.ngram_embedding.weight_scale.data.copy_(
+        torch.tensor([scale], dtype=torch.bfloat16)
     )
 
-    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
-    parts = 3
-    shard_size = (vocab + parts - 1) // parts
-    for shard_index in range(parts):
-        start = shard_index * shard_size
-        rows = max(0, min(shard_size, vocab - start))
-        tensors = {
-            f"{prefix}.shard_{shard_index}.weight": weight_fp8[start : start + rows]
-        }
-        if shard_index == 0:
-            tensors[f"{prefix}.weight_scale"] = scale
-        safetensors.torch.save_file(
-            tensors, str(tmp_path / f"model-ple-{shard_index:05d}.safetensors")
-        )
-    embedding = _attached_embedding(
-        tmp_path, layer_idx=1, vocab=vocab, parts=parts, cols=cols, scale=0.5
+    input_ids = torch.tensor([1, 2], dtype=torch.long)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.long)
+    ngram_context = torch.zeros((1, 4), dtype=torch.long)
+
+    reference = stock.forward(input_ids, query_start_loc, ngram_context)
+    assert reference.dtype == torch.float8_e4m3fn
+
+    # --- env-on: mmap placeholder backed by shards holding the SAME
+    # weight values, driven through the registered custom op. ---
+    _write_ple_layer(
+        tmp_path, layer_idx=1, vocab=vocab, parts=parts, cols=head_dim, scale=scale
     )
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    cc = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        splitting_ops=[ple_mmap.QUALIFIED_OP_NAME],
+    )
+    vllm_config = SimpleNamespace(
+        compilation_config=cc, model_config=_model_config(tmp_path)
+    )
+    with set_current_vllm_config(vllm_config):
+        mmap_module = Qwen4ExpNGramEmbedding(
+            config,
+            embedding_dim,
+            0,
+            16,
+            4,
+            "model.layers.1.ple.ple_embedding",
+            "model.layers.1.ple",
+            params_dtype=torch.bfloat16,
+        )
+    assert isinstance(mmap_module.ngram_embedding, ple_mmap.MmapNgramEmbedding)
+    ple_mmap.set_weight_scale(
+        mmap_module.ngram_embedding,
+        torch.tensor([scale], dtype=torch.bfloat16),
+        torch.device("cpu"),
+    )
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[1]
+    ple_mmap._attach_table(
+        mmap_module.ngram_embedding,
+        layer_shards,
+        split_ngram_parts=parts,
+        layer_idx=1,
+        model_path=str(tmp_path),
+    )
+
+    fake_ple_layer = SimpleNamespace(ple_embedding=mmap_module)
+    ctx = SimpleNamespace(no_compile_layers={mmap_module.layer_name: fake_ple_layer})
+    with forward_context.override_forward_context(ctx):
+        got = mmap_module.forward(input_ids, query_start_loc, ngram_context)
+
+    assert torch.equal(got, reference)
 
     # Real nn.Module chain (mirrors test_ple.py's
     # test_ple_fp8_embedding_dequantizes_in_ple_layer): __new__ + a manual
     # nn.Module.__init__ skips the heavy real __init__, but
     # _get_embedding_weight_scale/_dequantize_embeddings stay the REAL
     # bound methods, exercising the actual getattr chain — no lambda stub.
-    ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    nn.Module.__init__(ple_layer)
-    ple_layer.ple_embedding = nn.Module()
-    ple_layer.ple_embedding.ngram_embedding = embedding
+    stock_ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(stock_ple_layer)
+    stock_ple_layer.ple_embedding = stock
+    dequant_off = stock_ple_layer._dequantize_embeddings(reference, torch.bfloat16)
 
-    output = torch.empty((ngram_ids.shape[0], heads * cols), dtype=torch.float8_e4m3fn)
-    ctx = SimpleNamespace(no_compile_layers={"layer0": ple_layer})
-    with forward_context.override_forward_context(ctx):
-        torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, "layer0")
+    mmap_ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(mmap_ple_layer)
+    mmap_ple_layer.ple_embedding = mmap_module
+    dequant_on = mmap_ple_layer._dequantize_embeddings(got, torch.bfloat16)
 
-    assert torch.equal(output, reference)
-
-    dequant_on = ple_layer._dequantize_embeddings(output, torch.bfloat16)
-    dequant_off = reference.to(torch.bfloat16) * scale.to(torch.bfloat16)
     assert torch.equal(dequant_on, dequant_off)
 
 
@@ -1655,9 +1729,10 @@ def test_mmap_forward_allocates_an_fp8_output_buffer(
         model_path=str(tmp_path),
     )
 
-    fake_ple_layer = SimpleNamespace(
-        ple_embedding=SimpleNamespace(ngram_embedding=embedding)
-    )
+    # ple_embedding must be the REAL module (not a bare embedding wrapper):
+    # the widened (R2.18) op calls ple_embedding_module._hash_ngram_ids(...)
+    # before the gather, and only Qwen4ExpNGramEmbedding provides that.
+    fake_ple_layer = SimpleNamespace(ple_embedding=module)
     ctx = SimpleNamespace(no_compile_layers={layer_name: fake_ple_layer})
 
     input_ids = torch.tensor([1, 2], dtype=torch.long)
