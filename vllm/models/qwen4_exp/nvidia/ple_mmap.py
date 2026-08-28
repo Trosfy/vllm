@@ -27,6 +27,18 @@ How, with ``VLLM_PLE_MMAP=1``:
     forced a temporary whole-forward op boundary until the hashing was
     rewritten with symbolic-safe constructs.) The op is listed in
     ``splitting_ops``.
+  * ``MmapNgramEmbedding.forward`` tolerates out-of-range ids by
+    zero-filling instead of gathering. This is not a relaxed bounds check:
+    the op runs eagerly between piecewise CUDA-graph subgraph captures, and
+    during capture a compiled subgraph is RECORDED, not executed, so this
+    op's ``ngram_ids`` input can be read off an unexecuted intermediate
+    buffer (uninitialized memory) instead of the real hashed ids. Executed
+    hashing (``Qwen4ExpNGramEmbedding._hash_ngram_ids`` in ``ple_layer.py``)
+    provably bounds every id via ``torch.remainder(...) + offsets``, so an
+    out-of-range id can only come from such a non-semantic capture pass,
+    whose output is never consumed. See :meth:`MmapPleTable.gather`, which
+    keeps its own strict ``IndexError`` for every other caller (e.g.
+    prewarm/tests) — the tolerance lives at the forward boundary only.
 
 This module is imported unconditionally at ``nvidia/ple_layer.py`` module
 scope so the custom op registers at import time; every behavior above is
@@ -46,7 +58,6 @@ from __future__ import annotations
 import functools
 import glob
 import json
-import logging
 import math
 import os
 import re
@@ -63,13 +74,14 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config.compilation import CompilationMode
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op, get_dtype_size, vllm_lib
 
 if TYPE_CHECKING:
     from vllm.config import CompilationConfig, ModelConfig
 
-logger = logging.getLogger("vllm.ple_mmap")
+logger = init_logger(__name__)
 
 OP_NAME = "qwen4_exp_ple_mmap_gather"
 QUALIFIED_OP_NAME = f"vllm::{OP_NAME}"
@@ -334,6 +346,7 @@ class MmapPleTable:
         self.pool = ThreadPoolExecutor(max_workers=self.workers)
         self._pending = 0
         self._errors = 0
+        self._skipped = 0
         self._rows_since_log = 0
         self._latencies_ms: list[float] = []
         self._last_log = time.monotonic()
@@ -407,6 +420,17 @@ class MmapPleTable:
         )
         return gathered
 
+    def record_capture_pass_skip(self) -> None:
+        """Count one gather skipped by :class:`MmapNgramEmbedding` because its
+        input ids were out of range.
+
+        Never called from :meth:`gather` itself — that path stays a strict
+        ``IndexError`` for every caller other than the compiled forward (see
+        the module docstring). Surfaced as ``skipped=`` in the periodic
+        telemetry line below, without a full warning per occurrence.
+        """
+        self._skipped += 1
+
     def _record(self, rows: int, pending: int, elapsed_ms: float) -> None:
         self._latencies_ms.append(elapsed_ms)
         self._rows_since_log += rows
@@ -417,11 +441,12 @@ class MmapPleTable:
         p99_idx = max(0, math.ceil(len(latencies) * 0.99) - 1)
         p99 = latencies[p99_idx] if latencies else 0.0
         logger.info(
-            "rows=%d p99_ms=%.2f pending=%d errors=%d",
+            "rows=%d p99_ms=%.2f pending=%d errors=%d skipped=%d",
             self._rows_since_log,
             p99,
             pending,
             self._errors,
+            self._skipped,
         )
         self._latencies_ms.clear()
         self._rows_since_log = 0
@@ -520,6 +545,12 @@ class MmapNgramEmbedding(nn.Module):
     didn't run, or raised and was swallowed somewhere) is a bug, and must
     raise loudly rather than silently serve zeros as if they were real
     embeddings (invariant 4: fail closed, never serve garbage).
+
+    A second, unrelated zero-fill case exists once ``table`` IS attached:
+    ``forward`` zero-fills (instead of gathering) when the incoming ``ids``
+    fall outside the table's row range. That is not a relaxed bounds check
+    — see ``forward`` and the module docstring for why it can only happen
+    during CUDA-graph capture, never for a real token.
     """
 
     # Declared so static type-checkers resolve this to Tensor instead of
@@ -555,6 +586,31 @@ class MmapNgramEmbedding(nn.Module):
                 device=ids.device,
             )
         ids_np = ids.detach().to("cpu", non_blocking=False).numpy().reshape(-1)
+        if ((ids_np < 0) | (ids_np >= table.rows_total)).any():
+            # Only reachable from a CUDA-graph capture pass (module
+            # docstring): the executed hash always bounds ids via
+            # torch.remainder(...) + offsets (Qwen4ExpNGramEmbedding.
+            # _hash_ngram_ids in ple_layer.py), so a real forward can never
+            # produce an out-of-range id. Capture RECORDS this op instead of
+            # running it, so `ids` here can be read off an unexecuted
+            # subgraph's buffer — uninitialized memory, not real ngram ids
+            # — and that capture pass's output is never consumed, so
+            # zero-filling instead of gathering is correct, not merely
+            # tolerated. gather() itself keeps its strict IndexError for
+            # every other caller (e.g. prewarm/tests).
+            logger.warning_once(
+                "PLE mmap: out-of-range ngram ids reached the gather "
+                "boundary; tolerating as a CUDA-graph capture-pass "
+                "artifact and zero-filling the output instead of "
+                "gathering. See the periodic PLE mmap telemetry line's "
+                "'skipped=' count for the running total."
+            )
+            table.record_capture_pass_skip()
+            return torch.zeros(
+                (*ids.shape, self.embedding_dim),
+                dtype=table.torch_dtype,
+                device=ids.device,
+            )
         rows = table.gather(ids_np)  # uint8 [N, row_bytes], fresh & writable
         itemsize = table.itemsize
         if table.row_bytes != self.embedding_dim * itemsize:

@@ -963,6 +963,115 @@ def test_placeholder_forward_gathers_from_attached_table(tmp_path: Path) -> None
 
 
 # --------------------------------------------------------------------------- #
+# Capture-pass tolerance: an out-of-range id reaching the gather boundary can
+# only come from a CUDA-graph capture pass (module docstring) — executed
+# hashing always bounds ids via torch.remainder(...) + offsets
+# (Qwen4ExpNGramEmbedding._hash_ngram_ids in ple_layer.py), so a real forward
+# can never produce one. forward() must zero-fill instead of gathering,
+# never raise, never touch the table, and count the occurrence.
+# --------------------------------------------------------------------------- #
+
+
+def _raising_gather(ids: np.ndarray) -> np.ndarray:
+    raise AssertionError("gather must not run for out-of-range ids")
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [0, 1],  # exactly rows_total (one past the last valid row), and beyond
+)
+def test_placeholder_forward_zero_fills_ids_at_or_past_rows_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offset: int
+) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    table = embedding.table
+    assert table is not None
+    assert table.rows_total == 9
+    monkeypatch.setattr(table, "gather", _raising_gather)
+    warn_calls: list[tuple[object, object]] = []
+    monkeypatch.setattr(
+        ple_mmap.logger, "warning_once", lambda *a, **k: warn_calls.append((a, k))
+    )
+
+    ids = torch.tensor([0, table.rows_total + offset], dtype=torch.long)
+    out = embedding(ids)
+
+    assert out.shape == (2, 2)
+    assert out.dtype == table.torch_dtype
+    assert torch.equal(out, torch.zeros_like(out))
+    assert table._skipped == 1
+    assert len(warn_calls) == 1
+
+
+def test_placeholder_forward_zero_fills_negative_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    table = embedding.table
+    assert table is not None
+    monkeypatch.setattr(table, "gather", _raising_gather)
+
+    # A single bad id anywhere in the batch must zero-fill the WHOLE output
+    # (the op receives one ngram_ids tensor per forward; a capture pass
+    # taints all of it, not just the offending element).
+    ids = torch.tensor([-1, 3], dtype=torch.long)
+    out = embedding(ids)
+
+    assert torch.equal(out, torch.zeros_like(out))
+    assert table._skipped == 1
+
+
+def test_placeholder_forward_boundary_ids_still_gather(tmp_path: Path) -> None:
+    """(b) in-range path stays unchanged: the boundary rows (0 and
+    rows_total - 1) are valid and must still take the real gather path — the
+    new out-of-range check must not false-positive at either edge."""
+    full = _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    table = embedding.table
+    assert table is not None
+    assert table.rows_total == 9
+
+    ids = torch.tensor([0, 8], dtype=torch.long)
+    out = embedding(ids)
+
+    assert torch.equal(out, full[[0, 8]])
+    assert table._skipped == 0
+
+
+def test_op_zero_fills_output_for_out_of_range_ngram_ids(tmp_path: Path) -> None:
+    """The production boundary is the custom op itself, not forward() in
+    isolation: drives an out-of-range id (the exact magnitude from the
+    measured crash) through torch.ops.vllm.qwen4_exp_ple_mmap_gather, proving
+    the mutate-in-place ``output`` receives zeros instead of the op raising
+    IndexError out of engine init's cudagraph memory profiling."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    fake_layer = SimpleNamespace(
+        ple_embedding=SimpleNamespace(ngram_embedding=embedding)
+    )
+    ctx = SimpleNamespace(no_compile_layers={"layer0": fake_layer})
+    ngram_ids = torch.tensor([[0, 9_223_231_297_218_904_063]], dtype=torch.long)
+    output = torch.empty((1, 4), dtype=torch.float8_e4m3fn)
+
+    with forward_context.override_forward_context(ctx):
+        torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, "layer0")
+
+    assert torch.equal(output, torch.zeros_like(output))
+    assert embedding.table is not None
+    assert embedding.table._skipped == 1
+
+
+# --------------------------------------------------------------------------- #
 # load_weights interception + loaded-set contract
 # --------------------------------------------------------------------------- #
 
