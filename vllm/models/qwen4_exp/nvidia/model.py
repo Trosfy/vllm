@@ -75,6 +75,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import Qwen4ExpConfig
 from . import ple_mmap
+from .dense_fp8 import dense_fp8_quant_config
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .lm_head_fp8 import get_lm_head_quant_method
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
@@ -623,9 +624,16 @@ class Qwen4ExpForCausalLM(
                 "Qwen4Exp currently does not support 'all' prefix caching, "
                 "please use '--mamba-cache-mode=align' instead"
             )
-        self.model = Qwen4ExpModel(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        # Scoped: GDN layers read vllm_config.quant_config at layer init, but
+        # post-init readers must see the checkpoint's own config again.
+        with dense_fp8_quant_config(
+            vllm_config, self.packed_modules_mapping
+        ) as dense_fp8_config:
+            self.model = Qwen4ExpModel(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
+        if dense_fp8_config is not None:
+            dense_fp8_config.validate_match_count()
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
