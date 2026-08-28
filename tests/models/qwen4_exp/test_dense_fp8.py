@@ -20,6 +20,15 @@ import torch
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp as qwen4_exp_package
 from vllm.config import CompilationConfig, set_current_vllm_config
+from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+    HummingFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+    MarlinFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
+)
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -30,7 +39,11 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.quantization.utils.humming_utils import (
     convert_linear_layer_to_humming_standard,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+    kFp8DynamicTensorSym,
+    kFp8StaticTensorSym,
+)
 from vllm.models.qwen4_exp.nvidia.dense_fp8 import (
     DENSE_FP8_EXPECTED_MATCHES,
     DENSE_FP8_PATTERNS,
@@ -41,6 +54,7 @@ from vllm.models.qwen4_exp.nvidia.dense_fp8 import (
     maybe_dense_fp8,
 )
 from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForCausalLM
+from vllm.utils.import_utils import has_humming
 
 PACKED_MODULES_MAPPING = Qwen4ExpForCausalLM.packed_modules_mapping
 
@@ -562,6 +576,102 @@ def test_qkv_merged_shard_survives_humming_layout_prep() -> None:
     layer.quant_method.process_weights_after_loading(layer)
 
     _assert_survives_humming_layout_prep(layer, HIDDEN)
+
+
+def _assert_only_cpu_op_gap(exc: Exception) -> None:
+    """The only failure a CPU test runner may legitimately hit past the
+    Python-level attribute contract these kernel preps read off ``layer``:
+    the real CUDA-only repack op has no CPU kernel registered. Anything else
+    -- notably an AttributeError for a layer attribute the prep reads -- is
+    a real regression, not an environment limitation.
+    """
+    assert isinstance(exc, NotImplementedError), (
+        f"expected only the CPU-backend op gap, got {type(exc).__name__}: {exc}"
+    )
+    assert "CPU' backend" in str(exc), f"unexpected NotImplementedError: {exc}"
+
+
+def _build_and_process_bf16_row_linear(wrapper: Qwen4ExpDenseFp8Config):
+    """Like _build_row_linear, but with an explicit bf16 params_dtype.
+
+    _build_row_linear leaves params_dtype at its RowParallelLinear default
+    (torch.get_default_dtype(), float32 in a bare test process), which none
+    of the other tests in this file notice because they never read
+    layer.params_dtype. The real Humming prep does (it builds its layer
+    config off it), and production always runs with model_config.dtype ==
+    bfloat16, so pin it explicitly here to match what create_weights() +
+    process_weights_after_loading() actually see live.
+    """
+    layer = RowParallelLinear(
+        HIDDEN,
+        HIDDEN,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=wrapper,
+        prefix="model.layers.0.linear_attn.out_proj",
+        disable_tp=True,
+    )
+    torch.manual_seed(31)
+    checkpoint_weight = torch.randn(HIDDEN, HIDDEN, dtype=torch.bfloat16)
+    layer.weight.weight_loader(layer.weight, checkpoint_weight)
+    layer.quant_method.process_weights_after_loading(layer)
+    return layer
+
+
+@pytest.mark.skipif(not has_humming(), reason="humming is not installed")
+def test_humming_prep_does_not_hit_a_missing_layer_attribute() -> None:
+    """Audit companion to test_lm_head_fp8.py's attribute-contract test.
+
+    Unlike ParallelLMHead, RowParallelLinear IS a real LinearBase, so
+    LinearBase.__init__ already sets params_dtype/has_bias and
+    ColumnParallelLinear/RowParallelLinear set output_partition_sizes --
+    nothing in dense_fp8.py's create_weights needs to duck-type them.
+    Asserted here anyway per the same convention as the lm_head test: calls
+    the REAL (unbound) HummingFP8ScaledMMLinearKernel.
+    process_weights_after_loading against a layer built exactly as
+    create_weights()/process_weights_after_loading() leave it, bypassing
+    only __init__'s CUDA-capability assertion. On a CPU test runner the only
+    exception this may legitimately raise is the CUDA-only repack op's
+    NotImplementedError; any AttributeError fails the test.
+    """
+    vllm_config = _vllm_config(dense_quant="fp8")
+    wrapper = Qwen4ExpDenseFp8Config(
+        None, packed_modules_mapping=PACKED_MODULES_MAPPING
+    )
+    with set_current_vllm_config(vllm_config):
+        layer = _build_and_process_bf16_row_linear(wrapper)
+
+    fake_kernel = SimpleNamespace(
+        config=FP8ScaledMMLinearLayerConfig(
+            weight_quant_key=kFp8StaticTensorSym,
+            activation_quant_key=kFp8DynamicTensorSym,
+            weight_shape=layer.weight.shape,
+            input_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+        )
+    )
+    try:
+        HummingFP8ScaledMMLinearKernel.process_weights_after_loading(fake_kernel, layer)
+    except Exception as exc:  # noqa: BLE001 - re-asserted below
+        _assert_only_cpu_op_gap(exc)
+
+
+def test_marlin_prep_does_not_hit_a_missing_layer_attribute() -> None:
+    """Same audit as above, for Marlin's prep."""
+    vllm_config = _vllm_config(dense_quant="fp8")
+    wrapper = Qwen4ExpDenseFp8Config(
+        None, packed_modules_mapping=PACKED_MODULES_MAPPING
+    )
+    with set_current_vllm_config(vllm_config):
+        layer = _build_and_process_bf16_row_linear(wrapper)
+
+    fake_kernel = SimpleNamespace(
+        marlin_input_dtype=None, block_quant=False, size_k_first=True
+    )
+    try:
+        MarlinFP8ScaledMMLinearKernel.process_weights_after_loading(fake_kernel, layer)
+    except Exception as exc:  # noqa: BLE001 - re-asserted below
+        _assert_only_cpu_op_gap(exc)
 
 
 # --------------------------------------------------------------------------

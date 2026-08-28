@@ -88,6 +88,18 @@ class Qwen4ExpLMHeadFp8Method(LinearMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
+        # ParallelLMHead is not a LinearBase, so none of the attributes a real
+        # LinearBase subclass's __init__ sets are present; duck-type the ones
+        # the w8a16 kernels' prep functions read off `layer` (enumerated from
+        # prepare_humming_linear_layer_config() in humming_utils.py and
+        # prepare_fp8_layer_for_marlin() in marlin_utils_fp8.py). The rest of
+        # that surface (input_size_per_partition, output_size_per_partition,
+        # orig_dtype, weight_block_size, logical_widths) is already set above;
+        # Marlin's prep needs nothing more, but Humming's also reads these:
+        layer.output_partition_sizes = output_partition_sizes
+        layer.params_dtype = params_dtype
+        layer.has_bias = False  # this method never registers a bias param
+
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
