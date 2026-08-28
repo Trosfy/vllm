@@ -47,6 +47,7 @@ def _reset_ple_mmap_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "VLLM_PLE_MMAP_WORKERS",
         "VLLM_PLE_MMAP_CHUNK",
         "VLLM_PLE_MMAP_PREWARM",
+        "VLLM_PLE_MMAP_GPU_GATHER",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -924,6 +925,8 @@ def test_ple_mmap_tuning_knobs_are_not_compile_factors() -> None:
     assert "VLLM_PLE_MMAP_WORKERS" not in factors
     assert "VLLM_PLE_MMAP_CHUNK" not in factors
     assert "VLLM_PLE_MMAP_PREWARM" not in factors
+    # GPU gather swaps the body of the split-out op, never the graph.
+    assert "VLLM_PLE_MMAP_GPU_GATHER" not in factors
 
 
 # --------------------------------------------------------------------------- #
@@ -2188,3 +2191,125 @@ def test_hash_ngram_ids_traces_with_dynamic_shapes() -> None:
         f"expected one dynamic graph, got {counter.frame_count} "
         "(shape-specialized recompile)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Zero-copy GPU gather (VLLM_PLE_MMAP_GPU_GATHER). CPU-runnable pieces are
+# tested unconditionally; kernel behavior needs a CUDA device (GB10 ATS) and
+# skips elsewhere.
+# --------------------------------------------------------------------------- #
+
+_needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="zero-copy gather needs a CUDA device"
+)
+
+
+def test_gpu_gather_defaults_off_and_table_records_the_flag(
+    tmp_path: Path,
+) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    assert embedding.table is not None
+    assert embedding.table.gpu_gather is False
+
+
+def test_gpu_gather_env_flag_enables_on_the_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    assert embedding.table is not None
+    assert embedding.table.gpu_gather is True
+
+
+def test_gpu_gather_without_triton_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
+    monkeypatch.setattr(ple_mmap, "HAS_TRITON", False)
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    with pytest.raises(RuntimeError, match="triton"):
+        _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+
+
+def test_shard_base_addresses_match_memmaps(tmp_path: Path) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    table = embedding.table
+    assert table is not None
+    bases = table._shard_base_addresses()
+    assert bases == [mm.ctypes.data for mm in table.mm]
+
+
+def test_shard_base_addresses_fail_closed_on_a_missing_shard(
+    tmp_path: Path,
+) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    table = embedding.table
+    assert table is not None
+    table.mm[1] = None
+    with pytest.raises(RuntimeError, match="shard 1"):
+        table._shard_base_addresses()
+
+
+@_needs_cuda
+def test_gpu_gather_matches_cpu_gather_across_shard_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
+    vocab, parts, cols = 50, 4, 8
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=vocab, parts=parts, cols=cols, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, vocab, parts, cols, 0.5)
+    table = embedding.table
+    assert table is not None
+    # Boundary rows of every shard plus interior rows, unsorted, with repeats.
+    ids = torch.tensor(
+        [0, 12, 13, 25, 26, 38, 39, 49, 7, 7, 30], dtype=torch.int64
+    )
+    ref = table.gather(ids.numpy())
+    out = torch.empty((ids.numel(), table.row_bytes), dtype=torch.uint8, device="cuda")
+    table.gather_gpu(ids.cuda(), out)
+    torch.cuda.synchronize()
+    assert (out.cpu().numpy() == ref).all()
+
+
+@_needs_cuda
+def test_gpu_gather_zero_fills_out_of_range_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    table = embedding.table
+    assert table is not None
+    ids = torch.tensor([-3, 50, 1], dtype=torch.int64, device="cuda")
+    out = torch.full((3, table.row_bytes), 7, dtype=torch.uint8, device="cuda")
+    table.gather_gpu(ids, out)
+    torch.cuda.synchronize()
+    got = out.cpu()
+    assert (got[0] == 0).all()
+    assert (got[1] == 0).all()
+    assert (got[2].numpy() == table.gather(np.array([1]))[0]).all()
+
+
+@_needs_cuda
+def test_forward_gpu_path_matches_cpu_path_byte_for_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
+    vocab, parts, cols = 50, 4, 8
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=vocab, parts=parts, cols=cols, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, vocab, parts, cols, 0.5)
+    ids = torch.tensor([[0, 12, 49], [26, 7, 39]], dtype=torch.int64)
+    # CPU ids -> CPU gather path (gpu_gather requires ids.is_cuda).
+    cpu_out = embedding.forward(ids)
+    gpu_out = embedding.forward(ids.cuda())
+    assert gpu_out.is_cuda
+    assert gpu_out.dtype == cpu_out.dtype
+    assert gpu_out.shape == cpu_out.shape
+    assert (
+        gpu_out.view(torch.uint8).cpu().numpy()
+        == cpu_out.view(torch.uint8).cpu().numpy()
+    ).all()

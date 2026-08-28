@@ -51,6 +51,19 @@ Knobs (env, registered in ``vllm/envs.py``):
   VLLM_PLE_MMAP_CHUNK=2048   rows per gather task
   VLLM_PLE_MMAP_PREWARM=0    1 = stream the table once at load, bounded by
                              free memory, to warm the page cache
+  VLLM_PLE_MMAP_GPU_GATHER=0 1 = zero-copy GPU gather: a triton kernel
+                             dereferences the mmap'd table VA directly
+                             (GB10 ATS/HMM: pageableMemoryAccess=1 with
+                             host page tables), removing the per-step D2H
+                             ids sync (a full device drain), the CPU
+                             thread-pool gather, and the pageable H2D copy.
+                             Probed 2026-08-28: warm rows gather in ~9 µs
+                             at n=64 (vs 22 µs CPU path) and are
+                             byte-identical; COLD pages are GPU-faulted
+                             correctly but serially (~0.5 ms/row), so the
+                             page-cache-warm assumption matters — keep
+                             prewarm available and fall back to the CPU
+                             path (env off) if cold-miss latency shows up.
 """
 
 from __future__ import annotations
@@ -76,6 +89,7 @@ import vllm.envs as envs
 from vllm.config.compilation import CompilationMode
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op, get_dtype_size, vllm_lib
 
 if TYPE_CHECKING:
@@ -298,6 +312,39 @@ def _read_scale(entry: tuple[str, int, int, str]) -> torch.Tensor:
     return torch.frombuffer(raw_bytes, dtype=torch_dtype).clone().squeeze()
 
 
+@triton.jit
+def _gpu_gather_kernel(
+    bases_ptr,
+    ids_ptr,
+    out_ptr,
+    shard_size,
+    rows_total,
+    ROW: tl.constexpr,
+    ROW_POW2: tl.constexpr,
+):
+    """One program per row: dereference the shard's host VA directly.
+
+    ``bases_ptr`` holds each shard memmap's data address as int64; the
+    int-to-pointer cast is legal on GB10 because the GPU walks the host
+    page tables (pageableMemoryAccessUsesHostPageTables=1), so file-backed
+    mmap pages resolve like any other host memory. Out-of-range ids
+    zero-fill IN-KERNEL — the same capture-pass tolerance the CPU forward
+    boundary implements, minus the D2H inspection that forced a device
+    drain there (see ``MmapNgramEmbedding.forward``).
+    """
+    pid = tl.program_id(0)
+    rid = tl.load(ids_ptr + pid)
+    valid = (rid >= 0) & (rid < rows_total)
+    sid = tl.where(valid, rid // shard_size, 0)
+    local = tl.where(valid, rid - sid * shard_size, 0)
+    base = tl.load(bases_ptr + sid)
+    src = tl.cast(base, tl.pointer_type(tl.uint8))
+    offs = tl.arange(0, ROW_POW2)
+    mask = (offs < ROW) & valid
+    row = tl.load(src + local * ROW + offs, mask=mask, other=0)
+    tl.store(out_ptr + pid * ROW + offs, row, mask=offs < ROW)
+
+
 # --------------------------------------------------------------------------- #
 # The mmap-backed table itself.
 # --------------------------------------------------------------------------- #
@@ -344,6 +391,14 @@ class MmapPleTable:
             )
             self.rows_total += rows
         self.pool = ThreadPoolExecutor(max_workers=self.workers)
+        self.gpu_gather = bool(envs.VLLM_PLE_MMAP_GPU_GATHER)
+        if self.gpu_gather and not HAS_TRITON:
+            raise RuntimeError(
+                "VLLM_PLE_MMAP_GPU_GATHER=1 requires triton for the "
+                "zero-copy gather kernel; triton is not importable. "
+                "Unset VLLM_PLE_MMAP_GPU_GATHER to use the CPU gather."
+            )
+        self._gpu_bases: torch.Tensor | None = None
         self._pending = 0
         self._errors = 0
         self._skipped = 0
@@ -419,6 +474,56 @@ class MmapPleTable:
             int(ids.size), pending_snapshot, (time.monotonic() - start_t) * 1000.0
         )
         return gathered
+
+    def _shard_base_addresses(self) -> list[int]:
+        """Each shard memmap's data address, indexed by shard slot.
+
+        Raises:
+            RuntimeError: a shard slot has no memmap (a directly-constructed
+                table with gaps must fail closed, never hand the GPU a null
+                base address).
+        """
+        bases: list[int] = []
+        for idx, mm in enumerate(self.mm):
+            if mm is None:
+                raise RuntimeError(
+                    f"PLE mmap: shard {idx} has no memmap; cannot build "
+                    "GPU gather base addresses"
+                )
+            bases.append(mm.ctypes.data)
+        return bases
+
+    def gpu_bases(self, device: torch.device) -> torch.Tensor:
+        """int64 device tensor of shard base addresses, built once."""
+        if self._gpu_bases is None:
+            self._gpu_bases = torch.tensor(
+                self._shard_base_addresses(), dtype=torch.int64, device=device
+            )
+        return self._gpu_bases
+
+    def gather_gpu(self, ids: torch.Tensor, out: torch.Tensor) -> None:
+        """Gather rows into ``out`` with the zero-copy triton kernel.
+
+        Fully asynchronous: no D2H sync, no CPU-side work beyond the
+        launch. Out-of-range ids zero-fill in-kernel (capture-pass
+        semantics); ``gather`` keeps its strict IndexError for CPU callers.
+
+        Args:
+            ids: int64 CUDA tensor of global row ids, 1-D, contiguous.
+            out: uint8 CUDA tensor ``[ids.numel(), row_bytes]``.
+        """
+        n = ids.numel()
+        if n == 0:
+            return
+        _gpu_gather_kernel[(n,)](
+            self.gpu_bases(ids.device),
+            ids,
+            out,
+            self.shard_size,
+            self.rows_total,
+            ROW=self.row_bytes,
+            ROW_POW2=triton.next_power_of_2(self.row_bytes),
+        )
 
     def record_capture_pass_skip(self) -> None:
         """Count one gather skipped by :class:`MmapNgramEmbedding` because its
@@ -503,6 +608,9 @@ class MmapPleTable:
         self._closed = True
         self.pool.shutdown(wait=False)
         self.mm = [None] * len(self.mm)
+        # Base addresses point into the dropped memmaps; a stale tensor
+        # would hand the GPU dangling host VAs.
+        self._gpu_bases = None
 
 
 def _mem_available_bytes(path: str = "/proc/meminfo") -> int:
@@ -585,6 +693,8 @@ class MmapNgramEmbedding(nn.Module):
                 dtype=self.torch_dtype,
                 device=ids.device,
             )
+        if table.gpu_gather and ids.is_cuda:
+            return self._forward_gpu(ids, table)
         ids_np = ids.detach().to("cpu", non_blocking=False).numpy().reshape(-1)
         if ((ids_np < 0) | (ids_np >= table.rows_total)).any():
             # Only reachable from a CUDA-graph capture pass (module
@@ -626,6 +736,31 @@ class MmapNgramEmbedding(nn.Module):
         # separate, not-yet-pulled lever, not something this line hides.
         out = out.to(ids.device, non_blocking=True)
         return out.reshape(*ids.shape, self.embedding_dim)
+
+    def _forward_gpu(self, ids: torch.Tensor, table: MmapPleTable) -> torch.Tensor:
+        """Zero-copy path: the GPU dereferences the mmap'd table directly.
+
+        Everything here is async — the CPU-side out-of-range inspection
+        the CPU path needs (which costs a full device drain via
+        ``ids.to("cpu")``) is replaced by the kernel's in-range mask.
+        """
+        itemsize = table.itemsize
+        if table.row_bytes != self.embedding_dim * itemsize:
+            raise ValueError(
+                f"PLE mmap: table row_bytes={table.row_bytes} does not "
+                f"match embedding_dim={self.embedding_dim} * "
+                f"itemsize={itemsize}"
+            )
+        ids_flat = ids.reshape(-1)
+        if ids_flat.dtype != torch.int64:
+            ids_flat = ids_flat.long()
+        out = torch.empty(
+            (ids_flat.numel(), table.row_bytes),
+            dtype=torch.uint8,
+            device=ids.device,
+        )
+        table.gather_gpu(ids_flat.contiguous(), out)
+        return out.view(table.torch_dtype).reshape(*ids.shape, self.embedding_dim)
 
 
 def set_weight_scale(
@@ -978,13 +1113,14 @@ def _attach_table(
     embedding.table = table
     logger.info(
         "PLE mmap: layer %d attached, %d shards, %d rows x %d B "
-        "(%.2f GiB on disk), %d workers",
+        "(%.2f GiB on disk), %d workers, gpu_gather=%s",
         layer_idx,
         len(layer_shards.shards),
         table.rows_total,
         row_bytes,
         table_bytes / (1 << 30),
         table.workers,
+        table.gpu_gather,
     )
 
 

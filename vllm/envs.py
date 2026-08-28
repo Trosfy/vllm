@@ -326,6 +326,7 @@ if TYPE_CHECKING:
     VLLM_PLE_MMAP_WORKERS: int = 32
     VLLM_PLE_MMAP_CHUNK: int = 2048
     VLLM_PLE_MMAP_PREWARM: bool = False
+    VLLM_PLE_MMAP_GPU_GATHER: bool = False
 
 
 def get_default_cache_root():
@@ -2175,6 +2176,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, stream the PLE table once at load to warm the page cache
     # (bounded by available memory).
     "VLLM_PLE_MMAP_PREWARM": lambda: bool(int(os.getenv("VLLM_PLE_MMAP_PREWARM", "0"))),
+    # Zero-copy GPU gather for the PLE mmap path (GB10 ATS): a triton kernel
+    # dereferences the mmap'd table directly instead of the D2H-sync + CPU
+    # thread-pool + pageable-H2D round trip.
+    "VLLM_PLE_MMAP_GPU_GATHER": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_GPU_GATHER", "0"))
+    ),
 }
 
 
@@ -2347,6 +2354,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_WORKERS",
         "VLLM_PLE_MMAP_CHUNK",
         "VLLM_PLE_MMAP_PREWARM",
+        "VLLM_PLE_MMAP_GPU_GATHER",
     }
 
     from vllm.config.utils import normalize_value
