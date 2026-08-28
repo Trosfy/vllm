@@ -2313,3 +2313,52 @@ def test_forward_gpu_path_matches_cpu_path_byte_for_byte(
         gpu_out.view(torch.uint8).cpu().numpy()
         == cpu_out.view(torch.uint8).cpu().numpy()
     ).all()
+
+
+def test_prefault_ranges_page_math_and_oob_filtering(tmp_path: Path) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    table = embedding.table
+    assert table is not None
+    table._base_addrs = table._shard_base_addresses()
+    ids = np.array([-1, 0, 5, 50, 5], dtype=np.int64)  # OOB dropped, dupes merge
+    ranges = table._prefault_ranges(ids)
+    for addr, span in ranges:
+        assert addr % 4096 == 0
+        assert span % 4096 == 0 and span >= 4096
+    # every in-range row's bytes are covered by some range
+    for rid in (0, 5):
+        sid, local = divmod(rid, table.shard_size)
+        start = table._base_addrs[sid] + local * table.row_bytes
+        end = start + table.row_bytes - 1
+        assert any(a <= start and end < a + s for a, s in ranges)
+    assert table._prefault_ranges(np.array([-7, 999], dtype=np.int64)) == []
+
+
+def test_prefault_cb_never_raises_on_garbage_state(tmp_path: Path) -> None:
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    table = embedding.table
+    assert table is not None
+    table._libc = ple_mmap._load_libc()  # get past the fail-open early return
+    table._prefault_pinned[0] = "not a tensor"  # type: ignore[list-item]
+    table._prefault_n[0] = 3
+    table._prefault_cb(0)  # driver-thread entry: must swallow, never raise
+    assert table._prefault_errors == 1
+
+
+@_needs_cuda
+def test_gather_gpu_prefault_path_runs_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=50, parts=4, cols=8, scale=0.5)
+    embedding = _attached_embedding(tmp_path, 0, 50, 4, 8, 0.5)
+    table = embedding.table
+    assert table is not None
+    ids = torch.tensor([0, 12, 26, 49], dtype=torch.int64)
+    out = torch.empty((4, table.row_bytes), dtype=torch.uint8, device="cuda")
+    table.gather_gpu(ids.cuda(), out)
+    torch.cuda.synchronize()
+    assert (out.cpu().numpy() == table.gather(ids.numpy())).all()
+    assert table._prefault_errors == 0

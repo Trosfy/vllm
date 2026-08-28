@@ -68,6 +68,8 @@ Knobs (env, registered in ``vllm/envs.py``):
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import functools
 import glob
 import json
@@ -312,6 +314,37 @@ def _read_scale(entry: tuple[str, int, int, str]) -> torch.Tensor:
     return torch.frombuffer(raw_bytes, dtype=torch_dtype).clone().squeeze()
 
 
+_MADV_POPULATE_READ = 22  # linux 5.14+; this box runs 6.x
+_PAGE_MASK = ~4095
+_PREFAULT_SLOTS = 8  # > max CPU enqueue run-ahead in steps (async sched ~2)
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    try:
+        return ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        name = ctypes.util.find_library("c")
+        return ctypes.CDLL(name, use_errno=True) if name else None
+
+
+def _load_cudart() -> ctypes.CDLL | None:
+    for cand in ("libcudart.so", "libcudart.so.13", "libcudart.so.12"):
+        try:
+            return ctypes.CDLL(cand)
+        except OSError:
+            continue
+    import torch as _torch
+
+    for path in glob.glob(
+        os.path.join(os.path.dirname(_torch.__file__), "lib", "libcudart*")
+    ):
+        try:
+            return ctypes.CDLL(path)
+        except OSError:
+            continue
+    return None
+
+
 @triton.jit
 def _gpu_gather_kernel(
     bases_ptr,
@@ -399,6 +432,14 @@ class MmapPleTable:
                 "Unset VLLM_PLE_MMAP_GPU_GATHER to use the CPU gather."
             )
         self._gpu_bases: torch.Tensor | None = None
+        self._base_addrs: list[int] | None = None
+        self._libc: ctypes.CDLL | None = None
+        self._cudart: ctypes.CDLL | None = None
+        self._hostfn: Any = None  # keep the CFUNCTYPE object alive
+        self._prefault_pinned: list[torch.Tensor | None] = [None] * _PREFAULT_SLOTS
+        self._prefault_n: list[int] = [0] * _PREFAULT_SLOTS
+        self._prefault_idx = 0
+        self._prefault_errors = 0
         self._pending = 0
         self._errors = 0
         self._skipped = 0
@@ -501,12 +542,114 @@ class MmapPleTable:
             )
         return self._gpu_bases
 
+    def _prefault_ranges(self, ids_np: np.ndarray) -> list[tuple[int, int]]:
+        """Page-aligned (addr, length) madvise ranges for a batch of row ids.
+
+        Out-of-range ids (capture-pass garbage) are dropped — they must
+        never be turned into addresses. Ranges are deduplicated by page.
+        """
+        ids_np = ids_np[(ids_np >= 0) & (ids_np < self.rows_total)]
+        if ids_np.size == 0 or self._base_addrs is None:
+            return []
+        sid = ids_np // self.shard_size
+        local = ids_np - sid * self.shard_size
+        bases = np.asarray(self._base_addrs, dtype=np.int64)
+        starts = bases[sid] + local * self.row_bytes
+        pages: dict[int, int] = {}
+        for start in starts.tolist():
+            pg = start & _PAGE_MASK
+            end = (start + self.row_bytes - 1) & _PAGE_MASK
+            span = end - pg + 4096
+            prev = pages.get(pg)
+            if prev is None or prev < span:
+                pages[pg] = span
+        return sorted(pages.items())
+
+    def _prefault_cb(self, slot_arg: int | None) -> None:
+        """cudaLaunchHostFunc entry: fault this gather's pages into the
+        page tables with MADV_POPULATE_READ, overlapped across the gather
+        pool, BEFORE the stream reaches the gather kernel.
+
+        Runs on a driver thread — it must never raise (a propagating
+        exception would poison the stream) and must make no CUDA calls.
+        Purely a performance hint: any failure falls back to the kernel's
+        own (slow, serialized) ATS faults, so errors are counted and
+        swallowed.
+        """
+        try:
+            slot = int(slot_arg or 0)
+            pinned = self._prefault_pinned[slot]
+            n = self._prefault_n[slot]
+            libc = self._libc
+            if pinned is None or n == 0 or libc is None:
+                return
+            ranges = self._prefault_ranges(pinned[:n].numpy())
+            if not ranges:
+                return
+
+            def run(chunk: list[tuple[int, int]]) -> None:
+                for addr, span in chunk:
+                    libc.madvise(
+                        ctypes.c_void_p(addr),
+                        ctypes.c_size_t(span),
+                        _MADV_POPULATE_READ,
+                    )
+
+            step = max(1, len(ranges) // self.workers)
+            chunks = [ranges[i : i + step] for i in range(0, len(ranges), step)]
+            for _ in self.pool.map(run, chunks):
+                pass
+        except Exception:
+            self._prefault_errors += 1
+
+    def _prefault_enqueue(self, ids: torch.Tensor) -> None:
+        """Enqueue, in-stream and fully async: D2H of ids into a pinned
+        slot, then a host callback that pre-faults the pages. Stream order
+        guarantees the callback runs after the copy and before the gather
+        kernel launched next. Fail-open: if cudart/libc/pinned setup is
+        unavailable the gather kernel simply faults on its own.
+        """
+        if self._cudart is None:
+            self._cudart = _load_cudart()
+            self._libc = _load_libc()
+            if self._base_addrs is None:
+                self._base_addrs = self._shard_base_addresses()
+            if self._cudart is not None and self._hostfn is None:
+                hostfn_t = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+                self._hostfn = hostfn_t(self._prefault_cb)
+        if self._cudart is None or self._libc is None or self._hostfn is None:
+            return
+        n = ids.numel()
+        slot = self._prefault_idx % _PREFAULT_SLOTS
+        self._prefault_idx += 1
+        pinned = self._prefault_pinned[slot]
+        if pinned is None or pinned.numel() < n:
+            cap = 1 << max(10, n - 1).bit_length()
+            try:
+                pinned = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            except RuntimeError:
+                return
+            self._prefault_pinned[slot] = pinned
+        pinned[:n].copy_(ids, non_blocking=True)
+        self._prefault_n[slot] = n
+        rc = self._cudart.cudaLaunchHostFunc(
+            ctypes.c_void_p(torch.cuda.current_stream(ids.device).cuda_stream),
+            self._hostfn,
+            ctypes.c_void_p(slot),
+        )
+        if rc != 0:
+            self._prefault_errors += 1
+
     def gather_gpu(self, ids: torch.Tensor, out: torch.Tensor) -> None:
         """Gather rows into ``out`` with the zero-copy triton kernel.
 
-        Fully asynchronous: no D2H sync, no CPU-side work beyond the
-        launch. Out-of-range ids zero-fill in-kernel (capture-pass
-        semantics); ``gather`` keeps its strict IndexError for CPU callers.
+        Fully asynchronous: no D2H sync, no CPU-side wait. The in-stream
+        prefault (async D2H of ids -> host callback -> MADV_POPULATE_READ
+        across the gather pool) populates page tables ahead of the kernel;
+        without it, cold rows GPU-fault one at a time (~0.3-0.5 ms/row
+        measured 2026-08-28 vs ~2-6 ms per whole all-cold batch with it).
+        Out-of-range ids zero-fill in-kernel (capture-pass semantics);
+        ``gather`` keeps its strict IndexError for CPU callers.
 
         Args:
             ids: int64 CUDA tensor of global row ids, 1-D, contiguous.
@@ -515,6 +658,7 @@ class MmapPleTable:
         n = ids.numel()
         if n == 0:
             return
+        self._prefault_enqueue(ids)
         _gpu_gather_kernel[(n,)](
             self.gpu_bases(ids.device),
             ids,
@@ -609,8 +753,11 @@ class MmapPleTable:
         self.pool.shutdown(wait=False)
         self.mm = [None] * len(self.mm)
         # Base addresses point into the dropped memmaps; a stale tensor
-        # would hand the GPU dangling host VAs.
+        # (or the CPU-side address list the prefault callback reads) would
+        # hand out dangling host VAs.
         self._gpu_bases = None
+        self._base_addrs = None
+        self._prefault_pinned = [None] * _PREFAULT_SLOTS
 
 
 def _mem_available_bytes(path: str = "/proc/meminfo") -> int:
