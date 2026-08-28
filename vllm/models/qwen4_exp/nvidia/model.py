@@ -76,6 +76,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from ..config import Qwen4ExpConfig
 from . import ple_mmap
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .lm_head_fp8 import get_lm_head_quant_method
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
@@ -629,6 +630,7 @@ class Qwen4ExpForCausalLM(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            quant_method=get_lm_head_quant_method(vllm_config),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (

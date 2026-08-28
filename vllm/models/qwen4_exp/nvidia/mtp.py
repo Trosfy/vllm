@@ -47,6 +47,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 )
 
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .lm_head_fp8 import get_lm_head_quant_method
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
     _HC_WEIGHTS_MAPPER,
@@ -395,6 +396,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                     config.vocab_size,
                     config.hidden_size,
                     prefix=maybe_prefix(prefix, "lm_head"),
+                    quant_method=get_lm_head_quant_method(vllm_config),
                 )
         else:
             self.lm_head = PPMissingLayer()
