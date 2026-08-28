@@ -18,6 +18,9 @@ import torch
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.config import CompilationConfig, set_current_vllm_config
+from vllm.model_executor.layers.quantization.utils.humming_utils import (
+    convert_linear_layer_to_humming_standard,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -150,3 +153,39 @@ def test_online_quant_matches_dequant_reference() -> None:
     torch.testing.assert_close(
         logits.to(torch.float32), reference, atol=0.35, rtol=0.06
     )
+
+
+def test_processed_weight_survives_humming_layout_prep() -> None:
+    """Regression test for a live-serve crash.
+
+    process_weights_after_loading() canonicalizes the weight to (K, N) via
+    ``.t()``, which is a non-contiguous view (stride(-1) == HIDDEN, not 1).
+    Humming's own prep, convert_linear_layer_to_humming_standard(), reads the
+    weight's ``input_dim``/``output_dim`` tags to decide whether to
+    transpose-and-contiguous it back before a dtype-reinterpret
+    ``view(int32)`` cast, which requires a contiguous last dim; Marlin's prep
+    tolerates the view directly and never caught a missing/wrong tag. Without
+    the tags this raises ``RuntimeError: self.stride(-1) must be 1 to view
+    Float8_e4m3fn as Int``. Exercises the real prep function directly (pure
+    tensor ops, no CUDA/Humming runtime needed) so this is CPU-safe.
+    """
+    vllm_config = _vllm_config(lm_head_quant="fp8")
+    with set_current_vllm_config(vllm_config):
+        method = get_lm_head_quant_method(vllm_config)
+        head = _build_lm_head(quant_method=method)
+
+    torch.manual_seed(11)
+    checkpoint_weight = torch.randn(VOCAB, HIDDEN, dtype=torch.bfloat16)
+    head.weight.weight_loader(head.weight, checkpoint_weight)
+    method.process_weights_after_loading(head)
+
+    assert head.weight.shape == (HIDDEN, VOCAB)  # canonical (K, N)
+    assert not head.weight.is_contiguous()  # a transposed view, by design
+    assert head.weight.input_dim == 0
+    assert head.weight.output_dim == 1
+
+    convert_linear_layer_to_humming_standard(
+        layer=head, name_map={"weight": "weight", "weight_scale": "weight_scale"}
+    )
+    assert head.weight.is_contiguous()
+    assert head.weight.stride(-1) == 1

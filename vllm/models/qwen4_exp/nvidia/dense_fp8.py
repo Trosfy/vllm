@@ -226,8 +226,20 @@ class Qwen4ExpDenseFp8LinearMethod(LinearMethodBase):
         weight_scale = _per_tensor_fp8_scale(layer.weight)
         qweight = _quantize_to_fp8(layer.weight, weight_scale)
 
-        # Canonicalize to (K, N); the Marlin prep asserts this layout.
+        # Canonicalize to (K, N); the Marlin prep asserts this layout. `.t()`
+        # is a non-contiguous view (stride(-1) == input_size, not 1) even
+        # when `qweight` itself is contiguous (including after a merged- or
+        # QKV-shard load), so tag the resulting parameter's dims the way
+        # CompressedTensorsW8A16Fp8.process_weights_after_loading does: it is
+        # those tags, not an eager `.contiguous()` here, that tell Humming's
+        # convert_linear_layer_to_humming_standard() to transpose-and-copy
+        # the weight back to a contiguous layout before its view(int32)
+        # reinterpret cast, which requires a contiguous last dim. Marlin's
+        # prep reads (K, N) directly and tolerates the non-contiguous view,
+        # which is why only the Humming path surfaced this.
         replace_parameter(layer, "weight", qweight.t().data)
+        layer.weight.input_dim = 0
+        layer.weight.output_dim = 1
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
         if self.linear_kernel is not None and layer.weight.is_cuda:

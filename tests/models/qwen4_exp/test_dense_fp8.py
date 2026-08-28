@@ -27,6 +27,9 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.humming_utils import (
+    convert_linear_layer_to_humming_standard,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.models.qwen4_exp.nvidia.dense_fp8 import (
     DENSE_FP8_EXPECTED_MATCHES,
@@ -482,6 +485,83 @@ def test_qkv_shard_load_matches_dequant_reference() -> None:
         layer.weight.weight_loader(layer.weight, shard, shard_id)
 
     _assert_quantized_like(layer, torch.cat(list(shards.values()), dim=0))
+
+
+def _assert_survives_humming_layout_prep(layer, in_features: int) -> None:
+    """Regression check for a live-serve crash.
+
+    process_weights_after_loading() canonicalizes the weight to (K, N) via
+    ``.t()``, which is a non-contiguous view (stride(-1) == in_features, not
+    1) even when the pre-transpose weight is contiguous -- true here for both
+    a single shard and a merged/QKV shard load, since the weight loader
+    always materializes into a preallocated contiguous buffer. Humming's own
+    prep, convert_linear_layer_to_humming_standard(), reads the weight's
+    ``input_dim``/``output_dim`` tags to decide whether to
+    transpose-and-contiguous it back before a dtype-reinterpret
+    ``view(int32)`` cast, which requires a contiguous last dim; Marlin's prep
+    tolerates the view directly and never caught a missing/wrong tag.
+    Exercises the real prep function directly (pure tensor ops, no
+    CUDA/Humming runtime needed) so this is CPU-safe.
+    """
+    assert not layer.weight.is_contiguous()  # a transposed view, by design
+    assert layer.weight.input_dim == 0
+    assert layer.weight.output_dim == 1
+
+    convert_linear_layer_to_humming_standard(
+        layer=layer, name_map={"weight": "weight", "weight_scale": "weight_scale"}
+    )
+    assert layer.weight.is_contiguous()
+    assert layer.weight.stride(-1) == 1
+
+
+def test_single_shard_survives_humming_layout_prep() -> None:
+    vllm_config = _vllm_config(dense_quant="fp8")
+    wrapper = Qwen4ExpDenseFp8Config(
+        None, packed_modules_mapping=PACKED_MODULES_MAPPING
+    )
+    with set_current_vllm_config(vllm_config):
+        layer = _build_row_linear(wrapper, "model.layers.0.linear_attn.out_proj")
+
+    torch.manual_seed(17)
+    checkpoint_weight = torch.randn(HIDDEN, HIDDEN, dtype=torch.bfloat16)
+    layer.weight.weight_loader(layer.weight, checkpoint_weight)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    _assert_survives_humming_layout_prep(layer, HIDDEN)
+
+
+def test_qkv_merged_shard_survives_humming_layout_prep() -> None:
+    vllm_config = _vllm_config(dense_quant="fp8")
+    wrapper = Qwen4ExpDenseFp8Config(
+        None,
+        packed_modules_mapping=PACKED_MODULES_MAPPING,
+        patterns=("*.self_attn.qkv_proj",),
+        expected_matches=1,
+    )
+    head_dim = 8
+    with set_current_vllm_config(vllm_config):
+        layer = QKVParallelLinear(
+            hidden_size=HIDDEN,
+            head_size=head_dim,
+            total_num_heads=2,
+            total_num_kv_heads=1,
+            bias=False,
+            quant_config=wrapper,
+            prefix="model.layers.3.self_attn.qkv_proj",
+            disable_tp=True,
+        )
+
+    torch.manual_seed(19)
+    shards = {
+        "q": torch.randn(2 * head_dim, HIDDEN, dtype=torch.bfloat16),
+        "k": torch.randn(head_dim, HIDDEN, dtype=torch.bfloat16),
+        "v": torch.randn(head_dim, HIDDEN, dtype=torch.bfloat16) * 3.0,
+    }
+    for shard_id, shard in shards.items():
+        layer.weight.weight_loader(layer.weight, shard, shard_id)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    _assert_survives_humming_layout_prep(layer, HIDDEN)
 
 
 # --------------------------------------------------------------------------
