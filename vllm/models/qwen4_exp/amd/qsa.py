@@ -54,7 +54,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ..common.qsa_cache import QSAForwardMetadata
-from . import model
+
+# Platform-neutral helper; it lives beside the NVIDIA tree only because that is
+# where the dense-fp8 override was introduced (same as ``lm_head_fp8``).
+from ..nvidia import dense_fp8
 from .indexer_qsa import QSAIndexer
 
 
@@ -235,7 +238,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=model.without_modelopt_fp4(quant_config),
+            quant_config=dense_fp8.maybe_dense_fp8(quant_config, f"{prefix}.qkv_proj"),
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(

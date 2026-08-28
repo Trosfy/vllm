@@ -82,14 +82,15 @@ _SUPPORTED_DENSE_QUANT = ("fp8",)
 DENSE_FP8_PATTERNS: tuple[str, ...] = (
     "*.linear_attn.in_proj_qkvz",
     "*.linear_attn.out_proj",
+    "*.self_attn.qkv_proj",
     "*.self_attn.o_proj",
     "*.mlp.shared_expert.gate_up_proj",
     "*.mlp.shared_expert.down_proj",
 )
 
-# 36 GDN layers x (in_proj_qkvz + out_proj) + 12 QSA layers x o_proj
-# + 48 MoE layers x (shared_expert.gate_up_proj + shared_expert.down_proj).
-DENSE_FP8_EXPECTED_MATCHES = 180
+# 36 GDN layers x (in_proj_qkvz + out_proj) + 12 QSA layers x (qkv_proj +
+# o_proj) + 48 MoE layers x (shared_expert.gate_up_proj + .down_proj).
+DENSE_FP8_EXPECTED_MATCHES = 192
 
 
 def _per_tensor_fp8_scale(weight: torch.Tensor) -> torch.Tensor:
@@ -380,6 +381,35 @@ class Qwen4ExpDenseFp8Config(QuantizationConfig):
                 "checkpoint layer mix, or the TP/PP world size does not match "
                 "what this override was built for."
             )
+
+
+def maybe_dense_fp8(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> QuantizationConfig | None:
+    """Quant config for the QSA ``qkv_proj``, which ModelOpt-FP4 excludes.
+
+    ``qkv_proj`` is the one allow-listed projection whose call site hard-codes
+    ``without_modelopt_fp4``, so it can only join the dense-fp8 path through
+    this helper. One helper, both platform trees.
+
+    Args:
+        quant_config: The config in scope at the call site.
+        prefix: The projection's full module prefix.
+
+    Returns:
+        The dense-fp8 wrapper when it is active *and* allow-lists ``prefix``;
+        otherwise exactly what ``model.without_modelopt_fp4`` returns (kept in
+        sync by hand rather than imported, since ``model`` imports this module).
+    """
+    if (
+        isinstance(quant_config, Qwen4ExpDenseFp8Config)
+        and quant_config.matched_pattern(prefix) is not None
+    ):
+        return quant_config
+    if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        return None
+    return quant_config
 
 
 def get_dense_quant(vllm_config: VllmConfig) -> str | None:

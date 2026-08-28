@@ -10,6 +10,7 @@ Qwen4ExpDenseFp8LinearMethod.apply is checked against an fp32 reference.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 import torch
 
 import vllm.model_executor.parameter as parameter_module
+import vllm.models.qwen4_exp as qwen4_exp_package
 from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -33,6 +35,7 @@ from vllm.models.qwen4_exp.nvidia.dense_fp8 import (
     Qwen4ExpDenseFp8LinearMethod,
     dense_fp8_quant_config,
     get_dense_quant,
+    maybe_dense_fp8,
 )
 from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForCausalLM
 
@@ -122,6 +125,7 @@ def _census_prefixes() -> list[str]:
             prefixes += [
                 f"{base}.self_attn.qkv_proj",
                 f"{base}.self_attn.o_proj",
+                f"{base}.self_attn.indexer.index_qk_proj",
             ]
         else:
             prefixes += [
@@ -205,6 +209,7 @@ def test_wrapper_reports_the_wrapped_config_name() -> None:
     [
         "model.layers.0.linear_attn.in_proj_qkvz",
         "model.layers.0.linear_attn.out_proj",
+        "model.layers.3.self_attn.qkv_proj",
         "model.layers.3.self_attn.o_proj",
         "model.layers.0.mlp.shared_expert.gate_up_proj",
         "model.layers.0.mlp.shared_expert.down_proj",
@@ -222,7 +227,7 @@ def test_allowlisted_prefixes_match(prefix: str) -> None:
     [
         "model.layers.0.linear_attn.in_proj_ba",
         "model.layers.0.linear_attn.conv1d",
-        "model.layers.3.self_attn.qkv_proj",
+        "model.layers.3.self_attn.indexer.index_qk_proj",
         "model.layers.0.mlp.gate",
         "model.layers.0.mlp.shared_expert_gate",
         "model.layers.0.mlp.gate_up_proj",
@@ -244,7 +249,7 @@ def test_census_match_count_equals_expected() -> None:
     )
     matched = [p for p in _census_prefixes() if wrapper.matched_pattern(p) is not None]
     assert len(matched) == DENSE_FP8_EXPECTED_MATCHES
-    assert len(matched) == 180
+    assert len(matched) == 192
 
 
 def test_non_allowlisted_layer_delegates_to_wrapped_config() -> None:
@@ -479,10 +484,55 @@ def test_qkv_shard_load_matches_dequant_reference() -> None:
     _assert_quantized_like(layer, torch.cat(list(shards.values()), dim=0))
 
 
+# --------------------------------------------------------------------------
+# QSA qkv_proj call site
+# --------------------------------------------------------------------------
+
+QKV_PREFIX = "model.layers.3.self_attn.qkv_proj"
+
+
+def test_maybe_dense_fp8_preserves_stock_nvfp4_exclusion() -> None:
+    stub = _StubQuantConfig("modelopt_fp4")
+    assert maybe_dense_fp8(stub, QKV_PREFIX) is None
+    assert maybe_dense_fp8(None, QKV_PREFIX) is None
+
+
+def test_maybe_dense_fp8_passes_other_configs_through() -> None:
+    stub = _StubQuantConfig("compressed-tensors")
+    assert maybe_dense_fp8(stub, QKV_PREFIX) is stub
+
+
+def test_maybe_dense_fp8_routes_qkv_to_the_wrapper() -> None:
+    wrapper = Qwen4ExpDenseFp8Config(
+        _StubQuantConfig(), packed_modules_mapping=PACKED_MODULES_MAPPING
+    )
+    assert maybe_dense_fp8(wrapper, QKV_PREFIX) is wrapper
+
+
+def test_maybe_dense_fp8_falls_back_when_qkv_is_not_allowlisted() -> None:
+    # A narrowed allow-list must not hand qkv_proj back to ModelOpt-FP4, whose
+    # method would look for NVFP4 weights the checkpoint does not carry.
+    wrapper = Qwen4ExpDenseFp8Config(
+        _StubQuantConfig(),
+        packed_modules_mapping=PACKED_MODULES_MAPPING,
+        patterns=("*.self_attn.o_proj",),
+    )
+    assert maybe_dense_fp8(wrapper, QKV_PREFIX) is None
+
+
+def test_both_platform_trees_route_qkv_through_the_helper() -> None:
+    tree_root = Path(qwen4_exp_package.__file__).parent
+    for platform in ("nvidia", "amd"):
+        source = (tree_root / platform / "qsa.py").read_text()
+        assert "dense_fp8.maybe_dense_fp8(" in source, platform
+        assert "without_modelopt_fp4" not in source, platform
+
+
 def test_shipped_patterns_are_the_planned_allowlist() -> None:
     assert DENSE_FP8_PATTERNS == (
         "*.linear_attn.in_proj_qkvz",
         "*.linear_attn.out_proj",
+        "*.self_attn.qkv_proj",
         "*.self_attn.o_proj",
         "*.mlp.shared_expert.gate_up_proj",
         "*.mlp.shared_expert.down_proj",
