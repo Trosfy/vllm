@@ -362,28 +362,50 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
-        num_reqs = query_start_loc.numel() - 1
+        # .shape[0]-derived sizes stay SymInts under Dynamo; the previous
+        # .numel()-to-int forms specialized the marked-dynamic dims
+        # (ConstraintViolationError at engine init on the deployed torch).
+        num_reqs = query_start_loc.shape[0] - 1
         num_tokens = input_ids.shape[0]
-        if num_tokens > self.positions_buffer.numel():
-            raise ValueError(
-                f"PLE received {num_tokens} tokens, but its workspace supports "
-                f"at most {self.positions_buffer.numel()}"
-            )
-        if num_reqs > self.padded_buffer.shape[0]:
-            raise ValueError(
-                f"PLE received {num_reqs} requests, but its workspace supports "
-                f"at most {self.padded_buffer.shape[0]}"
-            )
+        if not torch.compiler.is_compiling():
+            # Eager-only validation: a Python comparison on a traced SymInt
+            # would install shape guards inside the compiled region.
+            if num_tokens > self.positions_buffer.numel():
+                raise ValueError(
+                    f"PLE received {num_tokens} tokens, but its workspace "
+                    f"supports at most {self.positions_buffer.numel()}"
+                )
+            if num_reqs > self.padded_buffer.shape[0]:
+                raise ValueError(
+                    f"PLE received {num_reqs} requests, but its workspace "
+                    f"supports at most {self.padded_buffer.shape[0]}"
+                )
 
+        max_total_tokens = self.padded_buffer.shape[1]
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
-        packed.fill_(self.eos_token_id)
-        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
-        request_indices.clamp_(max=num_reqs - 1)
-        columns = (positions - query_start_loc[request_indices]).clamp(
-            0, packed.shape[1] - 1
+        # Fresh, symbolically-sized allocation instead of slicing the static
+        # buffer: pre-allocated-buffer views break torch.compile dynamic
+        # shapes (see ngram_proposer_gpu.py for the same pattern).
+        packed = torch.full(
+            (num_reqs, max_total_tokens),
+            self.eos_token_id,
+            dtype=torch.int64,
+            device=input_ids.device,
         )
-        packed[request_indices, columns] = input_ids
+        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+        # torch.minimum with a tensor bound: clamp_(max=<SymInt>) coerces the
+        # bound to a concrete Scalar and specializes num_reqs.
+        request_indices = torch.minimum(
+            request_indices, (num_reqs - 1) * torch.ones_like(request_indices)
+        )
+        columns = (positions - query_start_loc[request_indices]).clamp(
+            0, max_total_tokens - 1
+        )
+        # Flattened 1-D scatter instead of 2-D advanced-index assignment
+        # (aten.index_put_ on a symbolic dim-0); max_total_tokens is static.
+        packed.view(-1).scatter_(
+            0, request_indices * max_total_tokens + columns, input_ids
+        )
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
@@ -416,7 +438,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             sizes = self.ngram_heads_vocab_sizes[start:end]
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
-            id_blocks.append(ids[request_indices, adjusted_columns])
+            # Flattened gather (same rationale as the scatter above);
+            # ids.shape[1] is static (ngram context width + max tokens).
+            flat_rows = ids.reshape(-1, ids.shape[-1])
+            id_blocks.append(
+                flat_rows[request_indices * ids.shape[1] + adjusted_columns]
+            )
         return torch.cat(id_blocks, dim=-1)
 
     def forward(
@@ -425,26 +452,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        ngram_ids = self._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
         if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
-            # R2.18 fallback: the stock hashing above specializes vLLM's
-            # dynamic dims (Python ints from .numel()-derived slicing) when
-            # traced under torch.compile — ConstraintViolationError on
-            # query_start_loc.size()[0]. Widen the op boundary to the WHOLE
-            # forward (hashing runs eagerly, untraced, inside the op)
-            # rather than just the gather. The allocation below is still
-            # traced code; new_empty with a symbolic dim is fine — it is
-            # the .numel()-to-int SLICING inside _hash_ngram_ids that
-            # specialized, so num_tokens here must stay symbolic (no int()).
-            num_tokens = input_ids.reshape(-1).shape[0]
-            output = input_ids.new_empty(
-                (num_tokens, self.embedding_dim),
+            # Hashing above is symbolic-shape-safe and stays inside the
+            # compiled graph; only the CPU mmap gather crosses the custom-op
+            # boundary (the plan's original gather-only design, restored
+            # after the R2.18 whole-forward fallback). new_empty with a
+            # symbolic dim is fine.
+            output = ngram_ids.new_empty(
+                (ngram_ids.shape[0], self.embedding_dim),
                 dtype=self.ngram_embedding.torch_dtype,
             )
-            torch.ops.vllm.qwen4_exp_ple_mmap_forward(
-                input_ids, query_start_loc, ngram_context, output, self.layer_name
-            )
+            torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, self.layer_name)
             return output
-        ngram_ids = self._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

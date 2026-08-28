@@ -582,57 +582,37 @@ def test_op_is_registered_under_platform_default_and_cpu_dispatch_keys() -> None
     assert "!) output" in schema, schema
     assert schema.endswith("-> ()")
     # Exercise the CPU key directly: this is what every other test below
-    # relies on to run without a GPU. The widened (R2.18) op calls
-    # ple_embedding_module._hash_ngram_ids THEN .ngram_embedding(...), so
-    # the fake stands in for both.
-    hash_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    # relies on to run without a GPU. The gather-only op resolves the layer
+    # and calls only .ngram_embedding(...) — hashing stays in traced code.
     gather_calls: list[torch.Tensor] = []
 
     class _FakePleEmbeddingModule:
-        def _hash_ngram_ids(
-            self,
-            input_ids: torch.Tensor,
-            query_start_loc: torch.Tensor,
-            ngram_context: torch.Tensor,
-        ) -> torch.Tensor:
-            hash_calls.append((input_ids, query_start_loc, ngram_context))
-            return torch.zeros((input_ids.reshape(-1).shape[0], 2), dtype=torch.long)
-
         def ngram_embedding(self, ngram_ids: torch.Tensor) -> torch.Tensor:
             gather_calls.append(ngram_ids)
             return torch.zeros((*ngram_ids.shape, 2), dtype=torch.float8_e4m3fn)
 
     fake_layer = SimpleNamespace(ple_embedding=_FakePleEmbeddingModule())
     ctx = SimpleNamespace(no_compile_layers={"layer0": fake_layer})
-    input_ids = torch.zeros((2,), dtype=torch.long)
-    query_start_loc = torch.tensor([0, 2], dtype=torch.long)
-    ngram_context = torch.zeros((1, 4), dtype=torch.long)
+    ngram_ids = torch.zeros((2, 2), dtype=torch.long)
     output = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
 
     with forward_context.override_forward_context(ctx):
-        torch.ops.vllm.qwen4_exp_ple_mmap_forward(
-            input_ids, query_start_loc, ngram_context, output, "layer0"
-        )
+        torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, "layer0")
 
-    assert len(hash_calls) == 1
     assert len(gather_calls) == 1
     assert torch.equal(output, torch.zeros_like(output))
 
 
 def test_op_raises_named_error_when_layer_name_does_not_resolve() -> None:
     ctx = SimpleNamespace(no_compile_layers={"layer0": SimpleNamespace()})
-    input_ids = torch.zeros((1,), dtype=torch.long)
-    query_start_loc = torch.tensor([0, 1], dtype=torch.long)
-    ngram_context = torch.zeros((1, 4), dtype=torch.long)
+    ngram_ids = torch.zeros((1, 2), dtype=torch.long)
     output = torch.empty((1, 4), dtype=torch.float8_e4m3fn)
 
     with (
         forward_context.override_forward_context(ctx),
         pytest.raises(RuntimeError, match="does not resolve to a PLE layer"),
     ):
-        torch.ops.vllm.qwen4_exp_ple_mmap_forward(
-            input_ids, query_start_loc, ngram_context, output, "layer0"
-        )
+        torch.ops.vllm.qwen4_exp_ple_mmap_gather(ngram_ids, output, "layer0")
 
 
 # --------------------------------------------------------------------------- #
@@ -2043,3 +2023,59 @@ def test_default_off_load_weights_matches_the_stock_contract() -> None:
     assert loaded == {"ngram_embedding.weight"}
     expected = torch.cat((shard_0[2:4], shard_1[0:2]))
     torch.testing.assert_close(embedding.weight, expected)
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic-shape compile safety. The engine compiles the model with
+# query_start_loc/ngram_context/input_ids marked dynamic in dim 0
+# (support_torch_compile dynamic_arg_dims); the original hashing specialized
+# those dims (ConstraintViolationError at engine init, R2.18). This traces
+# _hash_ngram_ids exactly as production does and pins: one graph, no
+# recompile, eager-identical outputs across two different
+# (num_tokens, num_reqs) shapes.
+# --------------------------------------------------------------------------- #
+
+
+def test_hash_ngram_ids_traces_with_dynamic_shapes() -> None:
+    config = _make_text_config()
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        8,
+        0,
+        8,
+        4,
+        "model.layers.1.ple.ple_embedding",
+        "model.layers.1.ple",
+        params_dtype=torch.float32,
+    )
+
+    shapes_a = (
+        torch.tensor([11, 22, 33], dtype=torch.long),
+        torch.tensor([0, 2, 3], dtype=torch.long),
+        torch.tensor([[44, 55], [66, 77]], dtype=torch.long),
+    )
+    shapes_b = (
+        torch.tensor([3, 14, 15, 92, 65], dtype=torch.long),
+        torch.tensor([0, 1, 3, 5], dtype=torch.long),
+        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.long),
+    )
+    eager_a = module._hash_ngram_ids(*shapes_a)
+    eager_b = module._hash_ngram_ids(*shapes_b)
+
+    torch._dynamo.reset()
+    counter = torch._dynamo.testing.CompileCounter()
+    compiled = torch.compile(module._hash_ngram_ids, backend=counter, fullgraph=True)
+
+    for tensors in (shapes_a, shapes_b):
+        for tensor in tensors:
+            torch._dynamo.mark_dynamic(tensor, 0)
+
+    traced_a = compiled(*shapes_a)
+    traced_b = compiled(*shapes_b)
+
+    assert torch.equal(traced_a, eager_a)
+    assert torch.equal(traced_b, eager_b)
+    assert counter.frame_count == 1, (
+        f"expected one dynamic graph, got {counter.frame_count} "
+        "(shape-specialized recompile)"
+    )
