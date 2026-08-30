@@ -2,22 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Serve the Qwen4Exp PLE n-gram table from NVMe via mmap.
 
-Why: the n-gram (PLE) table is tens of GiB in FP8 and the stock path keeps it
-resident (GPU, via ``VocabParallelEmbedding``). On a box where host and GPU
-share one unified memory pool, that table cannot sit next to the rest of the
-model. A token only ever touches a handful of rows out of the whole table, so
-it can live on disk and be served through the page cache instead.
+Why: the n-gram (PLE) table is tens of GiB (FP8-quantized, or unquantized
+BF16 for e.g. AutoRound W4A16 exports) and the stock path keeps it resident
+(GPU, via ``VocabParallelEmbedding``). On a box where host and GPU share one
+unified memory pool, that table cannot sit next to the rest of the model. A
+token only ever touches a handful of rows out of the whole table, so it can
+live on disk and be served through the page cache instead.
 
 How, with ``VLLM_PLE_MMAP=1``:
   * ``Qwen4ExpNGramEmbedding.__init__`` swaps the GPU-resident embedding for
     :class:`MmapNgramEmbedding`, a placeholder whose ``forward`` gathers rows
-    from :class:`MmapPleTable` (``np.memmap`` views over the checkpoint's
-    safetensors shards, page-cache backed).
+    from :class:`MmapPleTable` (``np.memmap`` views over the table
+    directory's safetensors shards, page-cache backed). That directory is
+    the checkpoint's own by default, or ``VLLM_PLE_MMAP_DIR`` when set —
+    see :func:`resolve_table_path`.
   * ``Qwen4ExpNGramEmbedding.load_weights`` drops the per-shard tensors on
-    the floor (never materialized into a resident table) and keeps the
-    checkpoint's global FP8 ``weight_scale`` as a buffer on the placeholder,
+    the floor (never materialized into a resident table); for a dtype whose
+    :class:`_PleDtype` descriptor requires one, it also keeps the
+    checkpoint's global ``weight_scale`` as a buffer on the placeholder,
     which the untouched ``Qwen4ExpPLELayer._dequantize_embeddings`` already
-    knows how to consume.
+    knows how to consume. Unquantized dtypes (e.g. BF16) need no scale and
+    pass through unscaled.
   * only the row gather is wrapped in a custom op,
     ``vllm::qwen4_exp_ple_mmap_gather``, so it runs OUTSIDE CUDA graph
     capture; the trigram hashing is symbolic-shape-safe and stays inside
@@ -45,10 +50,30 @@ scope so the custom op registers at import time; every behavior above is
 gated on :func:`enabled` at call time. With ``VLLM_PLE_MMAP`` unset, nothing
 in this module is ever invoked and the stock classes are untouched.
 
-Knobs (env, registered in ``vllm/envs.py``):
+Knobs (env, registered in ``vllm/envs.py`` unless noted):
   VLLM_PLE_MMAP=1            enable
+  VLLM_PLE_MMAP_DIR=<path>   absolute directory holding the PLE table's
+                             safetensors shards, instead of the checkpoint
+                             directory. Read straight from ``os.environ``
+                             (NOT registered in ``vllm/envs.py``): it names
+                             a data location, so it must not become a
+                             torch.compile cache factor, and every consumer
+                             is already behind :func:`enabled`. Lets one
+                             table serve several composed checkpoints
+                             without grafting a copy into each.
   VLLM_PLE_MMAP_WORKERS=32   gather threads (page faults overlap across them)
   VLLM_PLE_MMAP_CHUNK=2048   rows per gather task
+  VLLM_PLE_MMAP_SERIAL=0     N > 0 = a CPU gather touching at most N
+                             distinct rows runs its tasks inline on the
+                             calling thread instead of dispatching them
+                             through the worker pool. Read straight from
+                             ``os.environ`` (NOT registered in
+                             ``vllm/envs.py``) for the same reason as
+                             VLLM_PLE_MMAP_DIR: it tunes the body of the
+                             split-out op and must not become a
+                             torch.compile cache factor, which would let a
+                             threshold A/B poison its own measurement with
+                             a recompile. See :func:`serial_threshold`.
   VLLM_PLE_MMAP_PREWARM=0    1 = stream the table once at load, bounded by
                              free memory, to warm the page cache
   VLLM_PLE_MMAP_GPU_GATHER=0 1 = zero-copy GPU gather: a triton kernel
@@ -102,12 +127,23 @@ logger = init_logger(__name__)
 OP_NAME = "qwen4_exp_ple_mmap_gather"
 QUALIFIED_OP_NAME = f"vllm::{OP_NAME}"
 
-_FP8_DTYPES: dict[str, torch.dtype] = {
-    "F8_E4M3": torch.float8_e4m3fn,
+
+@dataclass(frozen=True)
+class _PleDtype:
+    """One PLE table dtype's storage type and whether it needs a scale."""
+
+    torch_dtype: torch.dtype
+    requires_scale: bool
+
+
+_PLE_DTYPES: dict[str, _PleDtype] = {
+    "F8_E4M3": _PleDtype(torch.float8_e4m3fn, requires_scale=True),
+    "BF16": _PleDtype(torch.bfloat16, requires_scale=False),
     # F8_E5M2 deliberately excluded: is_fp8() (fp8_utils.py) only recognizes
     # float8_e4m3fn/float8_e4m3fnuz, so an e5m2 table would silently skip
     # Qwen4ExpPLELayer._dequantize_embeddings's dequant gate and fail late,
-    # deep in a downstream matmul, instead of at load (invariant 4).
+    # deep in a downstream matmul, instead of at load (invariant 4). F16 is
+    # left out for want of a motivating checkpoint, not on principle.
 }
 _SCALE_TORCH_DTYPES: dict[str, torch.dtype] = {
     "F32": torch.float32,
@@ -143,6 +179,47 @@ def _itemsize(dtype_str: str) -> int:
 def enabled() -> bool:
     """Return True when the mmap-backed PLE path is enabled."""
     return envs.VLLM_PLE_MMAP
+
+
+def serial_threshold() -> int:
+    """The configured ``VLLM_PLE_MMAP_SERIAL`` row threshold, or 0 (off).
+
+    Read straight from ``os.environ`` rather than ``vllm/envs.py`` so the
+    knob stays out of the torch.compile cache factors: it only swaps how
+    :meth:`MmapPleTable.gather` dispatches its tasks, never the graph, and
+    a threshold sweep that forced a recompile per arm would poison its own
+    A/B. Consulted once per table, from :func:`_attach_table`, which only
+    runs under ``VLLM_PLE_MMAP=1``.
+
+    Returns:
+        The threshold in distinct rows; 0 (the default) always dispatches
+        through the worker pool.
+
+    Raises:
+        RuntimeError: the override is set to something that is not a
+            non-negative integer. Fail closed: silently reading a typo as
+            0 would report a clean "serial off" arm for a run the operator
+            believes measured the knob.
+    """
+    raw = os.environ.get("VLLM_PLE_MMAP_SERIAL", "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"PLE mmap: VLLM_PLE_MMAP_SERIAL={raw!r} is not an integer. Set "
+            "it to the number of distinct rows at or under which a gather "
+            "should run inline on the calling thread, or unset it (or set "
+            "it to 0) to always dispatch through the worker pool."
+        ) from None
+    if value < 0:
+        raise RuntimeError(
+            f"PLE mmap: VLLM_PLE_MMAP_SERIAL={value} is negative. Set it to "
+            "a row count, or unset it (or set it to 0) to always dispatch "
+            "through the worker pool."
+        )
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -405,6 +482,7 @@ class MmapPleTable:
         workers: int,
         chunk: int,
         model_path: str,
+        serial: int = 0,
     ) -> None:
         if not shards:
             raise ValueError("PLE mmap: no shards to build a table from")
@@ -415,6 +493,7 @@ class MmapPleTable:
         self.itemsize = get_dtype_size(torch_dtype)
         self.chunk = max(1, int(chunk))
         self.workers = max(1, int(workers))
+        self.serial = max(0, int(serial))
         n_slots = max(shards) + 1
         self.mm: list[np.memmap | None] = [None] * n_slots
         self.rows_total = 0
@@ -445,6 +524,10 @@ class MmapPleTable:
         self._skipped = 0
         self._rows_since_log = 0
         self._latencies_ms: list[float] = []
+        # Per-window engaged count backing the serial= log field — see
+        # _record for why it is window-scoped rather than the p99 sample's
+        # own flag.
+        self._serial_engaged_since_log = 0
         self._last_log = time.monotonic()
         self._closed = False
 
@@ -495,9 +578,26 @@ class MmapPleTable:
             out[a:b] = mm[local[a:b]]
 
         self._pending = len(tasks)
+        # VLLM_PLE_MMAP_SERIAL: an opt-in bypass of the executor for small
+        # gathers, keyed on uniq.size (distinct rows), NOT task count — a
+        # batch-1 decode gather hashes its ~96 rows across the whole width
+        # of the table by construction, so it degrades to ~96 one-row tasks
+        # and pays full pool dispatch for each even though the len(tasks)
+        # == 1 case below already runs inline. Measured 2026-08-29 on
+        # sm_120: 0.18 ms for a direct fancy-index over 96 warm rows vs
+        # 3.7 ms through the 32-worker pool, and a WORKERS=1 arm was the
+        # fastest of that set — both point at dispatch, not the copy. The
+        # knob has no upper bound of its own, so a high threshold
+        # serializes a cold prefill-sized gather's page faults on the
+        # calling thread with nothing to overlap them; accepted for an
+        # opt-in knob that changes no default behavior. Only the CPU
+        # gather is affected: VLLM_PLE_MMAP_GPU_GATHER=1 never routes a
+        # forward through here.
+        serial = self.serial > 0 and uniq.size <= self.serial
         try:
-            if len(tasks) == 1:
-                run(tasks[0])
+            if serial or len(tasks) == 1:
+                for task in tasks:
+                    run(task)
             else:
                 for _ in self.pool.map(run, tasks):
                     pass
@@ -506,13 +606,18 @@ class MmapPleTable:
             raise
         finally:
             # Snapshot before resetting: _record's log line (fired at most
-            # once per _LOG_INTERVAL_S) needs the concurrency depth THIS
-            # call actually ran at, not the always-zero post-reset value.
+            # once per _LOG_INTERVAL_S) needs THIS call's task count, not
+            # the always-zero post-reset value. It is a task count, not a
+            # concurrency depth — the serial branch runs every one of them
+            # at depth 1 on the calling thread.
             pending_snapshot = self._pending
             self._pending = 0
         gathered = out[inverse]
         self._record(
-            int(ids.size), pending_snapshot, (time.monotonic() - start_t) * 1000.0
+            int(ids.size),
+            pending_snapshot,
+            (time.monotonic() - start_t) * 1000.0,
+            serial,
         )
         return gathered
 
@@ -680,9 +785,19 @@ class MmapPleTable:
         """
         self._skipped += 1
 
-    def _record(self, rows: int, pending: int, elapsed_ms: float) -> None:
+    def _record(self, rows: int, pending: int, elapsed_ms: float, serial: bool) -> None:
         self._latencies_ms.append(elapsed_ms)
         self._rows_since_log += rows
+        # serial= is a WINDOW statistic (engaged/total gathers), not the p99
+        # SAMPLE's own flag: the p99 sample is by construction the window's
+        # biggest gather, which is exactly the one most likely to have
+        # crossed the threshold back onto the pool — keying the field on it
+        # reports serial=0 for a window in which nearly every gather did
+        # engage. Counting every call reflects what the window actually
+        # did. The window's total is len(self._latencies_ms), appended to
+        # just above.
+        if serial:
+            self._serial_engaged_since_log += 1
         now = time.monotonic()
         if now - self._last_log < _LOG_INTERVAL_S:
             return
@@ -690,15 +805,18 @@ class MmapPleTable:
         p99_idx = max(0, math.ceil(len(latencies) * 0.99) - 1)
         p99 = latencies[p99_idx] if latencies else 0.0
         logger.info(
-            "rows=%d p99_ms=%.2f pending=%d errors=%d skipped=%d",
+            "rows=%d p99_ms=%.2f pending=%d errors=%d skipped=%d serial=%d/%d",
             self._rows_since_log,
             p99,
             pending,
             self._errors,
             self._skipped,
+            self._serial_engaged_since_log,
+            len(self._latencies_ms),
         )
         self._latencies_ms.clear()
         self._rows_since_log = 0
+        self._serial_engaged_since_log = 0
         self._last_log = now
 
     def prewarm(self, max_bytes: int) -> int:
@@ -794,12 +912,15 @@ class MmapNgramEmbedding(nn.Module):
     :func:`build_tables`). While unset, ``forward``'s behavior depends on
     whether a real (non-dummy) load ever streamed weights through this
     module: ``--load-format dummy`` profiling never calls ``load_weights``
-    at all, so ``weights_streamed`` stays False and zeros are the correct,
-    intentional stand-in against the default unit ``weight_scale``. A real
-    load that streamed weights but never got a table attached (build_tables
-    didn't run, or raised and was swallowed somewhere) is a bug, and must
-    raise loudly rather than silently serve zeros as if they were real
-    embeddings (invariant 4: fail closed, never serve garbage).
+    at all, so ``weights_streamed`` stays False and zeros in the
+    placeholder's still-default fp8 dtype are the correct, intentional
+    stand-in — harmless regardless of which dtype eventually attaches, since
+    every :class:`_PleDtype` either dequantizes a zero to zero or passes it
+    through unscaled. A real load that streamed weights but never got a
+    table attached (build_tables didn't run, or raised and was swallowed
+    somewhere) is a bug, and must raise loudly rather than silently serve
+    zeros as if they were real embeddings (invariant 4: fail closed, never
+    serve garbage).
 
     A second, unrelated zero-fill case exists once ``table`` IS attached:
     ``forward`` zero-fills (instead of gathering) when the incoming ``ids``
@@ -821,6 +942,12 @@ class MmapNgramEmbedding(nn.Module):
         self.table: MmapPleTable | None = None
         self.weight_scale_loaded = False
         self.weights_streamed = False
+        # (total_ms, sync_ms, gather_ms, h2d_ms) per forward call that
+        # actually gathered through the CPU path — see
+        # _record_forward_timing for which calls that excludes.
+        self._fwd_timings_ms: list[tuple[float, float, float, float]] = []
+        self._fwd_rows_since_log = 0
+        self._fwd_last_log = time.monotonic()
         self.register_buffer(
             "weight_scale",
             torch.tensor(1.0, dtype=torch.bfloat16),
@@ -842,6 +969,7 @@ class MmapNgramEmbedding(nn.Module):
             )
         if table.gpu_gather and ids.is_cuda:
             return self._forward_gpu(ids, table)
+        sync_t = time.monotonic()
         ids_np = ids.detach().to("cpu", non_blocking=False).numpy().reshape(-1)
         if ((ids_np < 0) | (ids_np >= table.rows_total)).any():
             # Only reachable from a CUDA-graph capture pass (module
@@ -868,7 +996,15 @@ class MmapNgramEmbedding(nn.Module):
                 dtype=table.torch_dtype,
                 device=ids.device,
             )
+        # gather_t doubles as sync_t's end-of-window read: the only work
+        # between the two is the ids D2H drain and the (numpy, one-pass)
+        # capture-pass bounds check above, so one monotonic() call marks
+        # both boundaries and sync_ms reads as "everything the calling
+        # thread blocked on before the gather".
+        gather_t = time.monotonic()
+        sync_ms = (gather_t - sync_t) * 1000.0
         rows = table.gather(ids_np)  # uint8 [N, row_bytes], fresh & writable
+        gather_ms = (time.monotonic() - gather_t) * 1000.0
         itemsize = table.itemsize
         if table.row_bytes != self.embedding_dim * itemsize:
             raise ValueError(
@@ -876,13 +1012,95 @@ class MmapNgramEmbedding(nn.Module):
                 f"match embedding_dim={self.embedding_dim} * "
                 f"itemsize={itemsize}"
             )
+        h2d_t = time.monotonic()
         out = torch.from_numpy(rows).view(table.torch_dtype)
         # non_blocking=True has no effect here: `rows` (from table.gather)
         # is pageable host memory, not pinned, so this H2D copy is
         # effectively synchronous. Pinned staging (Phase-4 lever 5) is a
         # separate, not-yet-pulled lever, not something this line hides.
         out = out.to(ids.device, non_blocking=True)
+        h2d_ms = (time.monotonic() - h2d_t) * 1000.0
+        self._record_forward_timing(int(ids_np.size), sync_ms, gather_ms, h2d_ms)
         return out.reshape(*ids.shape, self.embedding_dim)
+
+    def _record_forward_timing(
+        self, rows: int, sync_ms: float, gather_ms: float, h2d_ms: float
+    ) -> None:
+        """Rate-limited log of this instance's forward CPU-blocking time.
+
+        The gather-side line (``MmapPleTable._record``) reports only the
+        middle of the three steps a CPU-path forward blocks on, so an
+        operator comparing bench arms cannot tell whether the ids D2H
+        drain, the mmap gather, or the H2D copy back is dominant. Each
+        field here is "time this call blocked the calling thread", which is
+        the number that feeds inter-token latency; ``h2d_call_ms`` is a
+        copy cost, not a bandwidth figure.
+
+        Always on, matching ``_record``'s always-on 60s-rate-limited
+        posture: the cost is four ``time.monotonic()`` calls and one list
+        append per forward, negligible beside the gather, and one extra log
+        line per PLE layer per rank.
+
+        Two forward paths deliberately never reach here. The table-unset
+        and capture-pass zero-fills never gather, so there is nothing to
+        attribute; and ``_forward_gpu`` is fully asynchronous — every step
+        it enqueues completes after it returns, so a wall-clock split of it
+        would measure launch overhead and read as a suspiciously fast
+        gather.
+
+        The window mixes two populations (decode: small, frequent;
+        prefill: large, rare), so a p99-only line is virtually always a
+        prefill sample and says nothing about what most calls cost. ``n=``
+        plus a p50 split alongside p99 — the list is already sorted, so
+        this is nearly free — gives both ends without guessing which
+        population p99 came from.
+        """
+        total_ms = sync_ms + gather_ms + h2d_ms
+        self._fwd_timings_ms.append((total_ms, sync_ms, gather_ms, h2d_ms))
+        self._fwd_rows_since_log += rows
+        now = time.monotonic()
+        if now - self._fwd_last_log < _LOG_INTERVAL_S:
+            return
+        # Sorted by total_ms, same as _record: each percentile reports its
+        # OWN sample's split, never an average across fast and slow calls.
+        timings = sorted(self._fwd_timings_ms)
+        n = len(timings)
+        p50_idx = max(0, math.ceil(n * 0.50) - 1)
+        p99_idx = max(0, math.ceil(n * 0.99) - 1)
+        p50_total, p50_sync, p50_gather, p50_h2d = (
+            timings[p50_idx] if timings else (0.0, 0.0, 0.0, 0.0)
+        )
+        p99_total, p99_sync, p99_gather, p99_h2d = (
+            timings[p99_idx] if timings else (0.0, 0.0, 0.0, 0.0)
+        )
+        # Every key below is unique within this line and is not a substring
+        # of any gather-side key: fwd_rows=/fwd_p99_ms= carry a prefix
+        # because _record already owns bare rows=/p99_ms=, and each
+        # percentile-scoped field spells out its own p50_/p99_ prefix
+        # rather than leaving one of the pair bare — a bare sync_ms= would
+        # be a substring of p50_sync_ms=, so a reader grepping for the p99
+        # split would silently be handed the p50 value. The containment is
+        # one-way: bare rows=/p99_ms= DO match this line's prefixed keys,
+        # so a gather-side grep has to anchor on a key this line does not
+        # carry (pending=, errors=, skipped=, serial=).
+        logger.info(
+            "PLE mmap forward: fwd_rows=%d n=%d p50_ms=%.2f p50_sync_ms=%.2f "
+            "p50_gather_ms=%.2f p50_h2d_call_ms=%.2f fwd_p99_ms=%.2f "
+            "p99_sync_ms=%.2f p99_gather_ms=%.2f p99_h2d_call_ms=%.2f",
+            self._fwd_rows_since_log,
+            n,
+            p50_total,
+            p50_sync,
+            p50_gather,
+            p50_h2d,
+            p99_total,
+            p99_sync,
+            p99_gather,
+            p99_h2d,
+        )
+        self._fwd_timings_ms.clear()
+        self._fwd_rows_since_log = 0
+        self._fwd_last_log = now
 
     def _forward_gpu(self, ids: torch.Tensor, table: MmapPleTable) -> torch.Tensor:
         """Zero-copy path: the GPU dereferences the mmap'd table directly.
@@ -913,11 +1131,15 @@ class MmapNgramEmbedding(nn.Module):
 def set_weight_scale(
     embedding: MmapNgramEmbedding, weight: torch.Tensor, device: torch.device
 ) -> None:
-    """Register the checkpoint's FP8 global scale on the placeholder.
+    """Register the table's global scale on the placeholder.
+
+    Quantized (``requires_scale``) dtypes only — an unquantized dtype like
+    BF16 has no scale on disk and never routes through this function.
 
     Called from ``Qwen4ExpNGramEmbedding.load_weights`` as it intercepts
-    ``ngram_embedding.weight_scale`` from the streamed weight iterator, so
-    ``device`` should match wherever the rest of the module already lives
+    ``ngram_embedding.weight_scale`` from the streamed weight iterator (and
+    from :func:`_resolve_scale` for a header read), so ``device`` should
+    match wherever the rest of the module already lives
     (e.g. an existing buffer's device) rather than being hardcoded — this is
     what lets seam tests build everything on CPU with no GPU present.
     """
@@ -974,6 +1196,62 @@ def check_cudagraph_safety(compilation_config: CompilationConfig) -> None:
 # --------------------------------------------------------------------------- #
 # Table directory resolution (R3.2/R4.5).
 # --------------------------------------------------------------------------- #
+def table_dir() -> str | None:
+    """The configured ``VLLM_PLE_MMAP_DIR`` override, or ``None``.
+
+    Returns:
+        The validated absolute directory, or ``None`` when the override is
+        unset/empty or the mmap path is disabled altogether.
+
+    Raises:
+        RuntimeError: the override is set but is not an absolute path, or
+            does not name an existing directory. Fail closed: silently
+            falling back to the checkpoint's own table would serve a
+            different table than the operator asked for, and the two
+            differ in dtype and values.
+    """
+    raw = os.environ.get("VLLM_PLE_MMAP_DIR", "").strip()
+    if not raw or not enabled():
+        return None
+    if not os.path.isabs(raw):
+        raise RuntimeError(
+            f"PLE mmap: VLLM_PLE_MMAP_DIR={raw!r} is not an absolute path. "
+            "Point it at the absolute directory holding the PLE table's "
+            "safetensors shards (the in-container path when serving under "
+            "docker), or unset it to serve the table out of the checkpoint "
+            "directory."
+        )
+    if not os.path.isdir(raw):
+        raise RuntimeError(
+            f"PLE mmap: VLLM_PLE_MMAP_DIR={raw!r} is not a directory. "
+            "Create it (a directory of safetensors shards, or hard links to "
+            "them, whose headers carry the PLE tensor names), fix the path, "
+            "or unset it to serve the table out of the checkpoint directory."
+        )
+    return raw
+
+
+def resolve_table_path(model_config: ModelConfig) -> str:
+    """Resolve the directory the PLE table's shards are discovered from.
+
+    ``VLLM_PLE_MMAP_DIR`` wins when set, which decouples the table from the
+    served checkpoint: one on-disk table can back several composed
+    checkpoints without grafting a copy into each. The table directory then
+    carries the whole contract on its own — the PLE tensor names in its
+    shard headers, plus ``ngram_embedding.weight_scale`` for a dtype that
+    needs one, since nothing from it streams through the weight iterator
+    (see :func:`_resolve_scale`).
+
+    Args:
+        model_config: the served model's config, used only when no override
+            is set.
+
+    Returns:
+        A local directory holding the PLE table's safetensors shards.
+    """
+    return table_dir() or resolve_model_path(model_config)
+
+
 def resolve_model_path(model_config: ModelConfig) -> str:
     """Resolve ``model_config`` to a local directory holding the checkpoint.
 
@@ -1006,32 +1284,60 @@ def _extract_layer_idx(layer_name: str) -> int:
 
 def _validate_layer_shards(
     layer_shards: _LayerShards, head_dim: int, layer_idx: int, model_path: str
-) -> tuple[str, int, int, str]:
+) -> tuple[str, int, int, str] | None:
     """Shared fail-closed checks between :func:`validate_shards_for` (cheap,
     construction-time) and :func:`_attach_table` (authoritative, attach-time)
     — the same class of validation runs at both points (M3), just at
     different times relative to the checkpoint's streamed load.
 
     Returns:
-        The layer's validated (non-``None``) ``scale_entry``.
+        The layer's validated ``scale_entry``, or ``None`` when the
+        discovered dtype's descriptor has ``requires_scale=False``.
     """
     if layer_shards.cols != head_dim:
         raise RuntimeError(
             f"PLE mmap: layer {layer_idx} shard width {layer_shards.cols} "
             f"!= head_dim {head_dim}"
         )
-    if layer_shards.dtype_str not in _FP8_DTYPES:
+    desc = _PLE_DTYPES.get(layer_shards.dtype_str)
+    if desc is None:
         raise RuntimeError(
             f"PLE mmap: layer {layer_idx} shards have unsupported dtype "
-            f"{layer_shards.dtype_str!r}; only {sorted(_FP8_DTYPES)} "
-            "is supported (F8_E5M2 is refused: is_fp8() does not "
+            f"{layer_shards.dtype_str!r}; only {sorted(_PLE_DTYPES)} "
+            "are supported (F8_E5M2 is refused: is_fp8() does not "
             "recognize it, so dequant would silently never fire)"
         )
+    if not desc.requires_scale:
+        if layer_shards.scale_entry is not None:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} is {layer_shards.dtype_str} "
+                "(unquantized, no scale required) but has an "
+                f"ngram_embedding.weight_scale on disk under {model_path} — "
+                "a half-finished fp8-to-bf16 conversion looks exactly like "
+                "this. Drop the stray scale, or export the shards in a "
+                "dtype that requires one."
+            )
+        return None
     if layer_shards.scale_entry is None:
         raise RuntimeError(
-            f"PLE mmap: layer {layer_idx} has FP8 shards but no "
-            f"ngram_embedding.weight_scale under {model_path}"
+            f"PLE mmap: layer {layer_idx} has {layer_shards.dtype_str} "
+            f"shards but no ngram_embedding.weight_scale under {model_path} "
+            "— a quantized table must carry its scale alongside its rows. "
+            "Add the weight_scale tensor to a shard in that directory, or "
+            "point VLLM_PLE_MMAP_DIR at a table that has one."
         )
+    _scale_path, _scale_offset, scale_nbytes, scale_dtype_str = layer_shards.scale_entry
+    scale_torch_dtype = _SCALE_TORCH_DTYPES.get(scale_dtype_str)
+    if scale_torch_dtype is not None:
+        expected_nbytes = get_dtype_size(scale_torch_dtype)
+        if scale_nbytes != expected_nbytes:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} weight_scale is {scale_nbytes} "
+                f"bytes, expected {expected_nbytes} for a single "
+                f"{scale_dtype_str} scalar — per-channel PLE scales are "
+                "unsupported (a header read would silently keep only the "
+                "first element); export a single global scale for this layer"
+            )
     return layer_shards.scale_entry
 
 
@@ -1056,21 +1362,26 @@ def validate_shards_for(
     snapshot yet — common for ``--load-format dummy``/test construction):
     logs and returns rather than raising, since :func:`build_tables` still
     fail-closes at the real load if the checkpoint is genuinely broken, so
-    skipping here masks nothing.
+    skipping here masks nothing. A configured ``VLLM_PLE_MMAP_DIR`` is NOT
+    covered by that tolerance: an operator-supplied path is either usable or
+    a typo, and nothing later in the load can make it resolve.
 
     Raises:
-        RuntimeError: the model path resolves but shards are missing,
-            wrong-dtype, wrong-width, or scale-less.
+        RuntimeError: ``VLLM_PLE_MMAP_DIR`` is set but unusable, or the
+            table path resolves but shards are missing, wrong-dtype,
+            wrong-width, or scale-less.
     """
-    try:
-        model_path = resolve_model_path(model_config)
-    except Exception:
-        logger.warning(
-            "PLE mmap: %s: cannot resolve model path to pre-validate shards "
-            "at construction time; deferring to load time",
-            layer_name,
-        )
-        return
+    model_path = table_dir()
+    if model_path is None:
+        try:
+            model_path = resolve_model_path(model_config)
+        except Exception:
+            logger.warning(
+                "PLE mmap: %s: cannot resolve model path to pre-validate "
+                "shards at construction time; deferring to load time",
+                layer_name,
+            )
+            return
     layer_idx = _extract_layer_idx(layer_name)
     layer_shards = discover_shards(model_path).get(layer_idx)
     if layer_shards is None:
@@ -1118,12 +1429,12 @@ def build_tables(
         RuntimeError: a PLE layer has no matching shards on disk, a
             discovered shard fails validation (invariant 4: fail closed),
             or an already-attached layer's table was built from a
-            DIFFERENT checkpoint than the one ``model_config`` resolves to
+            DIFFERENT table directory than the one this load resolves to
             now — reload_weights repointing ``model_config`` at a new
             checkpoint is unsupported; serving checkpoint A's mmap rows
             against checkpoint B's scale would silently corrupt output.
     """
-    model_path = resolve_model_path(model_config)
+    model_path = resolve_table_path(model_config)
 
     pending: list[tuple[str, Any, Any, MmapNgramEmbedding]] = []
     for layer_name, layer in compilation_config.static_forward_context.items():
@@ -1166,26 +1477,68 @@ def build_tables(
         )
 
 
-def _attach_table(
+def _resolve_scale(
     embedding: MmapNgramEmbedding,
-    layer_shards: _LayerShards,
-    split_ngram_parts: int,
+    scale_entry: tuple[str, int, int, str],
     layer_idx: int,
-    model_path: str,
+    from_table_dir: bool,
 ) -> None:
-    scale_entry = _validate_layer_shards(
-        layer_shards, embedding.embedding_dim, layer_idx, model_path
-    )
-    if not embedding.weight_scale_loaded:
-        raise RuntimeError(
-            f"PLE mmap: layer {layer_idx} weight_scale was never loaded "
-            "from the checkpoint's streamed weights"
+    """Make the placeholder carry the scale belonging to the rows about to
+    be attached, for a dtype whose descriptor requires one.
+
+    Three sources, in the order they can be trusted:
+
+    * ``VLLM_PLE_MMAP_DIR`` mode — the table directory is the sole
+      authority. Nothing in it streams through the weight iterator, so the
+      scale is read from its shard headers. Any scale the CHECKPOINT
+      streamed describes the checkpoint's own PLE table, which is not the
+      one being attached; using it would be exactly the "checkpoint A's
+      rows against checkpoint B's scale" corruption :func:`build_tables`
+      guards against, so it is overridden, loudly.
+    * a streamed scale (checkpoint mode) — cross-checked against an
+      independent direct read of the same tensor off disk: two
+      self-consistent halves (R4.13's philosophy applied to the scale, not
+      just row mapping), and a mismatch means the streamed weight iterator
+      silently renamed or skipped something.
+    * no streamed scale and nothing streamed at all (checkpoint mode) — a
+      loader topology that never routed this family here. Nothing was lost,
+      so fall back to the header read rather than fail closed on it.
+
+    Raises:
+        RuntimeError: rows streamed but their scale did not (a broken or
+            truncated weight iterator — the one case with something
+            genuinely missing), or the streamed and on-disk scales disagree.
+    """
+    if from_table_dir:
+        if embedding.weight_scale_loaded:
+            logger.warning(
+                "PLE mmap: layer %d overriding the checkpoint's streamed "
+                "weight_scale with the one in VLLM_PLE_MMAP_DIR — the table "
+                "served from that directory carries its own scale, and the "
+                "streamed value belongs to the checkpoint's own PLE table",
+                layer_idx,
+            )
+        # Same device the streamed path resolves to: the buffer being replaced.
+        set_weight_scale(
+            embedding, _read_scale(scale_entry), embedding.weight_scale.device
         )
-    # Cross-check the streamed-and-registered scale against an independent
-    # direct read of the same tensor off disk: these are two self-consistent
-    # halves (R4.13's philosophy applied to the scale, not just row mapping)
-    # and a mismatch would mean the streamed weight iterator silently
-    # renamed or skipped something.
+        return
+    if not embedding.weight_scale_loaded:
+        if embedding.weights_streamed:
+            raise RuntimeError(
+                f"PLE mmap: layer {layer_idx} weight_scale was never loaded "
+                "from the checkpoint's streamed weights"
+            )
+        logger.warning(
+            "PLE mmap: layer %d weight_scale falling back to a direct header "
+            "read — this layer's ngram_embedding family was never streamed "
+            "through the checkpoint loader",
+            layer_idx,
+        )
+        set_weight_scale(
+            embedding, _read_scale(scale_entry), embedding.weight_scale.device
+        )
+        return
     header_scale = _read_scale(scale_entry).float()
     streamed_scale = embedding.weight_scale.detach().to("cpu").float()
     if not torch.allclose(header_scale, streamed_scale, atol=1e-6):
@@ -1198,6 +1551,29 @@ def _attach_table(
             f"and the header-parsed value "
             f"({header_scale.flatten().tolist()[:4]})"
         )
+
+
+def _attach_table(
+    embedding: MmapNgramEmbedding,
+    layer_shards: _LayerShards,
+    split_ngram_parts: int,
+    layer_idx: int,
+    model_path: str,
+) -> None:
+    scale_entry = _validate_layer_shards(
+        layer_shards, embedding.embedding_dim, layer_idx, model_path
+    )
+    desc = _PLE_DTYPES[layer_shards.dtype_str]
+    if desc.requires_scale:
+        assert scale_entry is not None  # guaranteed by _validate_layer_shards
+        _resolve_scale(embedding, scale_entry, layer_idx, table_dir() is not None)
+    # else: an unquantized dtype (e.g. BF16) has no scale to resolve.
+    # _validate_layer_shards already refused a stray on-disk scale, so
+    # validation is the sole authority here and this path deliberately
+    # ignores weight_scale_loaded/weights_streamed: a real loader never
+    # calls set_weight_scale for such a table (there is nothing to stream),
+    # so weight_scale_loaded=True on an unscaled embedding only ever
+    # happens in a test double, and attaching must not chase that state.
 
     vocab = embedding.org_vocab_size
     # Verbatim shard-placement math from Qwen4ExpNGramEmbedding.load_weights
@@ -1239,10 +1615,11 @@ def _attach_table(
         layer_shards.shards,
         shard_size,
         row_bytes,
-        _FP8_DTYPES[layer_shards.dtype_str],
+        desc.torch_dtype,
         workers=envs.VLLM_PLE_MMAP_WORKERS,
         chunk=envs.VLLM_PLE_MMAP_CHUNK,
         model_path=model_path,
+        serial=serial_threshold(),
     )
     embedding.torch_dtype = table.torch_dtype
     table_bytes = table.rows_total * row_bytes
@@ -1260,7 +1637,7 @@ def _attach_table(
     embedding.table = table
     logger.info(
         "PLE mmap: layer %d attached, %d shards, %d rows x %d B "
-        "(%.2f GiB on disk), %d workers, gpu_gather=%s",
+        "(%.2f GiB on disk), %d workers, gpu_gather=%s, serial=%d",
         layer_idx,
         len(layer_shards.shards),
         table.rows_total,
@@ -1268,6 +1645,7 @@ def _attach_table(
         table_bytes / (1 << 30),
         table.workers,
         table.gpu_gather,
+        table.serial,
     )
 
 
@@ -1326,6 +1704,9 @@ __all__ = [
     "enabled",
     "parse_safetensors_header",
     "resolve_model_path",
+    "resolve_table_path",
+    "serial_threshold",
     "set_weight_scale",
+    "table_dir",
     "validate_shards_for",
 ]

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -44,10 +45,12 @@ def _reset_ple_mmap_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test starts from a clean, default-off environment."""
     for name in (
         "VLLM_PLE_MMAP",
+        "VLLM_PLE_MMAP_DIR",
         "VLLM_PLE_MMAP_WORKERS",
         "VLLM_PLE_MMAP_CHUNK",
         "VLLM_PLE_MMAP_PREWARM",
         "VLLM_PLE_MMAP_GPU_GATHER",
+        "VLLM_PLE_MMAP_SERIAL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -81,13 +84,18 @@ def _make_text_config(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def _synthetic_weight(vocab: int, cols: int, layer_idx: int = 0) -> torch.Tensor:
-    """Deterministic, layer-dependent fp8 values (never all-zero/uniform, and
+def _synthetic_weight(
+    vocab: int,
+    cols: int,
+    layer_idx: int = 0,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Deterministic, layer-dependent values (never all-zero/uniform, and
     distinguishable across layers so per-layer-keying tests are meaningful).
     """
     raw = torch.arange(vocab * cols, dtype=torch.float32).reshape(vocab, cols)
     raw = torch.remainder(raw + layer_idx * 97, 6.0) - 3.0
-    return raw.to(torch.float8_e4m3fn)
+    return raw.to(dtype)
 
 
 def _write_ple_layer(
@@ -99,16 +107,18 @@ def _write_ple_layer(
     cols: int,
     scale: float,
     write_scale: bool = True,
+    scale_dtype: torch.dtype = torch.bfloat16,
+    table_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> torch.Tensor:
     """Write one PLE layer's shard + weight_scale tensors as synthetic
     safetensors files (no model.safetensors.index.json, matching the real
-    checkpoint). Returns the full logical [vocab, cols] fp8 table.
+    checkpoint). Returns the full logical [vocab, cols] table in table_dtype.
     """
     prefix = (
         f"model.language_model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding"
     )
     shard_size = (vocab + parts - 1) // parts
-    full = _synthetic_weight(vocab, cols, layer_idx)
+    full = _synthetic_weight(vocab, cols, layer_idx, dtype=table_dtype)
     for shard_index in range(parts):
         start = shard_index * shard_size
         rows = max(0, min(shard_size, vocab - start))
@@ -116,9 +126,7 @@ def _write_ple_layer(
         if rows > 0:
             tensors[f"{prefix}.shard_{shard_index}.weight"] = full[start : start + rows]
         if write_scale and shard_index == 0:
-            tensors[f"{prefix}.weight_scale"] = torch.tensor(
-                [scale], dtype=torch.bfloat16
-            )
+            tensors[f"{prefix}.weight_scale"] = torch.tensor([scale], dtype=scale_dtype)
         if tensors:
             safetensors.torch.save_file(
                 tensors,
@@ -147,6 +155,23 @@ def _attached_embedding(
         model_path=str(directory),
     )
     return embedding
+
+
+def _record_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    """Capture plain logger.info calls — the rate-limited-log-line pattern
+    shared by MmapPleTable._record and
+    MmapNgramEmbedding._record_forward_timing.
+
+    Args are typed Any, not object: callers unpack these %-format args and
+    do arithmetic on the numeric ones.
+    """
+    recorded: list[tuple[str, tuple[Any, ...]]] = []
+    monkeypatch.setattr(
+        ple_mmap.logger, "info", lambda msg, *args: recorded.append((msg, args))
+    )
+    return recorded
 
 
 # --------------------------------------------------------------------------- #
@@ -501,6 +526,286 @@ def test_mmap_table_gather_empty_input_returns_empty(tmp_path: Path) -> None:
     out = table.gather(np.empty(0, dtype=np.int64))
 
     assert out.shape == (0, 2)
+
+
+# --------------------------------------------------------------------------- #
+# Serial small-gather dispatch (VLLM_PLE_MMAP_SERIAL)
+# --------------------------------------------------------------------------- #
+
+
+def test_serial_threshold_defaults_to_off_and_parses_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ple_mmap.serial_threshold() == 0  # env unset (autouse fixture)
+
+    monkeypatch.setenv("VLLM_PLE_MMAP_SERIAL", "  256 ")
+    assert ple_mmap.serial_threshold() == 256
+
+    monkeypatch.setenv("VLLM_PLE_MMAP_SERIAL", "")
+    assert ple_mmap.serial_threshold() == 0
+
+
+@pytest.mark.parametrize("raw", ["yes", "256.5", "-1"])
+def test_serial_threshold_refuses_a_value_that_is_not_a_row_count(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Fail closed rather than reading a typo as 0: a silently-off knob
+    would report a clean 'serial disabled' arm for a run the operator
+    believes measured it."""
+    monkeypatch.setenv("VLLM_PLE_MMAP_SERIAL", raw)
+
+    with pytest.raises(RuntimeError, match="VLLM_PLE_MMAP_SERIAL"):
+        ple_mmap.serial_threshold()
+
+
+def test_serial_gather_matches_pool_gather_for_the_same_ids(tmp_path: Path) -> None:
+    """The knob is a dispatch swap, not a different gather: the inline and
+    pooled branches must return byte-identical rows, in input order, for
+    the same ids."""
+    full = _write_ple_layer(tmp_path, layer_idx=0, vocab=40, parts=4, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    ids = np.array([0, 39, 12, 13, 14, 5, 5, 20, 31], dtype=np.int64)
+
+    gathered = []
+    for serial in (0, 64):  # off (pool) vs on (inline, uniq.size <= 64)
+        table = ple_mmap.MmapPleTable(
+            layer_shards.shards,
+            10,
+            8,
+            torch.float8_e4m3fn,
+            workers=4,
+            chunk=2,
+            model_path=str(tmp_path),
+            serial=serial,
+        )
+        gathered.append(torch.from_numpy(table.gather(ids)).view(torch.float8_e4m3fn))
+        table.close()
+
+    assert torch.equal(gathered[0], full[ids])
+    assert torch.equal(gathered[1], gathered[0])
+
+
+def _count_pool_dispatches(
+    monkeypatch: pytest.MonkeyPatch, table: ple_mmap.MmapPleTable
+) -> list[int]:
+    """Count table.pool.map calls without disturbing what it returns.
+
+    One sentinel appended per call, so len(...) reads as the dispatch count.
+    """
+    calls: list[int] = []
+    real_map = table.pool.map
+
+    def _counting_map(fn: object, tasks: object) -> object:
+        calls.append(1)
+        return real_map(fn, tasks)
+
+    monkeypatch.setattr(table.pool, "map", _counting_map)
+    return calls
+
+
+def test_serial_threshold_boundary_switches_inline_vs_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uniq.size == N stays inline (pool.map never called); uniq.size ==
+    N + 1 crosses the threshold back onto the pool."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=40, parts=4, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    table = ple_mmap.MmapPleTable(
+        layer_shards.shards,
+        10,
+        8,
+        torch.float8_e4m3fn,
+        workers=4,
+        chunk=1,
+        model_path=str(tmp_path),
+        serial=2,
+    )
+    calls = _count_pool_dispatches(monkeypatch, table)
+
+    table.gather(np.array([0, 5], dtype=np.int64))  # uniq.size == 2 == N
+    assert len(calls) == 0
+
+    table.gather(np.array([0, 5, 12], dtype=np.int64))  # uniq.size == 3 > N
+    assert len(calls) == 1
+
+    table.close()
+
+
+def test_serial_threshold_keys_on_distinct_rows_not_task_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large chunk coalesces each shard's span into a single task, so a
+    16-distinct-row gather spanning exactly 2 shards produces only 2 tasks
+    — fewer than the serial=6 threshold. The boundary test above used
+    chunk=1, where len(tasks) == uniq.size, so it cannot tell a
+    uniq.size-keyed gate from a len(tasks)-keyed one; this one can. Keying
+    on uniq.size is the point of the knob: hash-scattering is exactly what
+    makes task count an unreliable proxy for how big a gather is."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=20, parts=2, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    table = ple_mmap.MmapPleTable(
+        layer_shards.shards,
+        10,
+        8,
+        torch.float8_e4m3fn,
+        workers=4,
+        chunk=2048,
+        model_path=str(tmp_path),
+        serial=6,
+    )
+    calls = _count_pool_dispatches(monkeypatch, table)
+
+    # 8 rows from shard 0 ([0, 9]) + 8 rows from shard 1 ([10, 19]):
+    # uniq.size == 16, but chunk=2048 coalesces each shard's span into one
+    # task each, so len(tasks) == 2.
+    ids = np.array(
+        [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17], dtype=np.int64
+    )
+    table.gather(ids)
+
+    assert len(calls) == 1  # pooled: uniq.size (16) > serial (6)
+
+    table.close()
+
+
+def test_serial_branch_raises_the_same_named_indexerror_on_a_closed_table(
+    tmp_path: Path,
+) -> None:
+    """The serial dispatch loop reuses run() verbatim, so a missing shard
+    raises the identical named IndexError regardless of branch — exercised
+    here with more than one task, which the pre-existing len(tasks) == 1
+    special case never reaches. The contract under test is "a missing shard
+    slot" (run()'s ``mm is None`` check), simulated cheaply by closing the
+    table first, which nulls every mm slot. That is also why only the
+    serial branch is exercised: gathering through the pool branch on a
+    CLOSED table hits an unrelated, pre-existing divergence — pool.map
+    raises RuntimeError("cannot schedule new futures after shutdown")
+    straight from the shut-down executor, before run() can raise at all."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=40, parts=4, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    table = ple_mmap.MmapPleTable(
+        layer_shards.shards,
+        10,
+        8,
+        torch.float8_e4m3fn,
+        workers=4,
+        chunk=1,
+        model_path=str(tmp_path),
+        serial=64,
+    )
+    table.close()
+
+    with pytest.raises(IndexError, match="shard"):
+        table.gather(np.array([0, 5], dtype=np.int64))
+
+
+def test_serial_field_in_the_gather_log_line_reflects_the_engaged_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_record's rate-limited line gains an appended serial= field
+    (append-only — rows=/p99_ms=/pending=/errors=/skipped= keep their
+    names, order and meaning) reporting engaged/total gathers in the
+    window."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=40, parts=4, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    table = ple_mmap.MmapPleTable(
+        layer_shards.shards,
+        10,
+        8,
+        torch.float8_e4m3fn,
+        workers=4,
+        chunk=2,
+        model_path=str(tmp_path),
+        serial=2,
+    )
+    logged = _record_info(monkeypatch)
+
+    table._last_log = 0.0  # simulate the interval having elapsed
+    table.gather(np.array([0, 5], dtype=np.int64))  # uniq.size == 2 <= serial
+    assert len(logged) == 1
+    msg, args = logged[0]
+    assert "serial=" in msg
+    assert args[-2:] == (1, 1)  # this window's one gather engaged serial
+
+    logged.clear()
+    table._last_log = 0.0
+    table.gather(np.array([0, 5, 12], dtype=np.int64))  # uniq.size == 3 > serial
+    assert len(logged) == 1
+    assert logged[0][1][-2:] == (0, 1)  # this window's one gather did not
+
+    table.close()
+
+
+def test_mixed_window_serial_field_reports_engaged_over_total_gathers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shape the field's window-keying exists for: many small
+    (serial-engaged) gathers plus one large pooled one. p99 is by
+    construction the window's slowest call — here the large pooled gather,
+    the least representative sample of how the window actually dispatched.
+    Keying serial= on that one sample's flag would report 0 for the
+    19-of-20-engaged window driven below."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=600, parts=4, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    table = ple_mmap.MmapPleTable(
+        layer_shards.shards,
+        150,
+        8,
+        torch.float8_e4m3fn,
+        workers=4,
+        chunk=16,
+        model_path=str(tmp_path),
+        serial=5,
+    )
+    logged = _record_info(monkeypatch)
+
+    small_ids = np.array([0, 1], dtype=np.int64)  # uniq.size == 2 <= serial
+    for _ in range(19):
+        table.gather(small_ids)
+    large_ids = np.arange(500, dtype=np.int64)  # uniq.size == 500 > serial
+    table._last_log = 0.0  # simulate the interval having elapsed on this call
+    table.gather(large_ids)  # pooled, the window's slowest call by far
+
+    assert len(logged) == 1
+    msg, args = logged[0]
+    assert "serial=" in msg
+    assert args[-2:] == (19, 20)  # 19 of this window's 20 gathers engaged
+
+    table.close()
+
+
+def test_serial_engaged_counter_resets_with_the_log_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engaged count is per-window, so it must be cleared alongside
+    _latencies_ms when a line fires — otherwise every later window reports
+    an engaged count larger than its own total."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=40, parts=4, cols=8, scale=0.5)
+    layer_shards = ple_mmap.discover_shards(str(tmp_path))[0]
+    table = ple_mmap.MmapPleTable(
+        layer_shards.shards,
+        10,
+        8,
+        torch.float8_e4m3fn,
+        workers=4,
+        chunk=2,
+        model_path=str(tmp_path),
+        serial=64,
+    )
+    logged = _record_info(monkeypatch)
+    ids = np.array([0, 5], dtype=np.int64)
+
+    table.gather(ids)
+    assert table._serial_engaged_since_log == 1
+    table._last_log = 0.0
+    table.gather(ids)
+
+    assert len(logged) == 1
+    assert logged[0][1][-2:] == (2, 2)
+    assert table._serial_engaged_since_log == 0
+    assert table._latencies_ms == []
+
+    table.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -865,6 +1170,89 @@ def test_validate_shards_for_passes_on_a_well_formed_checkpoint(
     )  # must not raise
 
 
+def test_validate_shards_for_refuses_a_bf16_table_with_a_stray_weight_scale(
+    tmp_path: Path,
+) -> None:
+    """BF16 (unquantized) tables are registered with requires_scale=False —
+    a weight_scale present on disk anyway signals exporter confusion (e.g. a
+    half fp8-to-bf16 conversion) and must be refused up front, not silently
+    ignored."""
+    _write_ple_layer(
+        tmp_path,
+        layer_idx=1,
+        vocab=10,
+        parts=3,
+        cols=2,
+        scale=0.25,
+        write_scale=True,
+        table_dtype=torch.bfloat16,
+    )
+    model_config = _model_config(tmp_path)
+
+    with pytest.raises(RuntimeError, match="BF16"):
+        ple_mmap.validate_shards_for(model_config, "model.layers.1.ple", head_dim=2)
+
+
+def test_validate_shards_for_passes_on_a_well_formed_bf16_checkpoint(
+    tmp_path: Path,
+) -> None:
+    _write_ple_layer(
+        tmp_path,
+        layer_idx=1,
+        vocab=10,
+        parts=3,
+        cols=2,
+        scale=0.25,
+        write_scale=False,
+        table_dtype=torch.bfloat16,
+    )
+    model_config = _model_config(tmp_path)
+
+    ple_mmap.validate_shards_for(
+        model_config, "model.layers.1.ple", head_dim=2
+    )  # must not raise
+
+
+def test_validate_shards_for_reads_the_mmap_dir_instead_of_the_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VLLM_PLE_MMAP_DIR redirects construction-time discovery wholesale: a
+    checkpoint with no PLE tensors at all validates fine when the table
+    directory has them, and a broken table directory is refused even though
+    the checkpoint is untouched."""
+    checkpoint = tmp_path / "checkpoint"
+    table = tmp_path / "table"
+    checkpoint.mkdir()
+    table.mkdir()
+    _write_ple_layer(table, layer_idx=1, vocab=10, parts=3, cols=2, scale=0.25)
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_DIR", str(table))
+    model_config = _model_config(checkpoint)
+
+    ple_mmap.validate_shards_for(
+        model_config, "model.layers.1.ple", head_dim=2
+    )  # must not raise
+
+    with pytest.raises(RuntimeError, match="shard width"):
+        ple_mmap.validate_shards_for(model_config, "model.layers.1.ple", head_dim=4)
+
+
+def test_validate_shards_for_never_defers_on_a_broken_mmap_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unresolvable-model-path tolerance below must not swallow a
+    misconfigured override: an operator-supplied path is either usable or a
+    typo, and no later stage of the load can make it resolve."""
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_DIR", "/nonexistent/ple-table-xyz")
+    model_config = SimpleNamespace(
+        model_weights="", model="nonexistent-org/nonexistent-repo-xyz", revision=None
+    )
+
+    with pytest.raises(RuntimeError, match="is not a directory"):
+        ple_mmap.validate_shards_for(model_config, "model.layers.1.ple", head_dim=4)
+
+
 def test_validate_shards_for_tolerates_an_unresolvable_model_path() -> None:
     """A bare repo id with no local snapshot (e.g. --load-format
     dummy/test construction, offline): validation defers to load time
@@ -927,6 +1315,14 @@ def test_ple_mmap_tuning_knobs_are_not_compile_factors() -> None:
     assert "VLLM_PLE_MMAP_PREWARM" not in factors
     # GPU gather swaps the body of the split-out op, never the graph.
     assert "VLLM_PLE_MMAP_GPU_GATHER" not in factors
+    # VLLM_PLE_MMAP_DIR names where the table's bytes live, which the graph
+    # never sees; it is read straight from os.environ for exactly that
+    # reason, so it must not appear here even by accident.
+    assert "VLLM_PLE_MMAP_DIR" not in factors
+    # VLLM_PLE_MMAP_SERIAL only swaps how the gather dispatches its tasks,
+    # never the graph — and a threshold sweep that forced a recompile per
+    # arm would poison its own A/B. Also read straight from os.environ.
+    assert "VLLM_PLE_MMAP_SERIAL" not in factors
 
 
 # --------------------------------------------------------------------------- #
@@ -963,6 +1359,129 @@ def test_placeholder_forward_gathers_from_attached_table(tmp_path: Path) -> None
     assert out.shape == (2, 2, 2)
     assert out.dtype == torch.float8_e4m3fn
     assert torch.equal(out.reshape(-1, 2), full[ids.reshape(-1)])
+
+
+# --------------------------------------------------------------------------- #
+# Forward timing instrument (sync_ms / gather_ms / h2d_call_ms)
+# --------------------------------------------------------------------------- #
+
+
+def test_forward_timing_instrument_logs_the_rate_limited_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The split line fires only once per _LOG_INTERVAL_S — poked directly
+    via ``_fwd_last_log``, the same way this file already pokes
+    ``table._last_log``, rather than sleeping or monkeypatching
+    time.monotonic — and reports the window's sample count plus a p50 and a
+    p99 split of the three CPU-blocking components."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    logged = _record_info(monkeypatch)
+    ids = torch.tensor([0, 8], dtype=torch.long)
+
+    embedding(ids)  # first call: buffers a sample, does not log yet
+    assert logged == []
+
+    embedding._fwd_last_log = 0.0  # simulate the interval having elapsed
+    embedding(ids)
+
+    assert len(logged) == 1
+    msg, args = logged[0]
+    # rows=/p99_ms= are the gather-side line's own keys
+    # (MmapPleTable._record); this line's fwd_rows=/fwd_p99_ms= are
+    # namespaced so no key of this line ever matches a gather-side one. The
+    # converse is one-way and not asserted here: bare rows=/p99_ms= DO
+    # match the prefixed keys below, so a gather-side grep has to anchor on
+    # a key this line does not carry.
+    assert msg.count("rows=") == 1  # only as fwd_rows=, no bare rows= too
+    assert msg.count("p99_ms=") == 1  # only as fwd_p99_ms=
+    # Every percentile-scoped component spells out its own prefix: a bare
+    # sync_ms= would be a substring of p50_sync_ms=, so a reader grepping
+    # for the p99 split would silently get the p50 value instead.
+    for key in ("sync_ms=", "gather_ms=", "h2d_call_ms="):
+        assert f"p50_{key}" in msg and f"p99_{key}" in msg
+        assert msg.count(key) == 2  # only ever as those two prefixed twins
+    (
+        fwd_rows,
+        n,
+        p50_ms,
+        p50_sync_ms,
+        p50_gather_ms,
+        p50_h2d_ms,
+        fwd_p99_ms,
+        p99_sync_ms,
+        p99_gather_ms,
+        p99_h2d_ms,
+    ) = args
+    assert fwd_rows == 2 * ids.numel()
+    assert n == 2  # both calls landed in this window
+    for value in (
+        p50_ms,
+        p50_sync_ms,
+        p50_gather_ms,
+        p50_h2d_ms,
+        fwd_p99_ms,
+        p99_sync_ms,
+        p99_gather_ms,
+        p99_h2d_ms,
+    ):
+        assert value >= 0.0
+    # Each percentile sample's own total must equal the sum of its own
+    # split — an arg-order regression inside either group desyncs this.
+    assert fwd_p99_ms == pytest.approx(p99_sync_ms + p99_gather_ms + p99_h2d_ms)
+    assert p50_ms == pytest.approx(p50_sync_ms + p50_gather_ms + p50_h2d_ms)
+    # p99 indexes at or above p50 into a sorted window, so it can never
+    # come out below it — this is what a wholesale p50/p99 group swap
+    # breaks, and what the two per-group sum checks above would survive.
+    assert fwd_p99_ms >= p50_ms
+
+
+def test_forward_timing_window_resets_after_it_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """n= and fwd_rows= are per-window, so both accumulators clear when a
+    line fires; otherwise every later window reports the whole run."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    logged = _record_info(monkeypatch)
+    ids = torch.tensor([0, 8], dtype=torch.long)
+
+    embedding._fwd_last_log = 0.0
+    embedding(ids)
+    assert logged[0][1][:2] == (2, 1)  # fwd_rows=2, n=1
+    assert embedding._fwd_timings_ms == []
+    assert embedding._fwd_rows_since_log == 0
+
+    embedding._fwd_last_log = 0.0
+    embedding(ids)
+    assert logged[1][1][:2] == (2, 1)  # the second window, not (4, 2)
+
+
+def test_forward_timing_skips_the_paths_that_never_gathered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table-unset and capture-pass zero-fills return without touching
+    the table, so there is no sync/gather/H2D split to attribute and they
+    must not enter the window at all — an entry of zeros would drag the
+    reported p50 toward a call that never did any of the work."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5)
+    unattached = ple_mmap.MmapNgramEmbedding(9, 2)
+    unattached(torch.zeros((2, 3), dtype=torch.long))
+    assert unattached._fwd_timings_ms == []
+
+    embedding = _attached_embedding(
+        tmp_path, layer_idx=0, vocab=9, parts=3, cols=2, scale=0.5
+    )
+    monkeypatch.setattr(ple_mmap.logger, "warning_once", lambda *a, **k: None)
+    embedding(torch.tensor([0, 9], dtype=torch.long))  # 9 == rows_total
+
+    assert embedding.table is not None
+    assert embedding.table._skipped == 1
+    assert embedding._fwd_timings_ms == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1204,12 +1723,13 @@ def _model_config(directory: Path) -> SimpleNamespace:
 def test_build_tables_wires_the_tuning_knobs_from_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """(F-5): VLLM_PLE_MMAP_WORKERS/_CHUNK must reach the attached
-    MmapPleTable's workers/chunk in the right order — a swapped-args
+    """(F-5): VLLM_PLE_MMAP_WORKERS/_CHUNK/_SERIAL must reach the attached
+    MmapPleTable's workers/chunk/serial in the right order — a swapped-args
     regression would still construct a table, just with the wrong
     concurrency knobs, and nothing else would notice."""
     monkeypatch.setenv("VLLM_PLE_MMAP_WORKERS", "3")
     monkeypatch.setenv("VLLM_PLE_MMAP_CHUNK", "7")
+    monkeypatch.setenv("VLLM_PLE_MMAP_SERIAL", "13")
     _write_ple_layer(tmp_path, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.25)
     emb = _loaded_placeholder(10, 2, 0.25)
     cc = SimpleNamespace(static_forward_context={"a.ple": _fake_ple_layer(0, emb, 3)})
@@ -1219,6 +1739,23 @@ def test_build_tables_wires_the_tuning_knobs_from_the_environment(
     assert emb.table is not None
     assert emb.table.workers == 3
     assert emb.table.chunk == 7
+    assert emb.table.serial == 13
+
+
+def test_build_tables_leaves_serial_off_when_the_environment_is_unset(
+    tmp_path: Path,
+) -> None:
+    """Default-off is the whole safety story for this knob: an attached
+    table must dispatch through the pool exactly as it did before
+    VLLM_PLE_MMAP_SERIAL existed unless an operator asks otherwise."""
+    _write_ple_layer(tmp_path, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.25)
+    emb = _loaded_placeholder(10, 2, 0.25)
+    cc = SimpleNamespace(static_forward_context={"a.ple": _fake_ple_layer(0, emb, 3)})
+
+    ple_mmap.build_tables(_model_config(tmp_path), cc)
+
+    assert emb.table is not None
+    assert emb.table.serial == 0
 
 
 def test_build_tables_attaches_a_table_per_ple_layer_without_cross_contamination(
@@ -1355,6 +1892,48 @@ def test_build_tables_refuses_a_uniformly_e5m2_ple_table(tmp_path: Path) -> None
     assert emb2.table.torch_dtype is emb2.torch_dtype
 
 
+def test_build_tables_attaches_a_bf16_table_and_forward_gathers_it_value_exact(
+    tmp_path: Path,
+) -> None:
+    """Intel AutoRound W4A16 exports pass the PLE table through as
+    unquantized BF16 with no weight_scale on disk: a real streamed load sets
+    weights_streamed True but weight_scale_loaded stays False (there is no
+    scale tensor to stream) — the True/False quadrant the streamed-loader
+    error would otherwise refuse. For a requires_scale=False dtype this must
+    still attach and serve real values through the full load_weights ->
+    build_tables -> forward chain, not raise."""
+    full = _write_ple_layer(
+        tmp_path,
+        layer_idx=0,
+        vocab=8,
+        parts=2,
+        cols=2,
+        scale=0.0,
+        write_scale=False,
+        table_dtype=torch.bfloat16,
+    )
+    module = _mmap_ngram_module_for_load_test(vocab=8, cols=2)
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", full[0:4]),
+            ("ngram_embedding.shard_1.weight", full[4:8]),
+        ]
+    )
+    assert module.ngram_embedding.weights_streamed is True
+    assert module.ngram_embedding.weight_scale_loaded is False
+
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, module.ngram_embedding, 2)}
+    )
+    ple_mmap.build_tables(_model_config(tmp_path), cc)
+
+    ids = torch.tensor([[0, 7], [3, 3]], dtype=torch.long)
+    out = module.ngram_embedding(ids)
+
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out.reshape(-1, 2), full[ids.reshape(-1)])
+
+
 def test_build_tables_raises_on_missing_shard_file(tmp_path: Path) -> None:
     prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
     full = _synthetic_weight(10, 2, layer_idx=0)
@@ -1379,15 +1958,112 @@ def test_build_tables_raises_on_missing_shard_file(tmp_path: Path) -> None:
 
 
 def test_build_tables_raises_when_weight_scale_was_never_loaded(tmp_path: Path) -> None:
-    _write_ple_layer(tmp_path, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.25)
-    embedding = ple_mmap.MmapNgramEmbedding(10, 2)  # weight_scale_loaded stays False
+    """Rows streamed but weight_scale absent from the same iterable is a
+    broken or truncated weight iterator, not an unstreamed family — this
+    must stay in the fail-closed True/False quadrant (weights_streamed
+    True, weight_scale_loaded False), never fall back to a header read."""
+    _write_ple_layer(
+        tmp_path, layer_idx=0, vocab=8, parts=2, cols=2, scale=0.25, write_scale=True
+    )
+    module = _mmap_ngram_module_for_load_test(vocab=8, cols=2)
+    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    shard_1 = torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)
+    shard_1 = shard_1.to(torch.float8_e4m3fn)
+
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+        ]
+    )
+
+    assert module.ngram_embedding.weights_streamed is True
+    assert module.ngram_embedding.weight_scale_loaded is False
+
     cc = SimpleNamespace(
-        static_forward_context={"a.ple": _fake_ple_layer(0, embedding, 3)}
+        static_forward_context={"a.ple": _fake_ple_layer(0, module.ngram_embedding, 2)}
     )
     model_config = _model_config(tmp_path)
 
     with pytest.raises(RuntimeError, match="weight_scale was never loaded"):
         ple_mmap.build_tables(model_config, cc)
+
+
+def test_build_tables_falls_back_to_header_scale_when_family_never_streamed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A layer whose ngram_embedding family was never routed to this worker
+    never streams anything, so weights_streamed stays False along with
+    weight_scale_loaded (the False/False quadrant) — that must attach off a
+    direct header read and warn, not raise the streamed-loader's fail-closed
+    error. The on-disk scale is F32 (0.1) to exercise the no-cast rule:
+    casting to the placeholder's default bf16 would silently rewrite 0.1 to
+    a different float and trip on nothing, masking the bug.
+    """
+    _write_ple_layer(
+        tmp_path,
+        layer_idx=0,
+        vocab=8,
+        parts=2,
+        cols=2,
+        scale=0.1,
+        write_scale=True,
+        scale_dtype=torch.float32,
+    )
+    embedding = ple_mmap.MmapNgramEmbedding(8, 2)
+    assert embedding.weights_streamed is False
+    assert embedding.weight_scale_loaded is False
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, embedding, 2)}
+    )
+    warnings: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        ple_mmap.logger,
+        "warning",
+        lambda msg, *args: warnings.append((msg, args)),
+    )
+
+    ple_mmap.build_tables(_model_config(tmp_path), cc)
+
+    assert embedding.weight_scale_loaded is True
+    assert embedding.weight_scale.dtype is torch.float32
+    assert torch.equal(
+        embedding.weight_scale, torch.tensor([0.1], dtype=torch.float32).squeeze()
+    )
+    assert len(warnings) == 1
+    assert warnings[0][1] == (0,)  # layer_idx
+
+
+def test_build_tables_raises_on_a_non_scalar_weight_scale(tmp_path: Path) -> None:
+    """A per-channel (multi-element) weight_scale would silently truncate to
+    its first element in _read_scale: _validate_layer_shards must refuse it
+    up front, before the header-read path (or any other quadrant) ever gets
+    a chance to attach off a truncated value.
+    """
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    vocab, parts, cols = 8, 2, 2
+    shard_size = (vocab + parts - 1) // parts
+    full = _synthetic_weight(vocab, cols)
+    for shard_index in range(parts):
+        start = shard_index * shard_size
+        rows = max(0, min(shard_size, vocab - start))
+        tensors: dict[str, torch.Tensor] = {
+            f"{prefix}.shard_{shard_index}.weight": full[start : start + rows]
+        }
+        if shard_index == 0:
+            tensors[f"{prefix}.weight_scale"] = torch.tensor(
+                [0.1, 0.2, 0.3, 0.4], dtype=torch.float32
+            )
+        safetensors.torch.save_file(
+            tensors, str(tmp_path / f"model-ple-0-{shard_index:05d}.safetensors")
+        )
+    emb = _loaded_placeholder(vocab, cols, 0.1)
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, emb, parts)}
+    )
+
+    with pytest.raises(RuntimeError, match=r"per-channel"):
+        ple_mmap.build_tables(_model_config(tmp_path), cc)
 
 
 def test_build_tables_raises_when_no_weight_scale_tensor_exists_on_disk(
@@ -1630,6 +2306,180 @@ def test_resolve_model_path_falls_back_to_offline_snapshot_download(
 
 
 # --------------------------------------------------------------------------- #
+# VLLM_PLE_MMAP_DIR: the table decoupled from the checkpoint it serves.
+# --------------------------------------------------------------------------- #
+
+
+def _use_mmap_dir(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    """Enable the mmap path and point it at a standalone table directory."""
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_DIR", str(directory))
+
+
+def test_resolve_table_path_prefers_the_mmap_dir_over_the_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_DIR", str(tmp_path))
+    model_config = SimpleNamespace(model_weights="/some/checkpoint", model="ignored")
+
+    assert ple_mmap.table_dir() == str(tmp_path)
+    assert ple_mmap.resolve_table_path(model_config) == str(tmp_path)
+
+
+def test_resolve_table_path_ignores_the_override_when_the_mmap_path_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The override is documented as consulted only under VLLM_PLE_MMAP=1 —
+    with the mmap path off there is no table to redirect, and honouring it
+    would make a stale export in the operator's shell change behavior."""
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    monkeypatch.setenv("VLLM_PLE_MMAP_DIR", str(tmp_path))
+    model_config = SimpleNamespace(model_weights=str(checkpoint), model="ignored")
+
+    assert ple_mmap.table_dir() is None
+    assert ple_mmap.resolve_table_path(model_config) == str(checkpoint)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("relative/table/dir", "not an absolute path"),
+        ("/nonexistent/ple-table-xyz", "is not a directory"),
+    ],
+)
+def test_table_dir_refuses_an_unusable_override(
+    value: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falling back to the checkpoint's own table on a typo'd override would
+    serve a DIFFERENT table than the operator asked for — one that differs
+    in dtype and values — so an unusable override fails closed."""
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_DIR", value)
+
+    with pytest.raises(RuntimeError, match=message):
+        ple_mmap.table_dir()
+
+
+def test_build_tables_serves_an_fp8_table_from_the_dir_off_a_header_scale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline DIR contract: the checkpoint holds no PLE tensors at
+    all, so nothing streams and weight_scale_loaded stays False. The table
+    directory's headers carry both the rows and the scale, and the layer
+    must attach off them and gather value-exact."""
+    checkpoint = tmp_path / "checkpoint"
+    table = tmp_path / "table"
+    checkpoint.mkdir()
+    table.mkdir()
+    full = _write_ple_layer(table, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.25)
+    embedding = ple_mmap.MmapNgramEmbedding(10, 2)
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, embedding, 3)}
+    )
+
+    _use_mmap_dir(monkeypatch, table)
+    ple_mmap.build_tables(_model_config(checkpoint), cc)
+
+    assert embedding.table is not None
+    assert embedding.table.model_path == str(table)
+    assert embedding.table.torch_dtype is torch.float8_e4m3fn
+    assert embedding.weight_scale_loaded is True
+    assert embedding.weight_scale.float().item() == 0.25
+    ids = torch.tensor([0, 9, 4], dtype=torch.long)
+    assert torch.equal(embedding(ids), full[ids])
+
+
+def test_build_tables_serves_a_bf16_table_from_the_dir_with_no_scale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DIR mode over an unquantized table: no scale exists anywhere, and
+    none is required — the requires_scale=False descriptor must keep the
+    whole scale block (header read included) from running."""
+    checkpoint = tmp_path / "checkpoint"
+    table = tmp_path / "table"
+    checkpoint.mkdir()
+    table.mkdir()
+    full = _write_ple_layer(
+        table,
+        layer_idx=0,
+        vocab=10,
+        parts=3,
+        cols=2,
+        scale=0.0,
+        write_scale=False,
+        table_dtype=torch.bfloat16,
+    )
+    embedding = ple_mmap.MmapNgramEmbedding(10, 2)
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, embedding, 3)}
+    )
+
+    _use_mmap_dir(monkeypatch, table)
+    ple_mmap.build_tables(_model_config(checkpoint), cc)
+
+    assert embedding.table is not None
+    assert embedding.table.torch_dtype is torch.bfloat16
+    assert embedding.weight_scale_loaded is False
+    ids = torch.tensor([0, 9, 4], dtype=torch.long)
+    assert torch.equal(embedding(ids), full[ids])
+
+
+def test_build_tables_dir_mode_overrides_a_scale_streamed_by_the_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint that still ships its own PLE family streams a scale that
+    describes ITS table, not the one in VLLM_PLE_MMAP_DIR. Cross-checking
+    the two would refuse a legitimate config, and keeping the streamed one
+    would serve the dir's rows against the checkpoint's scale — precisely
+    the mismatch build_tables guards against elsewhere. The dir wins."""
+    checkpoint = tmp_path / "checkpoint"
+    table = tmp_path / "table"
+    checkpoint.mkdir()
+    table.mkdir()
+    _write_ple_layer(checkpoint, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.25)
+    _write_ple_layer(table, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.75)
+    embedding = _loaded_placeholder(10, 2, 0.25)  # as the checkpoint streamed it
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, embedding, 3)}
+    )
+
+    _use_mmap_dir(monkeypatch, table)
+    ple_mmap.build_tables(_model_config(checkpoint), cc)
+
+    assert embedding.table is not None
+    assert embedding.table.model_path == str(table)
+    assert embedding.weight_scale.float().item() == 0.75
+
+
+def test_build_tables_dir_mode_refuses_an_fp8_table_with_no_scale_anywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed on the one combination that could silently corrupt: an
+    fp8 table directory with no weight_scale in its headers. A scale the
+    CHECKPOINT streamed must not stand in for it — it belongs to a
+    different table."""
+    checkpoint = tmp_path / "checkpoint"
+    table = tmp_path / "table"
+    checkpoint.mkdir()
+    table.mkdir()
+    _write_ple_layer(
+        table, layer_idx=0, vocab=10, parts=3, cols=2, scale=0.25, write_scale=False
+    )
+    embedding = _loaded_placeholder(10, 2, 0.25)  # a streamed scale exists
+    cc = SimpleNamespace(
+        static_forward_context={"a.ple": _fake_ple_layer(0, embedding, 3)}
+    )
+
+    _use_mmap_dir(monkeypatch, table)
+    with pytest.raises(RuntimeError, match="no ngram_embedding"):
+        ple_mmap.build_tables(_model_config(checkpoint), cc)
+
+    assert embedding.table is None
+
+
+# --------------------------------------------------------------------------- #
 # (a) env-on vs env-off FORWARD equivalence, through the CPU dispatch key.
 # Widened per the R2.18 fallback: env-on now hashes AND gathers inside the
 # op. Both arms call the SAME Qwen4ExpNGramEmbedding._hash_ngram_ids, so
@@ -1757,6 +2607,23 @@ def test_env_on_off_forward_equivalence_fp8_and_dequantized(
     dequant_on = mmap_ple_layer._dequantize_embeddings(got, torch.bfloat16)
 
     assert torch.equal(dequant_on, dequant_off)
+
+
+def test_dequantize_embeddings_casts_a_bf16_table_to_the_output_dtype() -> None:
+    """A BF16 (unquantized) PLE table carries no scale to apply: the
+    non-fp8 branch of _dequantize_embeddings must still cast to
+    output_dtype, mirroring the fp8 branch's final cast — without it, a
+    bf16 table served under e.g. ``--dtype float16`` reaches key_proj with
+    a stale bf16 dtype and fails there, unattributably, instead of here."""
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    embeddings = torch.tensor([[1.5, -2.25], [0.5, 3.0]], dtype=torch.bfloat16)
+    assert not is_fp8(embeddings)
+
+    out = layer._dequantize_embeddings(embeddings, torch.float16)
+
+    assert out.dtype == torch.float16
+    assert torch.equal(out, embeddings.to(torch.float16))
 
 
 # --------------------------------------------------------------------------- #
@@ -2260,14 +3127,14 @@ def test_gpu_gather_matches_cpu_gather_across_shard_boundaries(
 ) -> None:
     monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
     vocab, parts, cols = 50, 4, 8
-    _write_ple_layer(tmp_path, layer_idx=0, vocab=vocab, parts=parts, cols=cols, scale=0.5)
+    _write_ple_layer(
+        tmp_path, layer_idx=0, vocab=vocab, parts=parts, cols=cols, scale=0.5
+    )
     embedding = _attached_embedding(tmp_path, 0, vocab, parts, cols, 0.5)
     table = embedding.table
     assert table is not None
     # Boundary rows of every shard plus interior rows, unsorted, with repeats.
-    ids = torch.tensor(
-        [0, 12, 13, 25, 26, 38, 39, 49, 7, 7, 30], dtype=torch.int64
-    )
+    ids = torch.tensor([0, 12, 13, 25, 26, 38, 39, 49, 7, 7, 30], dtype=torch.int64)
     ref = table.gather(ids.numpy())
     out = torch.empty((ids.numel(), table.row_bytes), dtype=torch.uint8, device="cuda")
     table.gather_gpu(ids.cuda(), out)
@@ -2300,7 +3167,9 @@ def test_forward_gpu_path_matches_cpu_path_byte_for_byte(
 ) -> None:
     monkeypatch.setenv("VLLM_PLE_MMAP_GPU_GATHER", "1")
     vocab, parts, cols = 50, 4, 8
-    _write_ple_layer(tmp_path, layer_idx=0, vocab=vocab, parts=parts, cols=cols, scale=0.5)
+    _write_ple_layer(
+        tmp_path, layer_idx=0, vocab=vocab, parts=parts, cols=cols, scale=0.5
+    )
     embedding = _attached_embedding(tmp_path, 0, vocab, parts, cols, 0.5)
     ids = torch.tensor([[0, 12, 49], [26, 7, 39]], dtype=torch.int64)
     # CPU ids -> CPU gather path (gpu_gather requires ids.is_cuda).
