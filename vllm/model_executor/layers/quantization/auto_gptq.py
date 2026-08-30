@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from copy import deepcopy
 from typing import Any
 
@@ -30,12 +31,17 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     make_wna16_moe_kernel,
     select_wna16_moe_backend,
 )
-from vllm.model_executor.layers.linear import LinearMethodBase, set_weight_attrs
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    set_weight_attrs,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_dynamic_override,
@@ -66,6 +72,30 @@ from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.collection_utils import is_list_of
 
 logger = init_logger(__name__)
+
+# HF override attribute names read by
+# vllm/models/qwen4_exp/nvidia/dense_fp8.py (DENSE_QUANT_ATTR) and
+# lm_head_fp8.py (LM_HEAD_QUANT_ATTR). Checked here by plain attribute name,
+# not imported: AutoGPTQConfig is a model-agnostic quantization method and
+# must not depend on a specific model package. Both override paths claim
+# their allow-listed prefixes with an unquantized bf16 method
+# (dense_fp8.py:360-374) before the checkpoint's own fp8 weights ever reach a
+# quant_method, so they are mutually exclusive with the hybrid fp8 dispatch
+# below.
+_QWEN4_EXP_DENSE_FP8_OVERRIDE_ATTRS = ("dense_quant", "lm_head_quant")
+
+
+def _fp8_hybrid_enabled() -> bool:
+    """Whether the env-gated int4+fp8 hybrid dispatch is on (default off)."""
+    return os.environ.get("VLLM_FP8_HYBRID", "0").lower() in ("1", "true", "yes")
+
+
+def _active_dense_fp8_override(hf_config: PretrainedConfig | None) -> str | None:
+    """Name of the first active qwen4_exp dense/lm_head fp8 override, if any."""
+    for attr in _QWEN4_EXP_DENSE_FP8_OVERRIDE_ATTRS:
+        if getattr(hf_config, attr, None) is not None:
+            return attr
+    return None
 
 
 def get_moe_quant_method(
@@ -165,6 +195,13 @@ class AutoGPTQConfig(QuantizationConfig):
         # used to identify GPTQ model quantized by autoround
         self.autoround_version = full_config.get("autoround_version", "")
 
+        # VLLM_FP8_HYBRID (default off): layer names (vLLM-mapped) whose
+        # checkpoint tensors are blockwise-fp8 (F8_E4M3 + .weight_scale_inv),
+        # and the lazily-built shared Fp8Config those layers dispatch to.
+        # See maybe_update_config/get_quant_method below.
+        self.fp8_layers: set[str] = set()
+        self._fp8_cfg: Fp8Config | None = None
+
     def __repr__(self) -> str:
         return (
             f"AutoGPTQConfig(quant_type={self.quant_type}, "
@@ -240,6 +277,10 @@ class AutoGPTQConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        if isinstance(layer, LinearBase) and self._is_fp8_layer(prefix):
+            logger.debug("fp8 hybrid: %s -> Fp8LinearMethod", prefix)
+            return self._fp8_hybrid_config().get_quant_method(layer, prefix)
+
         if isinstance(layer, RoutedExperts):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
@@ -274,6 +315,8 @@ class AutoGPTQConfig(QuantizationConfig):
             self.modules_in_block_to_quantize = hf_to_vllm_mapper.apply_list(
                 self.modules_in_block_to_quantize
             )
+        if self.fp8_layers:
+            self.fp8_layers = set(hf_to_vllm_mapper.apply_list(list(self.fp8_layers)))
 
     def maybe_update_config(
         self,
@@ -281,6 +324,7 @@ class AutoGPTQConfig(QuantizationConfig):
         hf_config: PretrainedConfig | None = None,
         revision: str | None = None,
     ):
+        metadata: dict[str, Any] | None = None
         if self.modules_in_block_to_quantize:
             if is_list_of(self.modules_in_block_to_quantize, list):
                 # original modules_in_block_to_quantize: list[list[str]]
@@ -290,17 +334,107 @@ class AutoGPTQConfig(QuantizationConfig):
                     for sublist in self.modules_in_block_to_quantize
                     for item in sublist
                 ]
+        else:
+            unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+            metadata = get_safetensors_params_metadata(model_name, revision=revision)
+            # Hazard (VLLM_FP8_HYBRID off): any checkpoint-serialized fp8
+            # weight lands here too (F8_E4M3 is not in unquant_dtypes), so
+            # modules_in_block_to_quantize includes it and the GPTQ path
+            # below crashes trying to treat it as an int4/int8 GPTQ tensor.
+            # Serving a hybrid checkpoint requires VLLM_FP8_HYBRID=1.
+            quant_layers: set[str] = {
+                param_name.rsplit(".", 1)[0]
+                for param_name, info in metadata.items()
+                if (dtype := info.get("dtype", None))
+                and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
+            }
+            self.modules_in_block_to_quantize = list(quant_layers)
+
+        if _fp8_hybrid_enabled():
+            if metadata is None:
+                metadata = get_safetensors_params_metadata(
+                    model_name, revision=revision
+                )
+            self._detect_fp8_hybrid_layers(metadata, hf_config)
+
+    def _detect_fp8_hybrid_layers(
+        self,
+        metadata: dict[str, Any],
+        hf_config: PretrainedConfig | None,
+    ) -> None:
+        """Record checkpoint layers stored as blockwise fp8 (VLLM_FP8_HYBRID=1).
+
+        A layer qualifies when its ``.weight`` tensor is F8_E4M3 and it has a
+        sibling ``.weight_scale_inv`` (DeepSeek-format blockwise w8a8). Names
+        are hf-side at this point; ``apply_vllm_mapper`` maps them to vLLM
+        module prefixes afterwards, same as ``modules_in_block_to_quantize``.
+
+        Raises:
+            ValueError: if fp8 layers are detected while a qwen4_exp
+                dense_quant/lm_head_quant hf_overrides is also active. That
+                override claims its allow-listed prefixes with an
+                unquantized bf16 method before this dispatch ever sees them,
+                so the loader would crash deep in weight loading on an
+                F8_E4M3 tensor with an orphaned weight_scale_inv. Refusing
+                here, at config time, turns that crash into a clear error.
+        """
+        self.fp8_layers = {
+            name[: -len(".weight")]
+            for name, info in metadata.items()
+            if name.endswith(".weight")
+            and info.get("dtype") == "F8_E4M3"
+            and name[: -len(".weight")] + ".weight_scale_inv" in metadata
+        }
+        if not self.fp8_layers:
             return
 
-        unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32]
-        metadata = get_safetensors_params_metadata(model_name, revision=revision)
-        quant_layers: set[str] = {
-            param_name.rsplit(".", 1)[0]
-            for param_name, info in metadata.items()
-            if (dtype := info.get("dtype", None))
-            and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
-        }
-        self.modules_in_block_to_quantize = list(quant_layers)
+        logger.info(
+            "fp8 hybrid: %d blockwise-fp8 layers detected", len(self.fp8_layers)
+        )
+        conflict = _active_dense_fp8_override(hf_config)
+        if conflict is not None:
+            raise ValueError(
+                f"VLLM_FP8_HYBRID=1 detected {len(self.fp8_layers)} "
+                "checkpoint-serialized blockwise-fp8 layers, but the "
+                f"{conflict!r} hf_overrides is also active. That override "
+                "claims its allow-listed prefixes with an unquantized bf16 "
+                "method before the hybrid fp8 dispatch runs, so the loader "
+                "would crash on F8_E4M3 weights with an orphaned "
+                "weight_scale_inv. Drop the dense_quant/lm_head_quant "
+                "hf_overrides when serving a VLLM_FP8_HYBRID checkpoint, or "
+                "unset VLLM_FP8_HYBRID."
+            )
+
+    def _is_fp8_layer(self, prefix: str) -> bool:
+        """Whether ``prefix`` (and any fused siblings) are all blockwise-fp8.
+
+        Fused linear modules (``packed_modules_mapping``, e.g. a merged
+        ``qkv_proj``) dispatch as one indivisible unit: the checkpoint holds
+        one packed weight/scale pair per fused module, so a fused layer must
+        have every constituent detected as fp8 before it is safe to route
+        the whole thing to Fp8Config -- a partial match falls through to the
+        GPTQ path unchanged (fail closed).
+        """
+        if not self.fp8_layers:
+            return False
+        head, _, proj = prefix.rpartition(".")
+        fused = self.packed_modules_mapping.get(proj)
+        names = [f"{head}.{shard}" for shard in fused] if fused and head else [prefix]
+        return all(
+            any(fp8_name in name for fp8_name in self.fp8_layers) for name in names
+        )
+
+    def _fp8_hybrid_config(self) -> Fp8Config:
+        """Shared blockwise Fp8Config for all VLLM_FP8_HYBRID dispatch."""
+        if self._fp8_cfg is None:
+            fp8_cfg = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+            )
+            fp8_cfg.packed_modules_mapping = self.packed_modules_mapping
+            self._fp8_cfg = fp8_cfg
+        return self._fp8_cfg
 
 
 class AutoGPTQLinearMethod(LinearMethodBase):
