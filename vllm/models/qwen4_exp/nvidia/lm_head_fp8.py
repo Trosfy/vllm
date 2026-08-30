@@ -12,7 +12,11 @@ bf16 activations and accumulation (w8a16).
 
 Opt-in via ``--hf-overrides '{"lm_head_quant": "fp8"}'`` (resolved by
 :func:`get_lm_head_quant_method`); default-off behavior is byte-identical to
-stock.  The method follows the online-quantization house pattern
+stock -- which, for a checkpoint that ships its own quantized head, is the
+``quant_config`` dispatch both lm_head call sites also pass (GPTQ-Marlin for
+an int8 head).  The two are mutually exclusive; setting both raises.
+
+The method follows the online-quantization house pattern
 (``quantization/online/fp8.py``): the weight is created on the meta device,
 materialized while loading, and quantized in ``process_weights_after_loading``
 with an amax-derived per-tensor scale.  The GEMM runs through
@@ -193,9 +197,10 @@ def get_lm_head_quant_method(
     Returns ``None`` (stock unquantized behavior) when unset.
 
     Raises:
-        ValueError: on an unsupported ``lm_head_quant`` value, or when a
-            non-model ``head_dtype`` override is also set (the fp32-head path
-            in ``LogitsProcessor`` requires an unquantized lm_head).
+        ValueError: on an unsupported ``lm_head_quant`` value, when the
+            checkpoint already ships a quantized lm_head, or when a non-model
+            ``head_dtype`` override is also set (the fp32-head path in
+            ``LogitsProcessor`` requires an unquantized lm_head).
         NotImplementedError: with tied word embeddings (quantizing the shared
             table would also change the input embedding lookup).
     """
@@ -209,6 +214,24 @@ def get_lm_head_quant_method(
         raise ValueError(
             f"Unsupported {LM_HEAD_QUANT_ATTR}={requested!r}; supported "
             f"values: {_SUPPORTED_LM_HEAD_QUANT}."
+        )
+    # Only the GPTQ/AWQ-family configs carry lm_head_quantized; an
+    # unquantized checkpoint (None) and every other config answer False.
+    quant_config = vllm_config.quant_config
+    if getattr(quant_config, "lm_head_quantized", False):
+        # Double-quant: this method is preselected, so it wins over the
+        # checkpoint's own method (vocab_parallel_embedding.py: a non-None
+        # quant_method skips quant_config.get_quant_method) and creates a
+        # bf16 meta weight that the loader then cannot fill from the
+        # checkpoint's lm_head.qweight/qzeros/scales.
+        raise ValueError(
+            f"{LM_HEAD_QUANT_ATTR}={requested!r} conflicts with a checkpoint "
+            "whose lm_head is already quantized (its quantization config "
+            "reports lm_head_quantized=True). Online fp8 would take "
+            "precedence over the checkpoint's own lm_head method and the "
+            "loader would then fail on the packed head weights. Drop the "
+            f"{LM_HEAD_QUANT_ATTR} override to serve the checkpoint's head, "
+            "or point the recipe at a checkpoint with a bf16 lm_head."
         )
     if getattr(model_config.hf_text_config, "tie_word_embeddings", False):
         raise NotImplementedError(

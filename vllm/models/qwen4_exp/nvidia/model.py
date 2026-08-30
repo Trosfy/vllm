@@ -638,6 +638,11 @@ class Qwen4ExpForCausalLM(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            # Both kwargs, because they cover disjoint checkpoints: the
+            # preselected method wins whenever lm_head_quant is set (bf16
+            # head, quantized online), and quant_config is the fallthrough
+            # that lets a checkpoint-quantized head reach its own method.
+            quant_config=vllm_config.quant_config,
             quant_method=get_lm_head_quant_method(vllm_config),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)

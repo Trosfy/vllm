@@ -27,6 +27,10 @@ from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
 )
+from vllm.model_executor.layers.quantization.auto_gptq import (
+    AutoGPTQConfig,
+    AutoGPTQLinearMethod,
+)
 from vllm.model_executor.layers.quantization.utils.humming_utils import (
     convert_linear_layer_to_humming_standard,
 )
@@ -66,6 +70,7 @@ def _vllm_config(
     lm_head_quant: str | None = None,
     tie_word_embeddings: bool = False,
     head_dtype: torch.dtype = torch.bfloat16,
+    quant_config=None,
 ) -> SimpleNamespace:
     hf_attrs = {} if lm_head_quant is None else {"lm_head_quant": lm_head_quant}
     return SimpleNamespace(
@@ -77,6 +82,7 @@ def _vllm_config(
                 tie_word_embeddings=tie_word_embeddings, **hf_attrs
             ),
         ),
+        quant_config=quant_config,
         # Read by the wfp8-a16 kernel selection during create_weights.
         kernel_config=SimpleNamespace(linear_backend="auto"),
         compilation_config=CompilationConfig(custom_ops=["none"]),
@@ -111,6 +117,93 @@ def test_helper_selects_fp8_method() -> None:
     with set_current_vllm_config(vllm_config):
         method = get_lm_head_quant_method(vllm_config)
     assert isinstance(method, Qwen4ExpLMHeadFp8Method)
+
+
+# Shape used only by the GPTQ-checkpoint tests below: Marlin's kernel
+# selection requires input_size_per_partition % 128 == 0 and
+# output_size_per_partition % 64 == 0, unlike the fp8-method tests above
+# which don't route through Marlin.
+_GPTQ_VOCAB = 256
+_GPTQ_HIDDEN = 128
+
+
+def _gptq_config(lm_head_quantized: bool) -> AutoGPTQConfig:
+    """A synthetic quantize_config for a W4A16 checkpoint whose lm_head is
+    optionally int8-GPTQ (mirrors the composed hybrid lane's relabel:
+    ``lm_head_quantized`` + the ``+:.*lm_head$`` bits-8 dynamic rule).
+    """
+    dynamic: dict[str, dict[str, int | bool]] = {r"-:.*mtp\..*": {}}
+    if lm_head_quantized:
+        dynamic[r"+:.*lm_head$"] = {"bits": 8}
+    config = AutoGPTQConfig(
+        weight_bits=4,
+        group_size=128,
+        desc_act=False,
+        is_sym=True,
+        lm_head_quantized=lm_head_quantized,
+        dynamic=dynamic,
+        full_config={},
+        modules_in_block_to_quantize=[
+            "self_attn.q_proj",
+            "mlp.shared_expert.gate_proj",
+            "lm_head",
+        ],
+    )
+    config.packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    return config
+
+
+def _build_gptq_shaped_lm_head(vllm_config: SimpleNamespace) -> ParallelLMHead:
+    """The exact P4 call shape from model.py / mtp.py: both ``quant_config``
+    and the preselected ``quant_method`` are passed; the preselection wins
+    when set, and ``quant_config`` is the fallthrough for a
+    checkpoint-quantized head (vocab_parallel_embedding.py precedence).
+    """
+    return ParallelLMHead(
+        _GPTQ_VOCAB,
+        _GPTQ_HIDDEN,
+        prefix="lm_head",
+        quant_config=vllm_config.quant_config,
+        quant_method=get_lm_head_quant_method(vllm_config),
+        params_dtype=torch.bfloat16,
+    )
+
+
+def test_checkpoint_quantized_head_without_override_uses_gptq_marlin() -> None:
+    """No lm_head_quant override: an int8-GPTQ checkpoint head falls
+    through quant_config.get_quant_method to GPTQ-Marlin, not the online
+    fp8 method."""
+    vllm_config = _vllm_config(quant_config=_gptq_config(lm_head_quantized=True))
+    with set_current_vllm_config(vllm_config):
+        head = _build_gptq_shaped_lm_head(vllm_config)
+    assert isinstance(head.quant_method, AutoGPTQLinearMethod)
+    assert head.quant_method.quant_config.weight_bits == 8
+    assert str(head.quant_method.quant_config.quant_type) == "uint8b128"
+
+
+def test_checkpoint_quantized_head_with_fp8_override_raises() -> None:
+    """Double-quant guard: an int8-GPTQ checkpoint head plus the fp8
+    override must fail closed instead of silently taking the bf16 online
+    path and crashing later in the loader on the packed qweight/qzeros."""
+    vllm_config = _vllm_config(
+        lm_head_quant="fp8", quant_config=_gptq_config(lm_head_quantized=True)
+    )
+    with pytest.raises(ValueError, match="already quantized"):
+        get_lm_head_quant_method(vllm_config)
+
+
+def test_bf16_head_with_quant_config_present_stays_unquantized() -> None:
+    """Regression guard: passing quant_config alongside the preselected
+    None method (bf16 head, no override) must still resolve to
+    UnquantizedEmbeddingMethod -- the checkpoint's own GPTQ config declines
+    an unquantized lm_head (lm_head_quantized=False)."""
+    vllm_config = _vllm_config(quant_config=_gptq_config(lm_head_quantized=False))
+    with set_current_vllm_config(vllm_config):
+        head = _build_gptq_shaped_lm_head(vllm_config)
+    assert isinstance(head.quant_method, UnquantizedEmbeddingMethod)
 
 
 def _build_lm_head(quant_method) -> ParallelLMHead:

@@ -396,6 +396,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                     config.vocab_size,
                     config.hidden_size,
                     prefix=maybe_prefix(prefix, "lm_head"),
+                    # See the target model's lm_head: the preselected method
+                    # wins under lm_head_quant, quant_config is the
+                    # fallthrough for a checkpoint-quantized head. The draft
+                    # head loads the same lm_head.* tensors as the target
+                    # (mapped from mtp.shared_head.head.*) and its prefix is
+                    # the root "lm_head", so the checkpoint's `-:.*mtp\..*`
+                    # dynamic exclude does not reach it.
+                    quant_config=vllm_config.quant_config,
                     quant_method=get_lm_head_quant_method(vllm_config),
                 )
         else:
