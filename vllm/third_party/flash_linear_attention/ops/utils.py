@@ -152,6 +152,17 @@ is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in torch.cuda.get_device_name(0)
     or torch.cuda.get_device_capability()[0] >= 9
 )
+# GB10 and RTX 50-series report compute capability major 12 ("family-12x").
+# Measured: GB10 max_shared_mem=101376 B (99 KiB), exactly Backend.ADA below,
+# but 1024 B short of Backend.DEFAULT (102400), so the unmapped-arch fallback
+# in Backend.get_shared_memory misclassifies GB10 as sub-ADA. B100/B200 (cc
+# major 10) are Blackwell too but are NOT family-12x and are unaffected.
+_nvidia_cc_major = torch.cuda.get_device_capability()[0] if is_nvidia else None
+is_nvidia_family_12x = _nvidia_cc_major == 12
+# fla#953: num_warps=4 autotune configs race on Blackwell (tl.dot recurrence
+# -> nondeterministic GDN state), across both Blackwell cc families (10.x
+# datacenter, 12.x consumer/workstation). Consumed by chunk_delta_h.py.
+is_nvidia_blackwell = _nvidia_cc_major in (10, 12)
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
 is_tma_supported = (
@@ -187,6 +198,10 @@ class Backend(Enum):
         try:
             return cls[arch.upper()].value
         except KeyError:
+            # See is_nvidia_family_12x above: GB10's 101376 B is the ADA
+            # tier, not DEFAULT's 102400.
+            if is_nvidia_family_12x:
+                return cls.ADA.value
             return cls.DEFAULT.value
 
 

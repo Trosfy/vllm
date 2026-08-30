@@ -14,7 +14,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
-from .utils import FLA_CHUNK_SIZE, use_cuda_graph
+from .utils import FLA_CHUNK_SIZE, is_nvidia_blackwell, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
@@ -34,7 +34,10 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 @triton.autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        # fla#953: num_warps=4 races on Blackwell (tl.dot recurrence ->
+        # nondeterministic GDN state). Pin to 2 on all Blackwell (cc major
+        # 10 and 12 -- B100/B200 hit the same race); keep [2, 4] elsewhere.
+        for num_warps in ([2] if is_nvidia_blackwell else [2, 4])
         for num_stages in _CHUNK_DELTA_H_NUM_STAGES
         for BV in [32, 64]
     ],
